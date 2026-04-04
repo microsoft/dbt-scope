@@ -9,7 +9,7 @@
         partition_by=['event_year_date', 'edition'],
         delta_location=var('delta_location_filtered'),
         ss_source_path=var('ss_source_path'),
-        days_per_batch=32,
+        days_per_batch=17,
         au=4,
         priority=1,
         scope_columns=[

@@ -90,7 +90,11 @@ class TestIncrementalAppend:
         self, append_scenario: ScenarioConfig, request: pytest.FixtureRequest
     ):
         """After full refresh, generating new SS data and running incremental
-        should add new partitions without removing existing ones."""
+        should add new partitions without removing existing ones.
+
+        Uses ``--event-time-start/end`` to target the new data range, since
+        the default lookback window only covers recent days.
+        """
         vars_ = _dbt_vars(append_scenario)
         adla_account = os.environ.get("SCOPE_ADLA_ACCOUNT", "")
         test_name = _test_id(request)
@@ -105,34 +109,43 @@ class TestIncrementalAppend:
 
         before_info = verify_delta_with_duckdb(append_scenario.delta_location)
         assert before_info["total_rows"] > 0, "Full refresh produced no rows"
-        set(before_info["partition_counts"].keys())
 
         # Step 2: Generate new SS data (phase 2)
         log.info("Generating new SS data for incremental test")
         submit_datagen_job(append_scenario.new_data, adla_account=adla_account, au=5)
 
-        # Step 3: Incremental run (should pick up only new dates)
+        # Step 3: Incremental run targeting the new data date range
+        new_start = append_scenario.new_data.start_date
+        new_end_date = append_scenario.new_data.date_range[-1]
+        # end is exclusive, so add 1 day
+        from datetime import timedelta
+
+        new_end = (new_end_date + timedelta(days=1)).isoformat()
         result = run_dbt(
-            ["run", "--select", "append_no_delete"],
+            [
+                "run",
+                "--select",
+                "append_no_delete",
+                "--event-time-start",
+                new_start,
+                "--event-time-end",
+                new_end,
+            ],
             extra_vars=vars_,
             test_name=f"{test_name}_incremental",
         )
         assert result.success, f"Incremental run failed: {result.result}"
 
-        # DuckDB: verify incremental added new rows
-        # Note: append strategy may re-process overlapping dates, so we check
-        # that total rows increased (not exact count).
+        # Verify new data rows are present
         after_info = verify_delta_with_duckdb(append_scenario.delta_location)
         assert after_info["total_rows"] > before_info["total_rows"], (
             f"Incremental should add rows: before={before_info['total_rows']}, "
             f"after={after_info['total_rows']}"
         )
-        # Verify new data rows are present (at minimum, new_data rows were added)
-        assert after_info["total_rows"] >= (
-            before_info["total_rows"] + append_scenario.new_data.total_expected_rows
-        ), (
-            f"Expected at least {append_scenario.new_data.total_expected_rows} new rows, "
-            f"got {after_info['total_rows'] - before_info['total_rows']}"
+        expected_new = append_scenario.new_data.total_expected_rows
+        actual_new = after_info["total_rows"] - before_info["total_rows"]
+        assert actual_new >= expected_new, (
+            f"Expected at least {expected_new} new rows, got {actual_new}"
         )
 
 
@@ -174,9 +187,24 @@ class TestIncrementalDeleteInsert:
         )
         assert first_info["total_rows"] > 0, "Full refresh produced no rows"
 
-        # Step 2: Re-run the same range incrementally (delete+insert)
+        # Step 2: Re-run the same full range incrementally (delete+insert)
+        # Use --event-time-start/end to cover the full historical range,
+        # proving delete+insert is idempotent across the entire date span.
+        hist_start = delete_insert_scenario.historical.start_date
+        hist_end_date = delete_insert_scenario.historical.date_range[-1]
+        from datetime import timedelta
+
+        hist_end = (hist_end_date + timedelta(days=1)).isoformat()
         result = run_dbt(
-            ["run", "--select", "idempotent_delete_insert"],
+            [
+                "run",
+                "--select",
+                "idempotent_delete_insert",
+                "--event-time-start",
+                hist_start,
+                "--event-time-end",
+                hist_end,
+            ],
             extra_vars=vars_,
             test_name=f"{test_name}_incremental",
         )
@@ -221,9 +249,22 @@ class TestIncrementalDeleteInsert:
         log.info("Generating new SS data for delete+insert incremental test")
         submit_datagen_job(delete_insert_scenario.new_data, adla_account=adla_account, au=5)
 
-        # Step 3: Incremental run
+        # Step 3: Incremental run targeting the new data date range
+        new_start = delete_insert_scenario.new_data.start_date
+        new_end_date = delete_insert_scenario.new_data.date_range[-1]
+        from datetime import timedelta
+
+        new_end = (new_end_date + timedelta(days=1)).isoformat()
         result = run_dbt(
-            ["run", "--select", "idempotent_delete_insert"],
+            [
+                "run",
+                "--select",
+                "idempotent_delete_insert",
+                "--event-time-start",
+                new_start,
+                "--event-time-end",
+                new_end,
+            ],
             extra_vars=vars_,
             test_name=f"{test_name}_incremental",
         )

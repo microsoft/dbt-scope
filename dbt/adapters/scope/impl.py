@@ -77,12 +77,54 @@ class ScopeAdapter(BaseAdapter):
         pass  # No-op: SCOPE doesn't support ALTER COLUMN
 
     def list_relations_without_caching(self, schema_relation: ScopeRelation) -> list[ScopeRelation]:
-        """List Delta tables by querying ADLS directory structure.
+        """Detect existing Delta tables by checking ADLS for ``_delta_log/`` directories.
 
-        For simplicity, returns an empty list — the relation cache is populated
-        by dbt during materialization runs.
+        Scans ``{delta_base_path}/`` for subdirectories that contain a
+        ``_delta_log/`` folder, which confirms the directory is a Delta table.
+        This enables dbt-core's ``_is_incremental()`` check so that microbatch
+        runs process only the lookback window instead of all batches from ``begin``.
         """
-        return []
+        creds = self._credentials()
+        if not creds.storage_account or not creds.container:
+            return []
+
+        try:
+            from azure.identity import AzureCliCredential
+            from azure.storage.filedatalake import DataLakeServiceClient
+
+            from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK, FileLock
+
+            with FileLock(AZ_CLI_TOKEN_LOCK):
+                credential = AzureCliCredential()
+            service = DataLakeServiceClient(
+                account_url=f"https://{creds.storage_account}.dfs.core.windows.net",
+                credential=credential,
+            )
+            fs = service.get_file_system_client(creds.container)
+
+            relations: list[ScopeRelation] = []
+            for path_info in fs.get_paths(path=creds.delta_base_path, recursive=False):
+                if not path_info.is_directory:
+                    continue
+                table_name = path_info.name.split("/")[-1]
+                try:
+                    delta_log = fs.get_directory_client(f"{path_info.name}/_delta_log")
+                    delta_log.get_directory_properties()
+                    relations.append(
+                        self.Relation.create(
+                            database=creds.storage_account,
+                            schema=creds.container,
+                            identifier=table_name,
+                            type="table",
+                        )
+                    )
+                except Exception:
+                    pass  # Not a Delta table — skip
+            log.debug("list_relations_without_caching found %d Delta tables", len(relations))
+            return relations
+        except Exception:
+            log.debug("list_relations_without_caching failed, returning []", exc_info=True)
+            return []
 
     def quote(self, identifier: str) -> str:
         return identifier  # SCOPE doesn't use quoted identifiers
@@ -135,6 +177,18 @@ class ScopeAdapter(BaseAdapter):
         connection = self.connections.get_thread_connection()
         handle: ScopeConnectionHandle = connection.handle  # type: ignore[assignment]
         handle._next_job_name = name
+
+    @available
+    def get_max_partition_value(self, delta_location: str, partition_col: str) -> str | None:
+        """Query ``MAX(partition_col)`` from a Delta table via DuckDB.
+
+        Uses DuckDB's ``delta_scan`` to read the Delta transaction log directly
+        from ADLS — no ADLA compute cost.  Returns the max value as a string
+        (e.g. ``"20260404"``), or ``None`` if the table is empty or unreadable.
+        """
+        from dbt.adapters.scope.delta_introspection import get_max_partition
+
+        return get_max_partition(delta_location, partition_col)
 
     @available
     def get_where_connector(self, model_sql: str) -> str:
