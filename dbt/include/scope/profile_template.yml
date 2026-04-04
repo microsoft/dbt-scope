@@ -1,0 +1,19 @@
+fixed:
+  type: scope
+
+prompts:
+  adla_account:
+    hint: "ADLA account name"
+  storage_account:
+    hint: "Azure Storage account for Delta tables"
+  container:
+    hint: "ADLS container name"
+  delta_base_path:
+    hint: "Path prefix for Delta tables within the container"
+    default: "delta"
+  au:
+    hint: "Analytics Units per SCOPE job"
+    default: 100
+  priority:
+    hint: "Job priority (lower = higher priority)"
+    default: 1

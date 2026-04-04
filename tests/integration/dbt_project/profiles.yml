@@ -1,0 +1,20 @@
+# profiles.yml for integration testing
+# All sensitive values sourced from environment variables.
+# Set them in .env (see .env.example) — run.ps1 loads it automatically.
+dbt_scope_test:
+  target: dev
+  outputs:
+    dev:
+      type: scope
+      database: "{{ env_var('SCOPE_STORAGE_ACCOUNT') }}"
+      schema: "{{ env_var('SCOPE_CONTAINER') }}"
+      adla_account: "{{ env_var('SCOPE_ADLA_ACCOUNT') }}"
+      storage_account: "{{ env_var('SCOPE_STORAGE_ACCOUNT') }}"
+      container: "{{ env_var('SCOPE_CONTAINER') }}"
+      delta_base_path: "{{ env_var('SCOPE_DELTA_BASE_PATH', 'delta') }}"
+      au: "{{ env_var('SCOPE_AU', '5') | int }}"
+      priority: "{{ env_var('SCOPE_PRIORITY', '1') | int }}"
+      poll_interval_seconds: 5
+      max_wait_seconds: 3600
+      http_timeout_seconds: 30
+      http_retries: 3

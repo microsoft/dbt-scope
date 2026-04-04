@@ -1,0 +1,9 @@
+name: 'dbt_scope_test'
+version: '0.1.0'
+config-version: 2
+
+profile: 'dbt_scope_test'
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
