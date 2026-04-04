@@ -10,7 +10,8 @@
         delta_location=var('delta_location_with_delete'),
         ss_source_path=var('ss_source_path'),
         delete_before_insert=true,
-        au=10,
+        days_per_batch=32,
+        au=4,
         priority=1,
         scope_columns=[
             {'name': 'logical_server_name', 'type': 'string'},

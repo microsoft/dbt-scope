@@ -61,6 +61,10 @@
     feature_previews,
     model_sql
 ) %}
+{# -- Normalize partition_by to a list -- #}
+{%- set partition_cols = partition_by if partition_by is iterable and partition_by is not string else ([partition_by] if partition_by else []) -%}
+{# Only the first partition column is date-derived and excluded from EXTRACT #}
+{%- set derived_col = partition_cols[0] if partition_cols else none -%}
 
 {# -- Header -- #}
 // ============================================================
@@ -80,8 +84,8 @@ CREATE TABLE IF NOT EXISTS @target (
     {{ col.name }} {{ col.type }}{{ "," if not loop.last }}
 {%- endfor %}
 )
-{%- if partition_by %}
-PARTITIONED BY ({{ partition_by }})
+{%- if partition_cols %}
+PARTITIONED BY ({{ partition_cols | join(', ') }})
 {%- endif %}
 LOCATION @deltaPath
 OPTIONS (LAYOUT = DELTA);
@@ -99,7 +103,7 @@ ALTER TABLE @target SET TBLPROPERTIES (
 @data =
     EXTRACT
 {%- for col in scope_columns %}
-{%-   if partition_by is none or col.name != partition_by %}
+{%-   if col.name != derived_col %}
         {{ col.name }} : {{ col.type }},
 {%-   endif %}
 {%- endfor %}

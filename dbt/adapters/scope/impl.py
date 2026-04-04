@@ -178,6 +178,7 @@ class ScopeAdapter(BaseAdapter):
             priority=model_config.get("priority", creds.priority),
             columns=columns,
             delete_before_insert=model_config.get("delete_before_insert", False),
+            days_per_batch=model_config.get("days_per_batch", 1),
         )
 
     # ------------------------------------------------------------------

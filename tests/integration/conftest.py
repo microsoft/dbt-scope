@@ -14,18 +14,22 @@ import datetime
 import json
 import logging
 import os
-import subprocess
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import duckdb
 import pytest
 from datagen import ScopeDataset, make_default_dataset, submit_datagen_job
+from dbt.cli.main import dbtRunner
 
 PROJECT_DIR = Path(__file__).parent / "dbt_project"
+REPO_ROOT = Path(__file__).parent.parent.parent
+LOGS_DIR = REPO_ROOT / ".logs"
 
-# Unique prefix per session so parallel runs don't collide
+# Unique prefix per worker so xdist parallel runs don't collide
+_WORKER = os.environ.get("PYTEST_XDIST_WORKER", "gw0")
 _TS = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+_PREFIX = f"{_TS}_{_WORKER}"
 
 log = logging.getLogger(__name__)
 
@@ -60,7 +64,7 @@ class ScenarioConfig:
 def _build_scenario(label: str, historical_days: int = 3, new_days: int = 2) -> ScenarioConfig:
     """Build a test scenario with datagen datasets."""
     ss_root = _env("SCOPE_SS_TEST_ROOT")
-    stream = f"{label}_{_TS}"
+    stream = f"{label}_{_PREFIX}"
 
     historical = make_default_dataset(
         ss_root=ss_root,
@@ -81,7 +85,7 @@ def _build_scenario(label: str, historical_days: int = 3, new_days: int = 2) -> 
         name=label,
         historical=historical,
         new_data=new_data,
-        delta_location=_delta_path(f"{label}_{_TS}"),
+        delta_location=_delta_path(f"{label}_{_PREFIX}"),
     )
 
 
@@ -110,49 +114,75 @@ def delete_insert_scenario() -> ScenarioConfig:
 # -- dbt runner ---------------------------------------------------------------
 
 
-def _dbt_executable() -> str:
-    """Find the dbt executable in the venv."""
-    venv_dir = Path(sys.executable).parent
-    dbt_exe = venv_dir / "dbt.exe"
-    if dbt_exe.exists():
-        return str(dbt_exe)
-    dbt_exe = venv_dir / "dbt"
-    if dbt_exe.exists():
-        return str(dbt_exe)
-    # Fallback: try dbt.cli.main via python -m
-    return f"{sys.executable} -m dbt.cli.main"
+def _test_log_dir(test_name: str) -> Path:
+    """Return the log directory for a specific test, creating it if needed."""
+    log_dir = LOGS_DIR / test_name
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir
 
 
 def run_dbt(
     args: list[str],
     extra_vars: dict | None = None,
-    timeout: int = 3600,
-) -> subprocess.CompletedProcess:
-    """Run a dbt CLI command against the test project."""
-    dbt = _dbt_executable()
+    test_name: str = "default",
+):
+    """Run a dbt command using dbtRunner with per-invocation log directory.
+
+    Each invocation gets its own log directory under .logs/<test_name>/
+    using dbt's --log-path argument for clean separation.
+
+    Returns the dbtRunner result object with .success and .result attributes.
+    """
+    log_dir = _test_log_dir(test_name)
+
     cmd = [
-        dbt,
         *args,
         "--project-dir",
         str(PROJECT_DIR),
         "--profiles-dir",
         str(PROJECT_DIR),
+        "--log-path",
+        str(log_dir),
     ]
     if extra_vars:
         cmd.extend(["--vars", json.dumps(extra_vars)])
 
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        env=os.environ.copy(),
+    runner = dbtRunner()
+    result = runner.invoke(cmd)
+
+    _flush_dbt_logs(log_dir)
+    status = "success" if result.success else "FAILED"
+    log.info("dbt %s → %s (logs: %s)", " ".join(args), status, log_dir)
+    print(f"\n--- dbt {' '.join(args)} [{status}] ---")
+    print(f"    Logs: {log_dir}")
+
+    summary_file = log_dir / "result_summary.txt"
+    summary_file.write_text(
+        f"command: dbt {' '.join(args)}\nsuccess: {result.success}\nresult: {result.result}\n"
     )
-    print(f"\n--- dbt {' '.join(args)} ---")
-    print(result.stdout[-2000:] if len(result.stdout) > 2000 else result.stdout)
-    if result.stderr:
-        print(result.stderr[-1000:])
+
     return result
+
+
+def _flush_dbt_logs(log_dir: Path) -> None:
+    """Flush dbt's event logger and fsync log files to disk."""
+    try:
+        from dbt_common.events.event_manager_client import get_event_manager
+
+        get_event_manager().flush()
+    except Exception:
+        pass
+
+    log_file = log_dir / "dbt.log"
+    if log_file.exists():
+        try:
+            with open(log_file, "a") as f:
+                os.fsync(f.fileno())
+        except OSError:
+            pass
+
+
+# -- Delta verification -------------------------------------------------------
 
 
 def verify_delta(delta_path: str) -> dict:
@@ -164,6 +194,9 @@ def verify_delta(delta_path: str) -> dict:
         return {"parquet_count": 0, "partitions": [], "error": f"Bad path: {delta_path}"}
 
     container, account, prefix = m.group(1), m.group(2), m.group(3)
+
+    import subprocess
+
     result = subprocess.run(
         [
             "az",
@@ -186,6 +219,7 @@ def verify_delta(delta_path: str) -> dict:
         capture_output=True,
         text=True,
         timeout=60,
+        shell=True,
     )
     if result.returncode != 0:
         return {"parquet_count": 0, "partitions": [], "error": result.stderr}
@@ -196,3 +230,74 @@ def verify_delta(delta_path: str) -> dict:
         {pm.group(1) for b in blobs if (pm := _re.search(r"event_year_date[^=]*=(\d+)", b))}
     )
     return {"parquet_count": len(parquet), "partitions": partitions}
+
+
+def verify_delta_with_duckdb(
+    delta_path: str,
+    expected_manifest: dict[str, int] | None = None,
+    expected_total_rows: int | None = None,
+) -> dict:
+    """Validate Delta table contents using DuckDB with delta + azure extensions.
+
+    Args:
+        delta_path: abfss:// path to the Delta table.
+        expected_manifest: Optional dict of partition_value → expected row count.
+        expected_total_rows: Optional total expected row count.
+
+    Returns:
+        dict with keys: total_rows, partition_counts, errors.
+    """
+    conn = duckdb.connect()
+    conn.execute("INSTALL delta;")
+    conn.execute("LOAD delta;")
+    conn.execute("INSTALL azure;")
+    conn.execute("LOAD azure;")
+
+    try:
+        conn.execute("CREATE SECRET az1 (TYPE AZURE, PROVIDER CREDENTIAL_CHAIN, CHAIN 'cli;env');")
+    except duckdb.Error:
+        conn.execute("CREATE SECRET az1 (TYPE AZURE, PROVIDER CREDENTIAL_CHAIN);")
+    result_info: dict = {"total_rows": 0, "partition_counts": {}, "errors": []}
+
+    try:
+        # Total row count
+        row = conn.execute(f"SELECT COUNT(*) AS cnt FROM delta_scan('{delta_path}')").fetchone()
+        total = row[0] if row else 0
+        result_info["total_rows"] = total
+
+        if expected_total_rows is not None and total != expected_total_rows:
+            result_info["errors"].append(
+                f"Total rows mismatch: expected {expected_total_rows}, got {total}"
+            )
+
+        # Per-partition row counts
+        try:
+            rows = conn.execute(
+                f"SELECT event_year_date, COUNT(*) AS cnt "
+                f"FROM delta_scan('{delta_path}') "
+                f"GROUP BY event_year_date ORDER BY event_year_date"
+            ).fetchall()
+            partition_counts = {str(r[0]): r[1] for r in rows}
+            result_info["partition_counts"] = partition_counts
+
+            if expected_manifest:
+                for part_val, expected_count in expected_manifest.items():
+                    actual = partition_counts.get(part_val, 0)
+                    if actual != expected_count:
+                        result_info["errors"].append(
+                            f"Partition {part_val}: expected {expected_count} rows, got {actual}"
+                        )
+                # Check for unexpected partitions (ignore None from null partition values)
+                actual_keys = {k for k in partition_counts if k not in ("None", "null", "")}
+                unexpected = actual_keys - set(expected_manifest.keys())
+                if unexpected:
+                    result_info["errors"].append(f"Unexpected partitions: {sorted(unexpected)}")
+        except duckdb.Error as e:
+            result_info["errors"].append(f"Partition query failed: {e}")
+
+    except duckdb.Error as e:
+        result_info["errors"].append(f"Delta scan failed: {e}")
+    finally:
+        conn.close()
+
+    return result_info

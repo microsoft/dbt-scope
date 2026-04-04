@@ -36,8 +36,8 @@ class ScriptConfig:
     delta_base_path: str = "delta"
     table_name: str = ""
 
-    # Partitioning
-    partition_by: str | None = None
+    # Partitioning — single column name or list of column names
+    partition_by: str | list[str] | None = None
 
     # SS source
     ss_base_path: str = ""
@@ -51,6 +51,11 @@ class ScriptConfig:
     # Whether to DELETE the batch partition before INSERT (idempotent replace).
     # Default False (append-only). Set True if you need re-runnable batches.
     delete_before_insert: bool = False
+
+    # Number of days each SCOPE job covers in a microbatch run.
+    # Default 1 (one job per day). Set higher to bin-pack partitions:
+    #   days_per_batch=15 → a 30-day backlog produces 2 SCOPE jobs.
+    days_per_batch: int = 1
 
     # Feature previews
     feature_previews: str = "EnableDeltaTableDynamicInsert:on"
@@ -186,6 +191,15 @@ class ScriptBuilder:
 # -- Private helpers --------------------------------------------------
 
 
+def _normalize_partition_by(partition_by: str | list[str] | None) -> list[str]:
+    """Normalize partition_by to a list of column names (empty list if None)."""
+    if partition_by is None:
+        return []
+    if isinstance(partition_by, str):
+        return [partition_by]
+    return list(partition_by)
+
+
 def _header_comment(strategy: str, table_name: str) -> str:
     return textwrap.dedent(f"""\
         // {"=" * 60}
@@ -218,7 +232,7 @@ def _declare_paths(
 
 def _create_table(
     columns: list[ColumnDef],
-    partition_by: str | None,
+    partition_by: str | list[str] | None,
     location_var: str,
 ) -> str:
     col_defs = ",\n".join(c.render() for c in columns)
@@ -227,8 +241,9 @@ def _create_table(
         col_defs,
         ")",
     ]
-    if partition_by:
-        parts.append(f"PARTITIONED BY ({partition_by})")
+    pcols = _normalize_partition_by(partition_by)
+    if pcols:
+        parts.append(f"PARTITIONED BY ({', '.join(pcols)})")
     parts.append(f"LOCATION {location_var}")
     parts.append("OPTIONS (LAYOUT = DELTA);\n")
     return "\n".join(parts)
@@ -245,29 +260,37 @@ def _quote_prop_value(value: Any) -> str:
     return str(value)
 
 
-def _delete_batch_partition(partition_by: str | None) -> str:
-    if not partition_by:
+def _delete_batch_partition(partition_by: str | list[str] | None) -> str:
+    pcols = _normalize_partition_by(partition_by)
+    if not pcols:
         return ""
+    # Only the first (date) partition column drives the batch delete range
+    date_col = pcols[0]
     return textwrap.dedent(f"""\
         DECLARE TABLE @target_rw
         LOCATION @deltaPath
         OPTIONS (LAYOUT = DELTA);
 
         DELETE FROM @target_rw
-        WHERE {partition_by} >= @startDate.Replace("-", "")
-          AND {partition_by} < @endDate.Replace("-", "");
+        WHERE {date_col} >= @startDate.Replace("-", "")
+          AND {date_col} < @endDate.Replace("-", "");
     """)
 
 
 def _extract_from_ss(
     columns: list[ColumnDef],
-    partition_by: str | None,
+    partition_by: str | list[str] | None,
 ) -> str:
+    pcols = _normalize_partition_by(partition_by)
+    # Only the first partition column (date-derived, e.g. event_year_date) is excluded
+    # from EXTRACT — it's derived from _date in the user's SELECT, not present in SS.
+    # Additional partition columns (e.g. edition) are real data columns and must be extracted.
+    derived_col = pcols[0] if pcols else None
+
     # Build EXTRACT column list (data columns + virtual columns)
     extract_cols: list[str] = []
     for col in columns:
-        # Skip the partition column — it's derived from _date
-        if partition_by and col.name == partition_by:
+        if col.name == derived_col:
             continue
         extract_cols.append(f"        {col.name} : {col.scope_type}")
     # Add virtual columns
@@ -291,7 +314,7 @@ def _extract_from_ss(
 
 def _model_transform_and_insert(
     model_sql: str,
-    partition_by: str | None,
+    partition_by: str | list[str] | None,
     batch_start: str | None = None,
     batch_end: str | None = None,
 ) -> str:

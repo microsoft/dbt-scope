@@ -1,5 +1,8 @@
 .temp/
 
+# Test logs
+.logs/
+
 # Secrets
 .env
 

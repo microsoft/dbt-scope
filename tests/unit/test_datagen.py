@@ -114,3 +114,58 @@ class TestMakeDefaultDataset:
     def test_auto_stream_name(self):
         ds = make_default_dataset(ss_root="/local/test/ss")
         assert ds.stream_name.startswith("dbt_test_")
+
+
+class TestExpectedRowsPerPartition:
+    """Tests for per-partition row count tracking."""
+
+    def _make_dataset(self, days=3, files_per_day=2, rows=None) -> ScopeDataset:
+        return ScopeDataset(
+            stream_name="test_stream",
+            ss_root="/local/testuser/ss",
+            columns=[
+                ScopeColumn("name", "string"),
+                ScopeColumn("value", "long"),
+                ScopeColumn("PreciseTimeStamp", "DateTime"),
+            ],
+            rows=rows
+            or [
+                ('"hello"', "42L", None),
+                ('"world"', "99L", None),
+            ],
+            start_date="2026-03-01",
+            days=days,
+            files_per_day=files_per_day,
+        )
+
+    def test_partition_manifest_keys(self):
+        ds = self._make_dataset(days=3, files_per_day=2)
+        manifest = ds.expected_rows_per_partition()
+        assert set(manifest.keys()) == {"20260301", "20260302", "20260303"}
+
+    def test_partition_manifest_values(self):
+        ds = self._make_dataset(days=2, files_per_day=3)
+        # 2 rows * 3 files_per_day = 6 rows per partition
+        manifest = ds.expected_rows_per_partition()
+        assert manifest["20260301"] == 6
+        assert manifest["20260302"] == 6
+
+    def test_total_expected_rows(self):
+        ds = self._make_dataset(days=5, files_per_day=2)
+        # 2 rows * 2 files * 5 days = 20
+        assert ds.total_expected_rows == 20
+
+    def test_manifest_single_file_per_day(self):
+        ds = self._make_dataset(days=2, files_per_day=1)
+        manifest = ds.expected_rows_per_partition()
+        # 2 rows * 1 file = 2 rows per partition
+        assert manifest["20260301"] == 2
+        assert manifest["20260302"] == 2
+
+    def test_manifest_many_rows(self):
+        rows = [(f'"server-{i:03d}"', f"{i}L", None) for i in range(10)]
+        ds = self._make_dataset(days=1, files_per_day=2, rows=rows)
+        manifest = ds.expected_rows_per_partition()
+        # 10 rows * 2 files = 20 rows
+        assert manifest["20260301"] == 20
+        assert ds.total_expected_rows == 20

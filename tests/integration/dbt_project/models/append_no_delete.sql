@@ -6,10 +6,11 @@
         batch_size='day',
         begin=var('datagen_start_date', '2026-02-01'),
         lookback=1,
-        partition_by='event_year_date',
+        partition_by=['event_year_date', 'edition'],
         delta_location=var('delta_location'),
         ss_source_path=var('ss_source_path'),
-        au=10,
+        days_per_batch=32,
+        au=4,
         priority=1,
         scope_columns=[
             {'name': 'logical_server_name', 'type': 'string'},

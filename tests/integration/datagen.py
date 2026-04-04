@@ -83,6 +83,20 @@ class ScopeDataset:
         start = date.fromisoformat(self.start_date)
         return [start + timedelta(days=i) for i in range(self.days)]
 
+    def expected_rows_per_partition(self) -> dict[str, int]:
+        """Return expected row counts keyed by partition value (yyyyMMdd).
+
+        Each day produces ``len(rows) * files_per_day`` rows with partition
+        value = the day formatted as ``yyyyMMdd``.
+        """
+        rows_per_day = len(self.rows) * self.files_per_day
+        return {dt.strftime("%Y%m%d"): rows_per_day for dt in self.date_range}
+
+    @property
+    def total_expected_rows(self) -> int:
+        """Total rows expected across all partitions."""
+        return len(self.rows) * self.files_per_day * self.days
+
 
 def generate_scope_script(dataset: ScopeDataset) -> str:
     """Generate a complete SCOPE script that creates SS files.

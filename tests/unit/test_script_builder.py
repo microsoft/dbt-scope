@@ -112,6 +112,70 @@ class TestScriptBuilderIncremental:
         assert "2026-04-01" in script
 
 
+class TestScriptBuilderMultiPartition:
+    """Tests for multi-column partitioning support."""
+
+    def test_multi_partition_creates_partitioned_by(self, multi_partition_config):
+        script = ScriptBuilder.build_full_refresh(multi_partition_config, "SELECT * FROM @data")
+        assert "PARTITIONED BY (event_year_date, edition)" in script
+
+    def test_multi_partition_excludes_only_date_col_from_extract(self, multi_partition_config):
+        """Only the first (date-derived) partition column is excluded from EXTRACT.
+        Additional partition columns like 'edition' are real data and must be extracted."""
+        script = ScriptBuilder.build_full_refresh(multi_partition_config, "SELECT * FROM @data")
+        lines = script.split("\n")
+        extract_section = False
+        found_edition = False
+        for line in lines:
+            if "EXTRACT" in line:
+                extract_section = True
+            if "USING Extractors" in line:
+                extract_section = False
+            if extract_section:
+                if "event_year_date" in line:
+                    raise AssertionError("event_year_date should not be in EXTRACT")
+                if "edition" in line and ":" in line:
+                    found_edition = True
+        assert found_edition, "edition should be in EXTRACT (it's a real data column)"
+
+    def test_multi_partition_delete_uses_first_col(self, multi_partition_config):
+        multi_partition_config.delete_before_insert = True
+        script = ScriptBuilder.build_incremental(
+            multi_partition_config, "SELECT * FROM @data", "2026-04-01", "2026-04-02"
+        )
+        assert "DELETE FROM @target_rw" in script
+        # Should use first partition column (event_year_date) for date range
+        assert "event_year_date >= @startDate" in script
+
+    def test_multi_partition_incremental_batch(self, multi_partition_config):
+        script = ScriptBuilder.build_incremental(
+            multi_partition_config, "SELECT * FROM @data", "2026-04-01", "2026-04-02"
+        )
+        assert "PARTITIONED BY (event_year_date, edition)" in script
+        assert "INSERT INTO @target" in script
+
+
+class TestScriptBuilderDaysPerBatch:
+    """Tests for the days_per_batch config."""
+
+    def test_days_per_batch_default_is_one(self, sample_config):
+        assert sample_config.days_per_batch == 1
+
+    def test_days_per_batch_set(self, sample_config):
+        sample_config.days_per_batch = 15
+        assert sample_config.days_per_batch == 15
+
+    def test_wide_date_range_incremental(self, sample_config):
+        """With days_per_batch=15, a single script covers 15 days."""
+        sample_config.days_per_batch = 15
+        script = ScriptBuilder.build_incremental(
+            sample_config, "SELECT * FROM @data", "2026-02-01", "2026-02-16"
+        )
+        assert '#DECLARE @startDate string = "2026-02-01"' in script
+        assert '#DECLARE @endDate string = "2026-02-16"' in script
+        assert "INSERT INTO @target" in script
+
+
 class TestScriptBuilderCheckpoint:
     def test_generates_checkpoint_query(self, sample_config):
         script = ScriptBuilder.build_checkpoint(sample_config, "event_year_date")
@@ -141,6 +205,14 @@ class TestScriptConfig:
             table_name="my_tbl",
         )
         assert cfg.resolved_delta_location == ("abfss://ctr@acct.dfs.core.windows.net/delta/my_tbl")
+
+    def test_partition_by_as_list(self):
+        cfg = ScriptConfig(partition_by=["event_year_date", "edition"])
+        assert cfg.partition_by == ["event_year_date", "edition"]
+
+    def test_partition_by_as_string(self):
+        cfg = ScriptConfig(partition_by="event_year_date")
+        assert cfg.partition_by == "event_year_date"
 
 
 class TestColumnDef:

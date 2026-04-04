@@ -167,10 +167,27 @@ function Invoke-Debug {
 }
 
 function Invoke-Integrationtest {
-    Write-Step "integration-test: Running pytest tests/integration/ against ADLA"
+    Write-Step "integration-test: Running pytest tests/integration/ against ADLA (parallel)"
     Ensure-Installed
     Assert-Az
-    & $VenvPython -m pytest (Join-Path $ProjectDir "tests\integration") -v -s --timeout=3600
+
+    $logsDir = Join-Path $ProjectDir ".logs"
+    if (Test-Path $logsDir) { Remove-Item $logsDir -Recurse -Force }
+    New-Item -Path $logsDir -ItemType Directory -Force | Out-Null
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    & $VenvPython -m pytest (Join-Path $ProjectDir "tests\integration") -v -s --timeout=3600 -n 4
+    $sw.Stop()
+
+    Write-Host ""
+    Write-Host "  Integration tests completed in $($sw.Elapsed.ToString('hh\:mm\:ss'))" -ForegroundColor Green
+
+    if (Test-Path $logsDir) {
+        $logCount = (Get-ChildItem -Path $logsDir -Recurse -File | Measure-Object).Count
+        $logDirs = (Get-ChildItem -Path $logsDir -Directory | Measure-Object).Count
+        Write-Host "  Logs: $logCount files across $logDirs test directories in .logs/" -ForegroundColor Cyan
+    }
+
     if ($LASTEXITCODE -ne 0) { throw "Integration tests failed" }
 }
 
