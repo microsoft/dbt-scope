@@ -22,6 +22,7 @@ from dbt_common.exceptions import DbtDatabaseError, DbtRuntimeError
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK, FileLock
 from dbt.adapters.scope.credentials import ScopeCredentials
 
 log = logging.getLogger(__name__)
@@ -154,7 +155,8 @@ class ScopeConnectionHandle:
     def _get_token(self) -> str:
         if self._cached_token and time.time() < self._token_expires_at - 300:
             return self._cached_token
-        token = self._credential.get_token(ADLA_TOKEN_SCOPE)
+        with FileLock(AZ_CLI_TOKEN_LOCK):
+            token = self._credential.get_token(ADLA_TOKEN_SCOPE)
         self._cached_token = token.token
         self._token_expires_at = token.expires_on
         return self._cached_token

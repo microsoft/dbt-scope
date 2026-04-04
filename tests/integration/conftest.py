@@ -19,8 +19,11 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from azure.identity import AzureCliCredential
 from datagen import ScopeDataset, make_default_dataset, submit_datagen_job
 from dbt.cli.main import dbtRunner
+
+from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK, FileLock
 
 PROJECT_DIR = Path(__file__).parent / "dbt_project"
 REPO_ROOT = Path(__file__).parent.parent.parent
@@ -232,6 +235,14 @@ def verify_delta(delta_path: str) -> dict:
     return {"parquet_count": len(parquet), "partitions": partitions}
 
 
+def _get_storage_token() -> str:
+    """Acquire an Azure Storage token using the file-locked credential."""
+    cred = AzureCliCredential()
+    with FileLock(AZ_CLI_TOKEN_LOCK):
+        token = cred.get_token("https://storage.azure.com/.default")
+    return token.token
+
+
 def verify_delta_with_duckdb(
     delta_path: str,
     expected_manifest: dict[str, int] | None = None,
@@ -253,10 +264,8 @@ def verify_delta_with_duckdb(
     conn.execute("INSTALL azure;")
     conn.execute("LOAD azure;")
 
-    try:
-        conn.execute("CREATE SECRET az1 (TYPE AZURE, PROVIDER CREDENTIAL_CHAIN, CHAIN 'cli;env');")
-    except duckdb.Error:
-        conn.execute("CREATE SECRET az1 (TYPE AZURE, PROVIDER CREDENTIAL_CHAIN);")
+    token = _get_storage_token()
+    conn.execute(f"CREATE SECRET az1 (TYPE AZURE, PROVIDER ACCESS_TOKEN, ACCESS_TOKEN '{token}');")
     result_info: dict = {"total_rows": 0, "partition_counts": {}, "errors": []}
 
     try:
