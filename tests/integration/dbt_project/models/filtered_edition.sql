@@ -7,15 +7,11 @@
         begin=var('datagen_start_date', '2026-02-01'),
         lookback=1,
         partition_by=['event_year_date', 'edition'],
-        delta_location=var('delta_location'),
+        delta_location=var('delta_location_filtered'),
         ss_source_path=var('ss_source_path'),
         days_per_batch=32,
         au=4,
         priority=1,
-        scope_settings={
-            'microsoft.scope.compression': 'vorder:zstd#11',
-            'delta.checkpointInterval': 5
-        },
         scope_columns=[
             {'name': 'logical_server_name', 'type': 'string'},
             {'name': 'logical_database_name', 'type': 'string'},
@@ -37,3 +33,4 @@ SELECT
     max_size_bytes,
     _date.ToString("yyyyMMdd") AS event_year_date
 FROM @data
+WHERE edition == "Standard"

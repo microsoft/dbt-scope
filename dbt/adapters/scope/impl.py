@@ -136,6 +136,17 @@ class ScopeAdapter(BaseAdapter):
         handle: ScopeConnectionHandle = connection.handle  # type: ignore[assignment]
         handle._next_job_name = name
 
+    @available
+    def get_where_connector(self, model_sql: str) -> str:
+        """Return ``'AND'`` if *model_sql* already has a ``WHERE``, else ``'WHERE'``.
+
+        Called from Jinja macros to merge date predicates without
+        producing duplicate ``WHERE`` clauses.
+        """
+        from dbt.adapters.scope.sqlglot_parser import parser
+
+        return "AND" if parser.has_top_level_where(model_sql) else "WHERE"
+
     def submit_scope_script(
         self,
         script: str,

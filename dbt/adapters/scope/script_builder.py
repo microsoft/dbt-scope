@@ -318,26 +318,26 @@ def _model_transform_and_insert(
     batch_start: str | None = None,
     batch_end: str | None = None,
 ) -> str:
-    # Build the user's transformation as a rowset variable
-    # The model_sql is the user's SELECT statement
+    from dbt.adapters.scope.sqlglot_parser import parser
+
     parts: list[str] = []
 
-    # Apply date filter for incremental
-    where_clause = ""
+    # Strip trailing semicolons — the template adds its own
+    sql = model_sql.strip().rstrip(";").rstrip()
+
+    # Build the date predicate for incremental batches
+    date_predicate = ""
     if batch_start and batch_end:
-        where_clause = textwrap.dedent("""\
-            WHERE _date >= DateTime.Parse(@startDate)
+        already_has_where = parser.has_top_level_where(sql)
+        connector = "AND" if already_has_where else "WHERE"
+        date_predicate = textwrap.dedent(f"""\
+            {connector} _date >= DateTime.Parse(@startDate)
               AND _date < DateTime.Parse(@endDate)""")
 
-    # Wrap the user's SELECT with the date filter
     parts.append("@batch_data =")
-    # Inject the model SQL — the user writes something like:
-    #   SELECT col1, col2, _date.ToString("yyyyMMdd") AS event_year_date
-    #   FROM @data
-    # We need to ensure the FROM @data and WHERE clause are included
-    parts.append(f"    {model_sql.strip()}")
-    if where_clause:
-        parts.append(f"    {where_clause.strip()}")
+    parts.append(f"    {sql}")
+    if date_predicate:
+        parts.append(f"    {date_predicate.strip()}")
     parts.append(";")
     parts.append("")
     parts.append("INSERT INTO @target")

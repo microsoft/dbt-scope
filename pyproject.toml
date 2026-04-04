@@ -19,6 +19,7 @@ dependencies = [
     "requests>=2.31.0",
     "pyyaml>=6.0",
     "agate>=1.9.1",
+    "sqlglot>=26.0.0",
 ]
 
 [project.optional-dependencies]

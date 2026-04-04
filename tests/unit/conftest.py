@@ -25,7 +25,10 @@ def sample_config(sample_columns: list[ColumnDef]) -> ScriptConfig:
         table_name="my_table",
         partition_by="event_year_date",
         ss_base_path="/shares/test/ss/MyStream",
-        scope_settings={"microsoft.scope.compression": "zstd#11"},
+        scope_settings={
+            "microsoft.scope.compression": "zstd#11",
+            "delta.checkpointInterval": 5,
+        },
         feature_previews="EnableDeltaTableDynamicInsert:on",
         au=100,
         priority=1,

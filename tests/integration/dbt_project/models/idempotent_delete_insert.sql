@@ -13,6 +13,10 @@
         days_per_batch=32,
         au=4,
         priority=1,
+        scope_settings={
+            'microsoft.scope.compression': 'vorder:zstd#11',
+            'delta.checkpointInterval': 10
+        },
         scope_columns=[
             {'name': 'logical_server_name', 'type': 'string'},
             {'name': 'logical_database_name', 'type': 'string'},

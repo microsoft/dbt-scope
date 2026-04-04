@@ -305,9 +305,10 @@ WHERE {{ partition_cols[0] }} >= @startDate.Replace("-", "")
     USING Extractors.SStream();
 
 {# -- User's transformation + date filter + INSERT -- #}
+{%- set where_connector = adapter.get_where_connector(model_sql) -%}
 @batch_data =
     {{ model_sql }}
-    WHERE _date >= DateTime.Parse(@startDate)
+    {{ where_connector }} _date >= DateTime.Parse(@startDate)
       AND _date < DateTime.Parse(@endDate);
 
 INSERT INTO @target

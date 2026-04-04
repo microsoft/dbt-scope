@@ -1,6 +1,12 @@
 """Tests for ScriptBuilder — pure unit tests, no ADLA calls."""
 
+import re
+
+import sqlglot
+from sqlglot import exp
+
 from dbt.adapters.scope.script_builder import ColumnDef, ScriptBuilder, ScriptConfig
+from dbt.adapters.scope.sqlglot_parser import _normalize_scope_sql
 
 
 class TestScriptBuilderFullRefresh:
@@ -27,6 +33,14 @@ class TestScriptBuilderFullRefresh:
         assert "ALTER TABLE @target SET TBLPROPERTIES" in script
         assert '"microsoft.scope.compression"' in script
         assert '"zstd#11"' in script
+        assert '"delta.checkpointInterval" = 5' in script
+
+    def test_multi_prop_single_tblproperties(self, sample_config):
+        """Multiple scope_settings must produce a single ALTER TABLE statement."""
+        script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
+        assert script.count("ALTER TABLE") == 1
+        assert '"microsoft.scope.compression" = "zstd#11"' in script
+        assert '"delta.checkpointInterval" = 5' in script
 
     def test_skips_alter_when_no_settings(self, sample_config):
         sample_config.scope_settings = {}
@@ -110,6 +124,15 @@ class TestScriptBuilderIncremental:
         )
         assert "microbatch" in script
         assert "2026-04-01" in script
+
+    def test_multi_prop_single_tblproperties(self, sample_config):
+        """Multiple scope_settings produce a single ALTER TABLE in incremental scripts."""
+        script = ScriptBuilder.build_incremental(
+            sample_config, "SELECT * FROM @data", "2026-04-01", "2026-04-02"
+        )
+        assert script.count("ALTER TABLE") == 1
+        assert '"microsoft.scope.compression" = "zstd#11"' in script
+        assert '"delta.checkpointInterval" = 5' in script
 
 
 class TestScriptBuilderMultiPartition:
@@ -213,6 +236,108 @@ class TestScriptConfig:
     def test_partition_by_as_string(self):
         cfg = ScriptConfig(partition_by="event_year_date")
         assert cfg.partition_by == "event_year_date"
+
+
+class TestScriptBuilderFilteredSQL:
+    """Tests for model SQL that already contains a WHERE clause."""
+
+    def test_incremental_with_existing_where_uses_and(self, sample_config):
+        """When model SQL has WHERE, the date predicate is injected with AND."""
+        model_sql = (
+            "SELECT col_str, col_long, col_dt,\n"
+            '    _date.ToString("yyyyMMdd") AS event_year_date\n'
+            "FROM @data\n"
+            'WHERE col_str == "hello"'
+        )
+        script = ScriptBuilder.build_incremental(
+            sample_config, model_sql, "2026-04-01", "2026-04-02"
+        )
+        assert "AND _date >= DateTime.Parse(@startDate)" in script
+        assert "AND _date < DateTime.Parse(@endDate)" in script
+        # Must NOT have a second WHERE — only the user's WHERE and ANDs
+        batch_section = script.split("@batch_data =")[1].split("INSERT INTO")[0]
+        where_count = batch_section.upper().count("WHERE")
+        assert where_count == 1, f"Expected 1 WHERE, found {where_count}"
+
+    def test_incremental_without_where_uses_where(self, sample_config):
+        """When model SQL has no WHERE, date predicate uses WHERE (existing behavior)."""
+        model_sql = "SELECT * FROM @data"
+        script = ScriptBuilder.build_incremental(
+            sample_config, model_sql, "2026-04-01", "2026-04-02"
+        )
+        assert "WHERE _date >= DateTime.Parse(@startDate)" in script
+        assert "AND _date < DateTime.Parse(@endDate)" in script
+
+    def test_full_refresh_with_existing_where_no_date_filter(self, sample_config):
+        """Full refresh never injects date filter, even with WHERE in model SQL."""
+        model_sql = 'SELECT * FROM @data WHERE col_str == "hello"'
+        script = ScriptBuilder.build_full_refresh(sample_config, model_sql)
+        assert 'WHERE col_str == "hello"' in script
+        assert "DateTime.Parse" not in script
+
+    def test_incremental_with_complex_where(self, sample_config):
+        """Model SQL with multi-condition WHERE still gets AND for date predicate."""
+        model_sql = (
+            'SELECT col_str, col_long\nFROM @data\nWHERE col_str == "hello" AND col_long > 100'
+        )
+        script = ScriptBuilder.build_incremental(
+            sample_config, model_sql, "2026-04-01", "2026-04-02"
+        )
+        assert 'WHERE col_str == "hello" AND col_long > 100' in script
+        assert "AND _date >= DateTime.Parse(@startDate)" in script
+
+    def test_trailing_semicolon_stripped(self, sample_config):
+        """Model SQL with trailing semicolon doesn't break injection."""
+        model_sql = "SELECT * FROM @data;"
+        script = ScriptBuilder.build_incremental(
+            sample_config, model_sql, "2026-04-01", "2026-04-02"
+        )
+        assert "WHERE _date >= DateTime.Parse(@startDate)" in script
+        assert "INSERT INTO @target" in script
+
+    def test_no_duplicate_where_via_sqlglot(self, multi_partition_config):
+        """Regression: filtered model SQL must produce exactly one WHERE clause.
+
+        Uses sqlglot to parse the generated batch SELECT and assert no
+        duplicate WHERE nodes exist — mirrors the ADLA error
+        E_CSC_USER_DUPLICATECLAUSES.
+        """
+        # Exact model SQL from filtered_edition.sql
+        model_sql = (
+            "SELECT\n"
+            "    logical_server_name,\n"
+            "    logical_database_name,\n"
+            "    edition,\n"
+            "    state,\n"
+            "    region_name,\n"
+            "    max_size_bytes,\n"
+            '    _date.ToString("yyyyMMdd") AS event_year_date\n'
+            "FROM @data\n"
+            'WHERE edition == "Standard"'
+        )
+        script = ScriptBuilder.build_incremental(
+            multi_partition_config, model_sql, "2026-02-01", "2026-03-05"
+        )
+
+        # Extract the @batch_data assignment (between "@batch_data =" and ";")
+        batch_match = re.search(r"@batch_data\s*=\s*(.*?);", script, re.DOTALL)
+        assert batch_match, "Could not find @batch_data assignment in script"
+        batch_sql = batch_match.group(1).strip()
+
+        # 1) String-level check: only one WHERE keyword
+        where_count = len(re.findall(r"\bWHERE\b", batch_sql, re.IGNORECASE))
+        assert where_count == 1, (
+            f"Expected exactly 1 WHERE in batch SQL, found {where_count}:\n{batch_sql}"
+        )
+
+        # 2) sqlglot parse of normalised batch SQL — must have exactly one Where node
+        normalized = _normalize_scope_sql(batch_sql)
+        parsed = sqlglot.parse_one(normalized, error_level=sqlglot.ErrorLevel.IGNORE)
+        assert isinstance(parsed, exp.Select), f"Expected Select node, got {type(parsed).__name__}"
+        where_nodes = list(parsed.find_all(exp.Where))
+        assert len(where_nodes) == 1, (
+            f"sqlglot found {len(where_nodes)} WHERE nodes, expected 1:\n{batch_sql}"
+        )
 
 
 class TestColumnDef:

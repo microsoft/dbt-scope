@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "integration"))
 from datagen import (
     ScopeColumn,
     ScopeDataset,
+    dataset_to_records,
     generate_scope_script,
     make_default_dataset,
 )
@@ -169,3 +170,44 @@ class TestExpectedRowsPerPartition:
         # 10 rows * 2 files = 20 rows
         assert manifest["20260301"] == 20
         assert ds.total_expected_rows == 20
+
+
+class TestDatasetToRecords:
+    """Tests for dataset_to_records — converts ScopeDataset to Python dicts."""
+
+    def test_record_count_matches_total(self):
+        ds = make_default_dataset(ss_root="/local/test/ss", days=3, files_per_day=2)
+        records = dataset_to_records(ds)
+        assert len(records) == ds.total_expected_rows
+
+    def test_scope_string_quoting_stripped(self):
+        ds = make_default_dataset(ss_root="/local/test/ss", days=1, files_per_day=1)
+        records = dataset_to_records(ds)
+        # First row has logical_server_name = '"server-001"' → 'server-001'
+        assert records[0]["logical_server_name"] == "server-001"
+
+    def test_long_suffix_stripped(self):
+        ds = make_default_dataset(ss_root="/local/test/ss", days=1, files_per_day=1)
+        records = dataset_to_records(ds)
+        # First row has max_size_bytes = '1073741824L' → 1073741824
+        assert records[0]["max_size_bytes"] == 1073741824
+
+    def test_event_year_date_computed(self):
+        ds = make_default_dataset(
+            ss_root="/local/test/ss", start_date="2026-03-15", days=1, files_per_day=1
+        )
+        records = dataset_to_records(ds)
+        assert records[0]["event_year_date"] == "20260315"
+
+    def test_edition_values_present(self):
+        ds = make_default_dataset(ss_root="/local/test/ss", days=1, files_per_day=1)
+        records = dataset_to_records(ds)
+        editions = {r["edition"] for r in records}
+        assert editions == {"Standard", "Premium", "Basic"}
+
+    def test_filter_by_edition(self):
+        ds = make_default_dataset(ss_root="/local/test/ss", days=5, files_per_day=2)
+        records = dataset_to_records(ds)
+        standard = [r for r in records if r["edition"] == "Standard"]
+        # 2 Standard rows out of 4, x 2 files x 5 days = 20
+        assert len(standard) == 20

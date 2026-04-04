@@ -273,3 +273,49 @@ def make_default_dataset(
         days=days,
         files_per_day=files_per_day,
     )
+
+
+# -- Expected data as records ------------------------------------------------
+
+
+def _parse_scope_value(raw: str, scope_type: str) -> str | int | float:
+    """Convert a SCOPE literal string to a Python-native value.
+
+    Examples:
+        ``'"server-001"'`` → ``'server-001'`` (strip SCOPE double quotes)
+        ``'1073741824L'`` → ``1073741824``     (strip L suffix, cast to int)
+    """
+    if raw.startswith('"') and raw.endswith('"'):
+        return raw[1:-1]
+    if scope_type == "long" and raw.endswith("L"):
+        return int(raw[:-1])
+    if scope_type in ("int", "long"):
+        return int(raw)
+    if scope_type in ("float", "double"):
+        return float(raw)
+    return raw
+
+
+def dataset_to_records(dataset: ScopeDataset) -> list[dict]:
+    """Convert a ScopeDataset to a list of row dicts with Python-native types.
+
+    Each record represents one row as it would appear in the Delta table
+    after EXTRACT + model transform.  The ``event_year_date`` column is
+    computed from the date (``yyyyMMdd`` format).
+
+    Returns one record per ``row x file_per_day x day``.
+    """
+    records: list[dict] = []
+    for dt in dataset.date_range:
+        for _serial in range(dataset.files_per_day):
+            for row in dataset.rows:
+                record: dict = {}
+                for i, col in enumerate(dataset.columns):
+                    val = row[i]
+                    if val is None and col.name == "PreciseTimeStamp":
+                        record[col.name] = f"{dt.isoformat()} 19:00:00"
+                    else:
+                        record[col.name] = _parse_scope_value(str(val), col.scope_type)
+                record["event_year_date"] = dt.strftime("%Y%m%d")
+                records.append(record)
+    return records
