@@ -77,6 +77,12 @@ flowchart TB
 On **full refresh**, all batches run and there is no `DELETE` step.
 On **incremental**, dbt only runs batches after the last checkpoint (`MAX(event_time)` from the target). The `DELETE` (highlighted red) makes each batch idempotent — re-running the same batch replaces the partition.
 
+The scope jobs end up looking like this in ADLA:
+
+![Many scope jobs queued and run](.imgs/many-scope-jobs.png)
+
+![One generated scope job](.imgs/a-scope-job.png)
+
 ## Install
 
 ```powershell
