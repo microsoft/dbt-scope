@@ -76,6 +76,7 @@
 
             {{ log("SCOPE: Full refresh for " ~ identifier, info=True) }}
 
+            {% do adapter.set_next_job_name(identifier ~ "_full-refresh") %}
             {%- call statement('main') -%}
                 {{ scope_script }}
             {%- endcall -%}
@@ -102,6 +103,7 @@
 
         {{ log("SCOPE: Full refresh for " ~ identifier, info=True) }}
 
+        {% do adapter.set_next_job_name(identifier ~ "_full-refresh") %}
         {%- call statement('main') -%}
             {{ scope_script }}
         {%- endcall -%}
@@ -146,6 +148,7 @@
 
                         {{ log("SCOPE: Microbatch " ~ batch_start ~ " → " ~ widened_end ~ " (days_per_batch=" ~ days_per_batch ~ ") for " ~ identifier, info=True) }}
 
+                        {% do adapter.set_next_job_name(identifier ~ "_" ~ batch_start ~ "_" ~ widened_end) %}
                         {%- call statement('main') -%}
                             {{ scope_script }}
                         {%- endcall -%}
@@ -168,6 +171,7 @@
 
                     {{ log("SCOPE: Microbatch " ~ batch_start ~ " → " ~ batch_end ~ " for " ~ identifier, info=True) }}
 
+                    {% do adapter.set_next_job_name(identifier ~ "_" ~ batch_start ~ "_" ~ batch_end) %}
                     {%- call statement('main') -%}
                         {{ scope_script }}
                     {%- endcall -%}
@@ -194,6 +198,7 @@
 
             {{ log("SCOPE: Append for " ~ identifier, info=True) }}
 
+            {% do adapter.set_next_job_name(identifier ~ "_append") %}
             {%- call statement('main') -%}
                 {{ scope_script }}
             {%- endcall -%}

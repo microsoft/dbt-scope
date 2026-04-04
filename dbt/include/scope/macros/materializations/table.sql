@@ -40,6 +40,7 @@
 
     {{ log("Submitting SCOPE full-refresh job for " ~ identifier, info=True) }}
 
+    {% do adapter.set_next_job_name(identifier ~ "_full-refresh") %}
     {%- call statement('main') -%}
         {{ scope_script }}
     {%- endcall -%}

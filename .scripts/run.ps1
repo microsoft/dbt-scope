@@ -176,7 +176,9 @@ function Invoke-Integrationtest {
     New-Item -Path $logsDir -ItemType Directory -Force | Out-Null
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    & $VenvPython -m pytest (Join-Path $ProjectDir "tests\integration") -v -s --timeout=3600 -n 4
+    $numCores = (Get-CimInstance -ClassName Win32_Processor | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
+    Write-Host "  Using $numCores parallel workers (logical cores)" -ForegroundColor Cyan
+    & $VenvPython -m pytest (Join-Path $ProjectDir "tests\integration") -v -s --timeout=3600 -n $numCores
     $sw.Stop()
 
     Write-Host ""

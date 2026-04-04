@@ -6,7 +6,7 @@ import logging
 from typing import Any
 
 import agate
-from dbt.adapters.base import BaseAdapter
+from dbt.adapters.base import BaseAdapter, available
 from dbt_common.exceptions import DbtRuntimeError
 
 from dbt.adapters.scope.column import ScopeColumn
@@ -128,6 +128,13 @@ class ScopeAdapter(BaseAdapter):
     # ------------------------------------------------------------------
     # Custom adapter methods (called from macros)
     # ------------------------------------------------------------------
+
+    @available
+    def set_next_job_name(self, name: str) -> None:
+        """Set the ADLA job name for the next ``execute()`` call on this thread."""
+        connection = self.connections.get_thread_connection()
+        handle: ScopeConnectionHandle = connection.handle  # type: ignore[assignment]
+        handle._next_job_name = name
 
     def submit_scope_script(
         self,

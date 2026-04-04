@@ -1,7 +1,7 @@
 """Integration test fixtures.
 
 Two-phase datagen simulates a production lifecycle:
-  Phase 1: Historical data (3 days) -> full refresh
+  Phase 1: Historical data (31 days) -> full refresh
   Phase 2: New data arrives (2 more days) -> incremental picks it up
 
 All names are descriptive so you can trace SS streams and Delta tables
@@ -56,12 +56,12 @@ class ScenarioConfig:
     """Holds both phases of a test scenario's SS data + Delta paths."""
 
     name: str
-    historical: ScopeDataset  # Phase 1: initial 3 days
+    historical: ScopeDataset  # Phase 1: initial 31 days
     new_data: ScopeDataset  # Phase 2: 2 more days arriving later
     delta_location: str  # Where the Delta table lands
 
 
-def _build_scenario(label: str, historical_days: int = 3, new_days: int = 2) -> ScenarioConfig:
+def _build_scenario(label: str, historical_days: int = 31, new_days: int = 2) -> ScenarioConfig:
     """Build a test scenario with datagen datasets."""
     ss_root = _env("SCOPE_SS_TEST_ROOT")
     stream = f"{label}_{_PREFIX}"
@@ -76,7 +76,7 @@ def _build_scenario(label: str, historical_days: int = 3, new_days: int = 2) -> 
     new_data = make_default_dataset(
         ss_root=ss_root,
         stream_name=stream,  # same stream -- new files appear in later dates
-        start_date="2026-02-04",  # starts after historical
+        start_date="2026-03-04",  # starts after historical
         days=new_days,
         files_per_day=2,
     )
@@ -96,7 +96,7 @@ def append_scenario() -> ScenarioConfig:
     adla = _env("SCOPE_ADLA_ACCOUNT")
 
     log.info("Generating historical SS files for append scenario")
-    submit_datagen_job(scenario.historical, adla_account=adla, au=10)
+    submit_datagen_job(scenario.historical, adla_account=adla, au=5)
     return scenario
 
 
@@ -107,7 +107,7 @@ def delete_insert_scenario() -> ScenarioConfig:
     adla = _env("SCOPE_ADLA_ACCOUNT")
 
     log.info("Generating historical SS files for delete+insert scenario")
-    submit_datagen_job(scenario.historical, adla_account=adla, au=10)
+    submit_datagen_job(scenario.historical, adla_account=adla, au=5)
     return scenario
 
 

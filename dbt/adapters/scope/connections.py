@@ -84,6 +84,7 @@ class ScopeConnectionHandle:
         self._session = self._build_session(credentials.http_retries)
         self._cached_token: str | None = None
         self._token_expires_at: float = 0
+        self._next_job_name: str | None = None
 
     # -- Job operations -----------------------------------------------
 
@@ -255,8 +256,10 @@ class ScopeConnectionManager(BaseConnectionManager):
             return AdapterResponse(_message="OK"), agate.Table(rows=[])
 
         with self.exception_handler(sql):
+            effective_name = handle._next_job_name or job_name
+            handle._next_job_name = None
             job = handle.submit_and_wait(
-                name=job_name,
+                name=effective_name,
                 script=sql,
                 au=credentials.au,
                 priority=credentials.priority,

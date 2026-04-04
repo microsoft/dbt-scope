@@ -107,7 +107,7 @@ class TestIncrementalAppend:
 
         # Step 2: Generate new SS data (phase 2)
         log.info("Generating new SS data for incremental test")
-        submit_datagen_job(append_scenario.new_data, adla_account=adla_account, au=10)
+        submit_datagen_job(append_scenario.new_data, adla_account=adla_account, au=5)
 
         # Step 3: Incremental run (should pick up only new dates)
         result = run_dbt(
@@ -217,7 +217,7 @@ class TestIncrementalDeleteInsert:
 
         # Step 2: Generate new SS data
         log.info("Generating new SS data for delete+insert incremental test")
-        submit_datagen_job(delete_insert_scenario.new_data, adla_account=adla_account, au=10)
+        submit_datagen_job(delete_insert_scenario.new_data, adla_account=adla_account, au=5)
 
         # Step 3: Incremental run
         result = run_dbt(
