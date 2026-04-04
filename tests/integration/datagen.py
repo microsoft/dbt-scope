@@ -171,7 +171,7 @@ def generate_scope_script(dataset: ScopeDataset) -> str:
 def submit_datagen_job(
     dataset: ScopeDataset,
     adla_account: str,
-    au: int = 10,
+    au: int = 5,
     priority: int = 1,
     poll_interval: int = 5,
     max_wait: int = 3600,
