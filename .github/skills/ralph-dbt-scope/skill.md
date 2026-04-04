@@ -41,6 +41,7 @@ Execute the regression testing loop: analyze diffs → run full pipeline → fix
 - **Python**: 3.10+
 - **Auth**: `az login` required for debug/integration targets
 - **Config**: `.env` file required (copy from `.env.example`)
+- **Logs**: PowerShell transcript + pytest logs in `.logs/`
 
 ### Key directories
 

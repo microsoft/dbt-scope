@@ -53,6 +53,13 @@ function Load-EnvFile {
 
 Load-EnvFile
 
+# ── Logging setup ────────────────────────────────────────────────────────────
+
+$LogsDir = Join-Path $ProjectDir ".logs"
+if (Test-Path $LogsDir) { Remove-Item $LogsDir -Recurse -Force }
+New-Item -Path $LogsDir -ItemType Directory -Force | Out-Null
+$TranscriptFile = Join-Path $LogsDir "powershell_$Target.log"
+
 function Assert-EnvVar([string]$name) {
     $val = [Environment]::GetEnvironmentVariable($name, "Process")
     if (-not $val) {
@@ -171,10 +178,6 @@ function Invoke-Integrationtest {
     Ensure-Installed
     Assert-Az
 
-    $logsDir = Join-Path $ProjectDir ".logs"
-    if (Test-Path $logsDir) { Remove-Item $logsDir -Recurse -Force }
-    New-Item -Path $logsDir -ItemType Directory -Force | Out-Null
-
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $numCores = (Get-CimInstance -ClassName Win32_Processor | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
     Write-Host "  Using $numCores parallel workers (logical cores)" -ForegroundColor Cyan
@@ -184,9 +187,9 @@ function Invoke-Integrationtest {
     Write-Host ""
     Write-Host "  Integration tests completed in $($sw.Elapsed.ToString('hh\:mm\:ss'))" -ForegroundColor Green
 
-    if (Test-Path $logsDir) {
-        $logCount = (Get-ChildItem -Path $logsDir -Recurse -File | Measure-Object).Count
-        $logDirs = (Get-ChildItem -Path $logsDir -Directory | Measure-Object).Count
+    if (Test-Path $LogsDir) {
+        $logCount = (Get-ChildItem -Path $LogsDir -Recurse -File | Measure-Object).Count
+        $logDirs = (Get-ChildItem -Path $LogsDir -Directory | Measure-Object).Count
         Write-Host "  Logs: $logCount files across $logDirs test directories in .logs/" -ForegroundColor Cyan
     }
 
@@ -199,14 +202,20 @@ $targets = @("venv", "install", "build", "lint", "unit-test", "debug", "integrat
 
 Write-Host "=== dbt-scope: $Target ===" -ForegroundColor Green
 
-if ($Target -eq "all") {
-    foreach ($t in $targets) {
-        & "Invoke-$($t -replace '-','')" *>&1 | ForEach-Object { $_ }
+Start-Transcript -Path $TranscriptFile -Force
+
+try {
+    if ($Target -eq "all") {
+        foreach ($t in $targets) {
+            & "Invoke-$($t -replace '-','')" *>&1 | ForEach-Object { $_ }
+        }
+        Write-Host ""
+        Write-Host "=== All targets completed. ===" -ForegroundColor Green
     }
-    Write-Host ""
-    Write-Host "=== All targets completed. ===" -ForegroundColor Green
-}
-else {
-    $funcName = "Invoke-$($Target -replace '-','')"
-    & $funcName
+    else {
+        $funcName = "Invoke-$($Target -replace '-','')"
+        & $funcName
+    }
+} finally {
+    Stop-Transcript
 }

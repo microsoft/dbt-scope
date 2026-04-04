@@ -192,8 +192,11 @@ def verify_delta(delta_path: str) -> dict:
     """Verify Delta table via az CLI. Returns parquet_count + partition list."""
     import re as _re
 
+    log.info("Verifying Delta table via az CLI at %s", delta_path)
+
     m = _re.match(r"abfss://([^@]+)@([^.]+)\.dfs\.core\.windows\.net/(.+)", delta_path)
     if not m:
+        log.warning("Bad Delta path format: %s", delta_path)
         return {"parquet_count": 0, "partitions": [], "error": f"Bad path: {delta_path}"}
 
     container, account, prefix = m.group(1), m.group(2), m.group(3)
@@ -225,6 +228,7 @@ def verify_delta(delta_path: str) -> dict:
         shell=True,
     )
     if result.returncode != 0:
+        log.warning("az storage blob list failed: %s", result.stderr)
         return {"parquet_count": 0, "partitions": [], "error": result.stderr}
 
     blobs = json.loads(result.stdout)
@@ -232,6 +236,7 @@ def verify_delta(delta_path: str) -> dict:
     partitions = sorted(
         {pm.group(1) for b in blobs if (pm := _re.search(r"event_year_date[^=]*=(\d+)", b))}
     )
+    log.info("Delta verify result: %d parquet files, %d partitions", len(parquet), len(partitions))
     return {"parquet_count": len(parquet), "partitions": partitions}
 
 
@@ -258,6 +263,7 @@ def verify_delta_with_duckdb(
     Returns:
         dict with keys: total_rows, partition_counts, errors.
     """
+    log.info("Verifying Delta table with DuckDB at %s", delta_path)
     conn = duckdb.connect()
     conn.execute("INSTALL delta;")
     conn.execute("LOAD delta;")
@@ -306,7 +312,17 @@ def verify_delta_with_duckdb(
 
     except duckdb.Error as e:
         result_info["errors"].append(f"Delta scan failed: {e}")
+        log.error("DuckDB Delta scan failed: %s", e)
     finally:
         conn.close()
 
+    log.info(
+        "DuckDB verify result: total_rows=%d, partitions=%d, errors=%d",
+        result_info["total_rows"],
+        len(result_info["partition_counts"]),
+        len(result_info["errors"]),
+    )
+    if result_info["errors"]:
+        for err in result_info["errors"]:
+            log.warning("DuckDB verify error: %s", err)
     return result_info

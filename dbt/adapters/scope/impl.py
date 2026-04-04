@@ -120,10 +120,10 @@ class ScopeAdapter(BaseAdapter):
                     )
                 except Exception:
                     pass  # Not a Delta table — skip
-            log.debug("list_relations_without_caching found %d Delta tables", len(relations))
+            log.info("list_relations_without_caching found %d Delta tables", len(relations))
             return relations
         except Exception:
-            log.debug("list_relations_without_caching failed, returning []", exc_info=True)
+            log.info("list_relations_without_caching failed, returning []", exc_info=True)
             return []
 
     def quote(self, identifier: str) -> str:

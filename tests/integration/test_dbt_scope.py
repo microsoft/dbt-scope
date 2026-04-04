@@ -53,6 +53,12 @@ class TestFullRefresh:
         vars_ = _dbt_vars(append_scenario)
         test_name = _test_id(request)
 
+        log.info(
+            "Starting full refresh test: delta=%s, days=%d",
+            append_scenario.delta_location,
+            append_scenario.historical.days,
+        )
+
         result = run_dbt(
             ["run", "--full-refresh", "--select", "append_no_delete"],
             extra_vars=vars_,
@@ -60,6 +66,7 @@ class TestFullRefresh:
         )
         assert result.success, f"dbt run failed: {result.result}"
 
+        log.info("Verifying Delta table output")
         duckdb_info = verify_delta_with_duckdb(
             append_scenario.delta_location,
             expected_total_rows=append_scenario.historical.total_expected_rows,
@@ -75,6 +82,11 @@ class TestFullRefresh:
                 f"Expected {append_scenario.historical.days} partitions, "
                 f"got {len(non_null_partitions)}: {non_null_partitions}"
             )
+        log.info(
+            "Full refresh test passed: %d rows, %d partitions",
+            duckdb_info["total_rows"],
+            len(non_null_partitions),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +112,7 @@ class TestIncrementalAppend:
         test_name = _test_id(request)
 
         # Step 1: Full refresh with historical data
+        log.info("Step 1: Running full refresh with historical data")
         result = run_dbt(
             ["run", "--full-refresh", "--select", "append_no_delete"],
             extra_vars=vars_,
@@ -109,12 +122,14 @@ class TestIncrementalAppend:
 
         before_info = verify_delta_with_duckdb(append_scenario.delta_location)
         assert before_info["total_rows"] > 0, "Full refresh produced no rows"
+        log.info("After full refresh: %d rows", before_info["total_rows"])
 
         # Step 2: Generate new SS data (phase 2)
-        log.info("Generating new SS data for incremental test")
+        log.info("Step 2: Generating new SS data for incremental test")
         submit_datagen_job(append_scenario.new_data, adla_account=adla_account, au=5)
 
         # Step 3: Incremental run targeting the new data date range
+        log.info("Step 3: Running incremental with new data range")
         new_start = append_scenario.new_data.start_date
         new_end_date = append_scenario.new_data.date_range[-1]
         # end is exclusive, so add 1 day
@@ -137,6 +152,7 @@ class TestIncrementalAppend:
         assert result.success, f"Incremental run failed: {result.result}"
 
         # Verify new data rows are present
+        log.info("Verifying incremental results")
         after_info = verify_delta_with_duckdb(append_scenario.delta_location)
         assert after_info["total_rows"] > before_info["total_rows"], (
             f"Incremental should add rows: before={before_info['total_rows']}, "
@@ -146,6 +162,12 @@ class TestIncrementalAppend:
         actual_new = after_info["total_rows"] - before_info["total_rows"]
         assert actual_new >= expected_new, (
             f"Expected at least {expected_new} new rows, got {actual_new}"
+        )
+        log.info(
+            "Incremental append test passed: before=%d, after=%d, new=%d",
+            before_info["total_rows"],
+            after_info["total_rows"],
+            actual_new,
         )
 
 
@@ -174,6 +196,7 @@ class TestIncrementalDeleteInsert:
         }
 
         # Step 1: Full refresh
+        log.info("Step 1: Running full refresh for idempotent delete+insert test")
         result = run_dbt(
             ["run", "--full-refresh", "--select", "idempotent_delete_insert"],
             extra_vars=vars_,
@@ -186,8 +209,10 @@ class TestIncrementalDeleteInsert:
             expected_total_rows=delete_insert_scenario.historical.total_expected_rows,
         )
         assert first_info["total_rows"] > 0, "Full refresh produced no rows"
+        log.info("After full refresh: %d rows", first_info["total_rows"])
 
         # Step 2: Re-run the same full range incrementally (delete+insert)
+        log.info("Step 2: Re-running same range incrementally to test idempotency")
         # Use --event-time-start/end to cover the full historical range,
         # proving delete+insert is idempotent across the entire date span.
         hist_start = delete_insert_scenario.historical.start_date
@@ -217,6 +242,11 @@ class TestIncrementalDeleteInsert:
             f"Row count changed after idempotent re-run: "
             f"first={first_info['total_rows']}, second={second_info['total_rows']}"
         )
+        log.info(
+            "Idempotent test passed: first=%d, second=%d (equal ✓)",
+            first_info["total_rows"],
+            second_info["total_rows"],
+        )
 
     @pytest.mark.timeout(3600)
     def test_delete_insert_picks_up_new_data(
@@ -235,6 +265,7 @@ class TestIncrementalDeleteInsert:
         }
 
         # Step 1: Full refresh with historical data
+        log.info("Step 1: Running full refresh for delete+insert new data test")
         result = run_dbt(
             ["run", "--full-refresh", "--select", "idempotent_delete_insert"],
             extra_vars=vars_,
@@ -244,12 +275,14 @@ class TestIncrementalDeleteInsert:
 
         before_info = verify_delta_with_duckdb(delta_del)
         assert before_info["total_rows"] > 0, "Full refresh produced no rows"
+        log.info("After full refresh: %d rows", before_info["total_rows"])
 
         # Step 2: Generate new SS data
-        log.info("Generating new SS data for delete+insert incremental test")
+        log.info("Step 2: Generating new SS data for delete+insert incremental test")
         submit_datagen_job(delete_insert_scenario.new_data, adla_account=adla_account, au=5)
 
         # Step 3: Incremental run targeting the new data date range
+        log.info("Step 3: Running incremental with new data range")
         new_start = delete_insert_scenario.new_data.start_date
         new_end_date = delete_insert_scenario.new_data.date_range[-1]
         from datetime import timedelta
@@ -276,10 +309,16 @@ class TestIncrementalDeleteInsert:
             **delete_insert_scenario.new_data.expected_rows_per_partition(),
         }
         # DuckDB: verify new rows were added
+        log.info("Verifying delete+insert incremental results")
         after_info = verify_delta_with_duckdb(delta_del)
         assert after_info["total_rows"] > before_info["total_rows"], (
             f"Incremental should add rows: before={before_info['total_rows']}, "
             f"after={after_info['total_rows']}"
+        )
+        log.info(
+            "Delete+insert new data test passed: before=%d, after=%d",
+            before_info["total_rows"],
+            after_info["total_rows"],
         )
 
 
@@ -305,6 +344,8 @@ class TestFilteredEdition:
         test_name = _test_id(request)
         delta_filtered = f"{append_scenario.delta_location}_filtered"
 
+        log.info("Starting filtered edition test: delta=%s", delta_filtered)
+
         result = run_dbt(
             ["run", "--full-refresh", "--select", "filtered_edition"],
             extra_vars=vars_,
@@ -313,6 +354,7 @@ class TestFilteredEdition:
         assert result.success, f"dbt run failed: {result.result}"
 
         # Build expected records filtered to edition == "Standard"
+        log.info("Building expected records for filtered assertion")
         all_records = dataset_to_records(append_scenario.historical)
         expected_standard = [r for r in all_records if r.get("edition") == "Standard"]
 
@@ -364,6 +406,11 @@ class TestFilteredEdition:
                 f"Partition counts mismatch:\n"
                 f"  expected: {expected_per_partition}\n"
                 f"  actual:   {actual_per_partition}"
+            )
+            log.info(
+                "Filtered edition test passed: %d Standard rows across %d partitions",
+                len(expected_standard),
+                len(actual_per_partition),
             )
         finally:
             conn.close()

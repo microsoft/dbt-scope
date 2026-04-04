@@ -51,7 +51,7 @@ def delta_table_exists(delta_location: str) -> bool:
         conn.execute(f"SELECT 1 FROM delta_scan('{delta_location}') LIMIT 0")
         return True
     except Exception:
-        log.debug("delta_table_exists(%s) → False (not found or error)", delta_location)
+        log.info("delta_table_exists(%s) → False (not found or error)", delta_location)
         return False
     finally:
         if conn is not None:
@@ -72,11 +72,11 @@ def get_max_partition(delta_location: str, partition_col: str) -> str | None:
         ).fetchone()
         if row and row[0] is not None:
             result = str(row[0])
-            log.debug("get_max_partition(%s, %s) → %s", delta_location, partition_col, result)
+            log.info("get_max_partition(%s, %s) → %s", delta_location, partition_col, result)
             return result
         return None
     except Exception:
-        log.debug(
+        log.info(
             "get_max_partition(%s, %s) → None (error)",
             delta_location,
             partition_col,

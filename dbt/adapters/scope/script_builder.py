@@ -6,9 +6,12 @@ into self-contained SCOPE scripts that can be submitted to ADLA as jobs.
 
 from __future__ import annotations
 
+import logging
 import textwrap
 from dataclasses import dataclass, field
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -96,6 +99,11 @@ class ScriptBuilder:
           4. EXTRACT from SS files (full range — no date filter)
           5. INSERT INTO target from user's SELECT
         """
+        log.info(
+            "Building full-refresh script for %s → %s",
+            config.table_name,
+            config.resolved_delta_location,
+        )
         parts: list[str] = []
         delta_loc = config.resolved_delta_location
 
@@ -108,7 +116,9 @@ class ScriptBuilder:
         parts.append(_extract_from_ss(config.columns, config.partition_by))
         parts.append(_model_transform_and_insert(model_sql, config.partition_by))
 
-        return "\n".join(parts)
+        script = "\n".join(parts)
+        log.info("Full-refresh script length: %d chars", len(script))
+        return script
 
     @staticmethod
     def build_incremental(
@@ -127,6 +137,13 @@ class ScriptBuilder:
           5. EXTRACT from SS files filtered by batch date range
           6. INSERT INTO target from user's SELECT
         """
+        log.info(
+            "Building incremental script for %s (batch %s → %s, delete_before_insert=%s)",
+            config.table_name,
+            batch_start,
+            batch_end,
+            config.delete_before_insert,
+        )
         parts: list[str] = []
         delta_loc = config.resolved_delta_location
 
@@ -150,7 +167,9 @@ class ScriptBuilder:
             _model_transform_and_insert(model_sql, config.partition_by, batch_start, batch_end)
         )
 
-        return "\n".join(parts)
+        script = "\n".join(parts)
+        log.info("Incremental script length: %d chars", len(script))
+        return script
 
     @staticmethod
     def build_checkpoint(
@@ -161,6 +180,7 @@ class ScriptBuilder:
 
         The result is output to a temporary SS file that the adapter reads.
         """
+        log.info("Building checkpoint script for %s (column=%s)", config.table_name, event_time_col)
         delta_loc = config.resolved_delta_location
         return textwrap.dedent(f"""\
             // Checkpoint query for {config.table_name}
@@ -177,6 +197,7 @@ class ScriptBuilder:
     @staticmethod
     def build_drop(config: ScriptConfig) -> str:
         """Generate a SCOPE script to drop (delete all data from) a Delta table."""
+        log.info("Building drop script for %s", config.table_name)
         delta_loc = config.resolved_delta_location
         return textwrap.dedent(f"""\
             // Drop all data from {config.table_name}
