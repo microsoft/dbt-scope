@@ -129,13 +129,15 @@ function Invoke-Build {
 }
 
 function Invoke-Lint {
-    Write-Step "lint: ruff check + format --check"
+    Write-Step "lint: auto-fix + format, then verify"
     Ensure-Installed
+    & $VenvPython -m ruff check --fix dbt/ tests/
+    & $VenvPython -m ruff format dbt/ tests/
     & $VenvPython -m ruff check dbt/ tests/
     $checkExit = $LASTEXITCODE
     & $VenvPython -m ruff format --check dbt/ tests/
     $fmtExit = $LASTEXITCODE
-    if ($checkExit -ne 0 -or $fmtExit -ne 0) { throw "Lint failed — run: .\.scripts\run.ps1 fix" }
+    if ($checkExit -ne 0 -or $fmtExit -ne 0) { throw "Lint failed — unfixable issues remain" }
     Write-Host "  Lint passed."
 }
 

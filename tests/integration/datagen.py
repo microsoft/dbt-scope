@@ -124,9 +124,7 @@ def generate_scope_script(dataset: ScopeDataset) -> str:
         ts_literal = f'DateTime.Parse("{date_str} 19:00:00")'
 
         # Build VALUES with timestamp filled in
-        filled_lines = [
-            line.replace("__TIMESTAMP__", ts_literal) for line in values_lines
-        ]
+        filled_lines = [line.replace("__TIMESTAMP__", ts_literal) for line in values_lines]
         filled_values = ",\n".join(filled_lines)
 
         rowset_name = f"@data_{dt.strftime('%Y%m%d')}"
