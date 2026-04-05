@@ -6,8 +6,11 @@
 .NOTES
 
   - The script uninstalls Docker Desktop as it interferes with WSL2.
+  - Must be run as Administrator in PowerShell 7+.
 
 #>
+
+#Requires -RunAsAdministrator
 
 $dockerProcesses = @("Docker Desktop")
 foreach ($process in $dockerProcesses) {
@@ -17,6 +20,12 @@ foreach ($process in $dockerProcesses) {
 
     }
 }
+
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    Write-Error "This script requires PowerShell 7+. You are running PowerShell $($PSVersionTable.PSVersion).`nTo launch PowerShell 7 as Administrator:`n  Start Menu > search 'pwsh' > right-click 'PowerShell 7' > 'Run as administrator'"
+    exit 1
+}
+
 
 winget uninstall "Docker Desktop" --silent --force --accept-source-agreements 2>$null
 $pkg = Get-ChildItem 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall' | Get-ItemProperty | Where-Object { $_.DisplayName -like "Docker Desktop*" };
