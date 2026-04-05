@@ -43,9 +43,10 @@
    ```bash
    GIT_ROOT=$(git rev-parse --show-toplevel)
    chmod +x ${GIT_ROOT}/.scripts/bootstrap-dev-env.sh && ${GIT_ROOT}/.scripts/bootstrap-dev-env.sh
+   source ~/.bashrc
    ```
 
-5. Login to github:
+5. Login to github and make sure to authorize `Microsoft`:
 
    ```bash
    gh auth login
