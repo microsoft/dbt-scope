@@ -1,0 +1,110 @@
+name: GCI
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  IS_GH_ACTION: "1"
+  IMDS_ROUTER_PORT: "8080"
+  IMDS_METADATA_ENDPOINT: "http://localhost:8080/metadata/instance?api-version=2025-04-07"
+  IDENTITY_ENDPOINT: "http://localhost:8080/metadata/identity/oauth2/token"
+  IDENTITY_HEADER: "local-dev-secret"
+  UAMI_CLIENT_ID: "00000000-0000-0000-0000-000000000000"
+  UAMI_SUBSCRIPTION: "00000000-0000-0000-0000-000000000000"
+
+jobs:
+  gci-linux:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "🔐 Start IMDS Relay Router"
+        env:
+          IMDS_RELAY_URL: ${{ secrets.IMDS_RELAY_URL }}
+          IMDS_RELAY_SENDER_KEY: ${{ secrets.IMDS_RELAY_SENDER_KEY }}
+          IMDS_SUBSCRIPTION_ID: ${{ env.UAMI_SUBSCRIPTION }}
+        run: |
+          set -euo pipefail
+          nohup python3 .github/scripts/imds_relay_router.py > /tmp/imds-router.log 2>&1 &
+          echo "IMDS_ROUTER_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 10); do
+            curl -sf http://localhost:${IMDS_ROUTER_PORT}/healthz > /dev/null 2>&1 && break
+            [ "$i" -eq 10 ] && { cat /tmp/imds-router.log; exit 1; }
+            sleep 1
+          done
+
+      - name: "🔐 Verify IMDS Relay Router"
+        run: |
+          set -euo pipefail
+          SUB=$(curl -sf -H "Metadata: true" "$IMDS_METADATA_ENDPOINT" | jq -r '.compute.subscriptionId')
+          [[ "$SUB" == "$UAMI_SUBSCRIPTION" ]] || { echo "subscriptionId mismatch: expected '$UAMI_SUBSCRIPTION', got '$SUB'"; exit 1; }
+
+      - name: "🔐 Az Login with Fake UAMI"
+        run: |
+          set -euo pipefail
+          az login --identity --client-id "$UAMI_CLIENT_ID" > /dev/null 2>&1
+
+      - name: "⚙️ Bootstrap Dev Environment"
+        run: |
+          set -euo pipefail
+          chmod +x .scripts/bootstrap-dev-env.sh
+          .scripts/bootstrap-dev-env.sh
+
+      - name: "📝 Write .env from secrets"
+        env:
+          SCOPE_ADLA_ACCOUNT: ${{ secrets.SCOPE_ADLA_ACCOUNT }}
+          SCOPE_STORAGE_ACCOUNT: ${{ secrets.SCOPE_STORAGE_ACCOUNT }}
+          SCOPE_CONTAINER: ${{ secrets.SCOPE_CONTAINER }}
+          SCOPE_DELTA_BASE_PATH: ${{ secrets.SCOPE_DELTA_BASE_PATH }}
+          SCOPE_SS_TEST_ROOT: ${{ secrets.SCOPE_SS_TEST_ROOT }}
+          SCOPE_AU: ${{ secrets.SCOPE_AU }}
+          SCOPE_PRIORITY: ${{ secrets.SCOPE_PRIORITY }}
+        run: |
+          set -euo pipefail
+          {
+            echo "SCOPE_ADLA_ACCOUNT=${SCOPE_ADLA_ACCOUNT}"
+            echo "SCOPE_STORAGE_ACCOUNT=${SCOPE_STORAGE_ACCOUNT}"
+            echo "SCOPE_CONTAINER=${SCOPE_CONTAINER}"
+            echo "SCOPE_DELTA_BASE_PATH=${SCOPE_DELTA_BASE_PATH}"
+            echo "SCOPE_SS_TEST_ROOT=${SCOPE_SS_TEST_ROOT}"
+            echo "SCOPE_AU=${SCOPE_AU}"
+            echo "SCOPE_PRIORITY=${SCOPE_PRIORITY}"
+          } > .env
+
+      - name: "📦 Install"
+        run: |
+          set -euo pipefail
+          .scripts/run.sh install
+
+      - name: "📦 Build"
+        run: |
+          set -euo pipefail
+          .scripts/run.sh build
+
+      - name: "🧹 Lint"
+        run: |
+          set -euo pipefail
+          .scripts/run.sh lint
+
+      - name: "🧪 Unit Test"
+        run: |
+          set -euo pipefail
+          .scripts/run.sh unit-test
+
+      - name: "🔧 Debug"
+        run: |
+          set -euo pipefail
+          .scripts/run.sh debug
+
+      - name: "🧪 Integration Test"
+        run: |
+          set -euo pipefail
+          .scripts/run.sh integration-test
