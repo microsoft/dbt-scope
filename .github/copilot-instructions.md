@@ -3,15 +3,15 @@
 ## Build, test, lint
 
 ```powershell
-pip install -e ".[dev]"                          # editable install with dev deps
+uv sync --extra dev                             # create .venv and install dev deps
 .\.scripts\run.ps1 unit-test                     # fast, no credentials needed
 .\.scripts\run.ps1 integration-test              # requires ADLA + az login + .env
 .\.scripts\run.ps1 lint                          # ruff check + format --check
 .\.scripts\run.ps1 fix                           # ruff auto-fix + format
 
 # Single test file or test
-pytest tests/unit/test_script_builder.py -v
-pytest tests/unit/test_script_builder.py::TestScriptBuilderFullRefresh::test_generates_create_table -v
+uv run pytest tests/unit/test_script_builder.py -v
+uv run pytest tests/unit/test_script_builder.py::TestScriptBuilderFullRefresh::test_generates_create_table -v
 ```
 
 ## Architecture

@@ -101,7 +101,8 @@ The scope jobs end up looking like this in ADLA:
 ## Install
 
 ```powershell
-pip install -e ".[dev]"    # Python 3.10+, dbt-core ~1.9
+winget install -e --id Astral-sh.uv  # one-time install for uv on Windows
+uv sync --extra dev                  # creates .venv and installs dbt-scope + dev deps
 ```
 
 ## Configure

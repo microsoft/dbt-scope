@@ -1,11 +1,11 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    dbt-scope dev/test script. Requires Python 3.10+ and az login.
+    dbt-scope dev/test script. Requires uv, Python 3.10+, and az login.
 
 .DESCRIPTION
     Single entry-point for all development tasks. Each target is idempotent —
-    auto-creates the venv if missing, installs deps if needed.
+    auto-creates the uv-managed venv if missing and syncs deps as needed.
 
 .PARAMETER Target
     The task to run: venv | install | unit-test | integration-test | debug | all
@@ -28,8 +28,9 @@ $ErrorActionPreference = "Stop"
 $ProjectDir = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 $VenvDir = Join-Path $ProjectDir ".venv"
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
-$VenvPip = Join-Path $VenvDir "Scripts\pip.exe"
+$VenvDbt = Join-Path $VenvDir "Scripts\dbt.exe"
 $TestProjectDir = Join-Path $ProjectDir "tests\integration\dbt_project"
+$RequiredPython = "3.10"
 
 # ── Load .env ────────────────────────────────────────────────────────────────
 
@@ -69,6 +70,13 @@ function Assert-EnvVar([string]$name) {
     return $val
 }
 
+function Assert-Uv {
+    if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
+        Write-Host "ERROR: uv is not installed. Install it with 'winget install -e --id Astral-sh.uv' and rerun this script." -ForegroundColor Red
+        exit 1
+    }
+}
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 function Write-Step([string]$msg) {
@@ -87,6 +95,7 @@ function Assert-Az {
 }
 
 function Ensure-Venv {
+    Assert-Uv
     if (-not (Test-Path $VenvPython)) {
         Invoke-Venv
     }
@@ -94,11 +103,18 @@ function Ensure-Venv {
 
 function Ensure-Installed {
     Ensure-Venv
-    if (-not (Test-Path (Join-Path $VenvDir "Scripts\dbt.exe"))) {
+    if (-not (Test-Path $VenvDbt)) {
         Write-Step "Installing dbt-scope (dbt CLI not found in venv)"
-        & $VenvPip install -e "$ProjectDir[dev]" --quiet
-        if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
-        & $VenvPython -c "from dbt.adapters.scope import Plugin; print(f'  dbt-scope {Plugin.adapter.ConnectionManager.TYPE} adapter loaded')"
+        Invoke-Install
+    }
+    else {
+        Push-Location $ProjectDir
+        try {
+            & uv run --no-sync python -c "from dbt.adapters.scope import Plugin; print(f'  dbt-scope {Plugin.adapter.ConnectionManager.TYPE} adapter loaded')"
+        }
+        finally {
+            Pop-Location
+        }
         if ($LASTEXITCODE -ne 0) { throw "Adapter import failed" }
     }
 }
@@ -106,20 +122,31 @@ function Ensure-Installed {
 # ── Targets ──────────────────────────────────────────────────────────────────
 
 function Invoke-Venv {
-    Write-Step "venv: Creating fresh virtual environment"
+    Write-Step "venv: Creating fresh uv-managed virtual environment"
     if (Test-Path $VenvDir) { Remove-Item $VenvDir -Recurse -Force }
-    & python -m venv $VenvDir
-    if ($LASTEXITCODE -ne 0) { throw "Failed to create venv" }
-    & $VenvPython -m pip install --upgrade pip --quiet 2>$null
+    Push-Location $ProjectDir
+    try {
+        & uv venv $VenvDir --python $RequiredPython
+    }
+    finally {
+        Pop-Location
+    }
+    if ($LASTEXITCODE -ne 0) { throw "Failed to create venv with uv" }
     Write-Host "  venv created at $VenvDir"
 }
 
 function Invoke-Install {
-    Write-Step "install: Installing dbt-scope in editable mode"
+    Write-Step "install: Syncing dbt-scope environment with uv"
     Ensure-Venv
-    & $VenvPip install -e "$ProjectDir[dev]" --quiet
-    if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
-    & $VenvPython -c "from dbt.adapters.scope import Plugin; print(f'  dbt-scope {Plugin.adapter.ConnectionManager.TYPE} adapter loaded')"
+    Push-Location $ProjectDir
+    try {
+        & uv sync --extra dev
+        if ($LASTEXITCODE -ne 0) { throw "uv sync failed" }
+        & uv run --no-sync python -c "from dbt.adapters.scope import Plugin; print(f'  dbt-scope {Plugin.adapter.ConnectionManager.TYPE} adapter loaded')"
+    }
+    finally {
+        Pop-Location
+    }
     if ($LASTEXITCODE -ne 0) { throw "Adapter import failed" }
 }
 
@@ -128,8 +155,13 @@ function Invoke-Build {
     Ensure-Installed
     $distDir = Join-Path $ProjectDir "dist"
     if (Test-Path $distDir) { Remove-Item $distDir -Recurse -Force }
-    & $VenvPython -m pip install build --quiet
-    & $VenvPython -m build --wheel --outdir $distDir $ProjectDir
+    Push-Location $ProjectDir
+    try {
+        & uv build --wheel --out-dir $distDir
+    }
+    finally {
+        Pop-Location
+    }
     if ($LASTEXITCODE -ne 0) { throw "Wheel build failed" }
     $whl = Get-ChildItem $distDir -Filter "*.whl" | Select-Object -First 1
     Write-Host "  Built: $($whl.Name) ($([math]::Round($whl.Length / 1KB, 1)) KB)"
@@ -138,12 +170,18 @@ function Invoke-Build {
 function Invoke-Lint {
     Write-Step "lint: auto-fix + format, then verify"
     Ensure-Installed
-    & $VenvPython -m ruff check --fix dbt/ tests/
-    & $VenvPython -m ruff format dbt/ tests/
-    & $VenvPython -m ruff check dbt/ tests/
-    $checkExit = $LASTEXITCODE
-    & $VenvPython -m ruff format --check dbt/ tests/
-    $fmtExit = $LASTEXITCODE
+    Push-Location $ProjectDir
+    try {
+        & uv run --no-sync ruff check --fix dbt/ tests/
+        & uv run --no-sync ruff format dbt/ tests/
+        & uv run --no-sync ruff check dbt/ tests/
+        $checkExit = $LASTEXITCODE
+        & uv run --no-sync ruff format --check dbt/ tests/
+        $fmtExit = $LASTEXITCODE
+    }
+    finally {
+        Pop-Location
+    }
     if ($checkExit -ne 0 -or $fmtExit -ne 0) { throw "Lint failed — unfixable issues remain" }
     Write-Host "  Lint passed."
 }
@@ -151,15 +189,27 @@ function Invoke-Lint {
 function Invoke-Fix {
     Write-Step "fix: ruff auto-fix + format"
     Ensure-Installed
-    & $VenvPython -m ruff check --fix dbt/ tests/
-    & $VenvPython -m ruff format dbt/ tests/
+    Push-Location $ProjectDir
+    try {
+        & uv run --no-sync ruff check --fix dbt/ tests/
+        & uv run --no-sync ruff format dbt/ tests/
+    }
+    finally {
+        Pop-Location
+    }
     Write-Host "  Fixed."
 }
 
 function Invoke-UnitTest {
     Write-Step "unit-test: Running pytest tests/unit/"
     Ensure-Installed
-    & $VenvPython -m pytest (Join-Path $ProjectDir "tests\unit") -v
+    Push-Location $ProjectDir
+    try {
+        & uv run --no-sync pytest (Join-Path $ProjectDir "tests\unit") -v
+    }
+    finally {
+        Pop-Location
+    }
     if ($LASTEXITCODE -ne 0) { throw "Unit tests failed" }
 }
 
@@ -167,9 +217,15 @@ function Invoke-Debug {
     Write-Step "debug: Running dbt debug against test project"
     Ensure-Installed
     Assert-Az
-    & (Join-Path $VenvDir "Scripts\dbt.exe") debug `
-        --project-dir $TestProjectDir `
-        --profiles-dir $TestProjectDir
+    Push-Location $ProjectDir
+    try {
+        & uv run --no-sync dbt debug `
+            --project-dir $TestProjectDir `
+            --profiles-dir $TestProjectDir
+    }
+    finally {
+        Pop-Location
+    }
     if ($LASTEXITCODE -ne 0) { throw "dbt debug failed" }
 }
 
@@ -181,7 +237,13 @@ function Invoke-Integrationtest {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $numCores = (Get-CimInstance -ClassName Win32_Processor | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
     Write-Host "  Using $numCores parallel workers (logical cores)" -ForegroundColor Cyan
-    & $VenvPython -m pytest (Join-Path $ProjectDir "tests\integration") -v -s --timeout=3600 -n $numCores
+    Push-Location $ProjectDir
+    try {
+        & uv run --no-sync pytest (Join-Path $ProjectDir "tests\integration") -v -s --timeout=3600 -n $numCores
+    }
+    finally {
+        Pop-Location
+    }
     $sw.Stop()
 
     Write-Host ""

@@ -37,7 +37,7 @@ Execute the regression testing loop: analyze diffs → run full pipeline → fix
 ## Context
 
 - **Project**: `dbt-scope` — a dbt adapter that generates SCOPE scripts and submits them as ADLA jobs via REST API
-- **Build system**: pip with `pyproject.toml`, PowerShell dev script
+- **Build system**: `uv` with `pyproject.toml`, PowerShell dev script
 - **Python**: 3.10+
 - **Auth**: `az login` required for debug/integration targets
 - **Config**: `.env` file required (copy from `.env.example`)
@@ -58,8 +58,8 @@ Execute the regression testing loop: analyze diffs → run full pipeline → fix
 
 | Target             | What it does                                     | Cloud? |
 | ------------------ | ------------------------------------------------ | ------ |
-| `venv`             | Create fresh venv                                | No     |
-| `install`          | `pip install -e ".[dev]"`                        | No     |
+| `venv`             | Create a fresh uv-managed `.venv`                | No     |
+| `install`          | `uv sync --extra dev`                            | No     |
 | `build`            | Build wheel to `dist/`                           | No     |
 | `lint`             | `ruff check + format --check` (auto-fixes first) | No     |
 | `unit-test`        | `pytest tests/unit/` (fast, no credentials)      | No     |
@@ -144,8 +144,8 @@ When a target fails, analyze the error and fix the code.
 3. Fix either the implementation or the test (prefer fixing implementation unless the test expectation is wrong)
 4. Re-run a single test for fast iteration:
    ```powershell
-   .\.venv\Scripts\python.exe -m pytest tests\unit\test_script_builder.py -v
-   .\.venv\Scripts\python.exe -m pytest tests\unit\test_script_builder.py::TestClass::test_method -v
+   uv run pytest tests\unit\test_script_builder.py -v
+   uv run pytest tests\unit\test_script_builder.py::TestClass::test_method -v
    ```
 5. Once the individual test passes, re-run: `.\.scripts\run.ps1 unit-test`
 

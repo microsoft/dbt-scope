@@ -2,13 +2,55 @@
 
 ## Prerequisites
 
-Python 3.10+, pip, az CLI (`az login`), git.
+1. Windows pre-reqs
+
+   ```powershell
+   winget install -e --id Microsoft.VisualStudioCode
+   ```
+
+2. Get a fresh new WSL machine up:
+
+   > ⚠️ Warning: this removes your WSL machine and recreates it fresh.
+
+   ```powershell
+   $GIT_ROOT = git rev-parse --show-toplevel
+   & "$GIT_ROOT\.scripts\bootstrap-dev-env.ps1"
+   ```
+
+3. Clone the repo, and open VSCode in it:
+
+   ```bash
+   cd ~/
+   
+   read -p "Enter your name (e.g. 'FirstName LastName'): " user_name
+   read -p "Enter your github email (e.g. 'your-github-alias@blah.com'): " user_email
+   read -p "Enter the branch to switch to: (e.g. 'main') " branch_name
+    
+   git clone https://github.com/microsoft/dbt-scope.git
+   
+   git config --global user.name "$user_name"
+   git config --global user.email "$user_email"
+   
+   cd dbt-scope/
+
+   git pull origin
+   git checkout "$branch_name"
+   code .
+   ```
+
+4. Run the bootstrapper script from inside the WSL, that installs all tools idempotently:
+
+   ```bash
+   GIT_ROOT=$(git rev-parse --show-toplevel)
+   chmod +x ${GIT_ROOT}/.scripts/bootstrap-dev-env.sh && ${GIT_ROOT}/contrib/bootstrap-dev-env.sh
+   ```
 
 ## Quick start
 
 ```powershell
+winget install -e --id Astral-sh.uv # one-time install for uv
 cp .env.example .env   # fill in your ADLA/storage values
-.\.scripts\run.ps1 all # venv, install, unit-test, debug, integration-test
+.\.scripts\run.ps1 all # uv venv, sync, build, lint, unit-test, debug, integration-test
 ```
 
 ## Dev script
@@ -20,8 +62,8 @@ cp .env.example .env   # fill in your ADLA/storage values
 
 | Target             | What it does                                    | Cloud? |
 | ------------------ | ----------------------------------------------- | ------ |
-| `venv`             | Create fresh venv                               | No     |
-| `install`          | `pip install -e ".[dev]"`                       | No     |
+| `venv`             | Create a fresh uv-managed `.venv`               | No     |
+| `install`          | `uv sync --extra dev`                           | No     |
 | `build`            | Build wheel to `dist/`                          | No     |
 | `lint`             | `ruff check + format --check`                   | No     |
 | `fix`              | `ruff auto-fix + format`                        | No     |
@@ -30,7 +72,7 @@ cp .env.example .env   # fill in your ADLA/storage values
 | `integration-test` | `pytest tests/integration/` (datagen + dbt run) | Yes    |
 | `all`              | All of the above in sequence                    | Yes    |
 
-Each target is idempotent — auto-creates venv and installs deps if missing.
+Each target is idempotent — auto-creates the uv-managed `.venv` and syncs deps if missing.
 
 ## Running tests
 
