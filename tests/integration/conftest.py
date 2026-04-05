@@ -188,6 +188,55 @@ def _flush_dbt_logs(log_dir: Path) -> None:
 # -- Delta verification -------------------------------------------------------
 
 
+def count_delta_log_files(delta_path: str) -> int:
+    """Count JSON transaction-log files in a Delta table's ``_delta_log/`` directory.
+
+    Uses ``az storage blob list`` to enumerate ``*.json`` commit files.
+    Returns 0 on any error (bad path, auth issue, etc.).
+    """
+    import re as _re
+    import subprocess
+
+    m = _re.match(r"abfss://([^@]+)@([^.]+)\.dfs\.core\.windows\.net/(.+)", delta_path)
+    if not m:
+        log.warning("count_delta_log_files: bad path format: %s", delta_path)
+        return 0
+
+    container, account, prefix = m.group(1), m.group(2), m.group(3)
+
+    result = subprocess.run(
+        [
+            "az",
+            "storage",
+            "blob",
+            "list",
+            "--container-name",
+            container,
+            "--prefix",
+            f"{prefix}/_delta_log/",
+            "--account-name",
+            account,
+            "--auth-mode",
+            "login",
+            "--query",
+            "[?ends_with(name, '.json')].name",
+            "-o",
+            "json",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        shell=True,
+    )
+    if result.returncode != 0:
+        log.warning("count_delta_log_files: az CLI failed: %s", result.stderr)
+        return 0
+
+    blobs = json.loads(result.stdout)
+    log.info("count_delta_log_files(%s) → %d JSON files", delta_path, len(blobs))
+    return len(blobs)
+
+
 def verify_delta(delta_path: str) -> dict:
     """Verify Delta table via az CLI. Returns parquet_count + partition list."""
     import re as _re

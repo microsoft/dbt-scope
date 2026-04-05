@@ -71,7 +71,8 @@
                 scope_settings,
                 scope_columns,
                 feature_previews,
-                sql
+                sql,
+                clear_existing=true
             ) -%}
 
             {{ log("SCOPE: Full refresh for " ~ identifier, info=True) }}
@@ -102,7 +103,8 @@
             scope_settings,
             scope_columns,
             feature_previews,
-            sql
+            sql,
+            clear_existing=true
         ) -%}
 
         {{ log("SCOPE: Full refresh for " ~ identifier, info=True) }}

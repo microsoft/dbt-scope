@@ -77,6 +77,18 @@ class TestScriptBuilderFullRefresh:
         script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
         assert "PARTITIONED BY" not in script
 
+    def test_generates_delete_all_rows(self, sample_config):
+        script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
+        assert "DECLARE TABLE @target_rw" in script
+        assert "DELETE FROM @target_rw WHERE true" in script
+
+    def test_delete_appears_between_create_and_extract(self, sample_config):
+        script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
+        create_pos = script.index("CREATE TABLE IF NOT EXISTS")
+        delete_pos = script.index("DELETE FROM @target_rw WHERE true")
+        extract_pos = script.index("EXTRACT")
+        assert create_pos < delete_pos < extract_pos
+
 
 class TestScriptBuilderIncremental:
     def test_generates_batch_declares(self, sample_config):
@@ -212,7 +224,7 @@ class TestScriptBuilderDrop:
     def test_generates_delete_all(self, sample_config):
         script = ScriptBuilder.build_drop(sample_config)
         assert "DELETE FROM @target" in script
-        assert "WHERE 1 = 1" in script
+        assert "WHERE true" in script
 
 
 class TestScriptConfig:

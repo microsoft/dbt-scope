@@ -15,7 +15,7 @@ import os
 
 import duckdb
 import pytest
-from conftest import ScenarioConfig, run_dbt, verify_delta_with_duckdb
+from conftest import ScenarioConfig, count_delta_log_files, run_dbt, verify_delta_with_duckdb
 from datagen import dataset_to_records, submit_datagen_job
 
 log = logging.getLogger(__name__)
@@ -360,3 +360,79 @@ class TestFilteredEdition:
             )
         finally:
             conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Full refresh after incremental — idempotency + no duplicates
+# ---------------------------------------------------------------------------
+
+
+class TestFullRefreshAfterIncremental:
+    """Full refresh on an existing table should clear data before re-inserting.
+
+    Verifies that running ``--full-refresh`` on a table that was previously
+    populated by an incremental run produces the same row count (no duplicates)
+    and adds new Delta transaction log entries (proving DELETE + INSERT ran).
+    """
+
+    @pytest.mark.timeout(3600)
+    def test_full_refresh_after_incremental_no_duplicates(
+        self, append_scenario: ScenarioConfig, request: pytest.FixtureRequest
+    ):
+        """Incremental → full-refresh should yield identical row count."""
+        test_name = _test_id(request)
+
+        # Use a unique delta location so this test doesn't interfere with others
+        vars_ = _dbt_vars(append_scenario)
+        vars_["delta_location"] = f"{append_scenario.delta_location}_fullrefresh_test"
+        delta_loc = vars_["delta_location"]
+
+        # Step 1: Initial incremental run (auto full-refresh on new table)
+        log.info("Step 1: Initial incremental run → %s", delta_loc)
+        result = run_dbt(
+            ["run", "--select", "append_no_delete"],
+            extra_vars=vars_,
+            test_name=f"{test_name}_initial",
+        )
+        assert result.success, f"Initial run failed: {result.result}"
+
+        before_info = verify_delta_with_duckdb(delta_loc)
+        rows_before = before_info["total_rows"]
+        assert rows_before > 0, "Initial run produced no rows"
+        log.info("After initial run: %d rows", rows_before)
+
+        # Count delta log files before the explicit full-refresh
+        log_count_before = count_delta_log_files(delta_loc)
+        assert log_count_before > 0, "Expected at least 1 delta log file after initial run"
+        log.info("Delta log files before full-refresh: %d", log_count_before)
+
+        # Step 2: Explicit --full-refresh on the existing table
+        log.info("Step 2: Running --full-refresh on existing table")
+        result = run_dbt(
+            ["run", "--full-refresh", "--select", "append_no_delete"],
+            extra_vars=vars_,
+            test_name=f"{test_name}_full_refresh",
+        )
+        assert result.success, f"Full-refresh run failed: {result.result}"
+
+        # Assert 1: Row count unchanged — no duplicates, no data loss
+        after_info = verify_delta_with_duckdb(delta_loc)
+        rows_after = after_info["total_rows"]
+        assert rows_after == rows_before, (
+            f"Full-refresh should produce the same row count: "
+            f"before={rows_before}, after={rows_after}"
+        )
+        log.info("Row count unchanged after full-refresh: %d", rows_after)
+
+        # Assert 2: Delta transaction log grew (DELETE + INSERT created new entries)
+        log_count_after = count_delta_log_files(delta_loc)
+        assert log_count_after > log_count_before, (
+            f"Expected more delta log files after full-refresh: "
+            f"before={log_count_before}, after={log_count_after}"
+        )
+        log.info(
+            "Full-refresh idempotency test passed: %d rows, delta log %d → %d",
+            rows_after,
+            log_count_before,
+            log_count_after,
+        )

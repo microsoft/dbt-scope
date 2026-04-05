@@ -113,6 +113,8 @@ class ScriptBuilder:
         parts.append(_create_table(config.columns, config.partition_by, "@deltaPath"))
         if config.scope_settings:
             parts.append(_alter_table_properties(config.scope_settings))
+
+        parts.append(_delete_all_rows())
         parts.append(_extract_from_ss(config.columns, config.partition_by))
         parts.append(_model_transform_and_insert(model_sql, config.partition_by))
 
@@ -205,7 +207,7 @@ class ScriptBuilder:
             LOCATION "{delta_loc}"
             OPTIONS (LAYOUT = DELTA);
 
-            DELETE FROM @target WHERE 1 = 1;
+            DELETE FROM @target WHERE true;
         """)
 
 
@@ -295,6 +297,22 @@ def _delete_batch_partition(partition_by: str | list[str] | None) -> str:
         DELETE FROM @target_rw
         WHERE {date_col} >= @startDate.Replace("-", "")
           AND {date_col} < @endDate.Replace("-", "");
+    """)
+
+
+def _delete_all_rows() -> str:
+    """Emit a DELETE statement that clears all rows from the Delta table.
+
+    Uses a separate ``DECLARE TABLE @target_rw`` binding (matching the
+    pattern used by incremental DELETE) so that the ``CREATE TABLE``-bound
+    ``@target`` is not reused for a destructive operation.
+    """
+    return textwrap.dedent("""\
+        DECLARE TABLE @target_rw
+        LOCATION @deltaPath
+        OPTIONS (LAYOUT = DELTA);
+
+        DELETE FROM @target_rw WHERE true;
     """)
 
 

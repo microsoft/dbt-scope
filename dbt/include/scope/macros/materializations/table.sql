@@ -35,7 +35,8 @@
         scope_settings,
         scope_columns,
         feature_previews,
-        sql
+        sql,
+        clear_existing=true
     ) -%}
 
     {{ log("Submitting SCOPE full-refresh job for " ~ identifier, info=True) }}
@@ -60,7 +61,8 @@
     scope_settings,
     scope_columns,
     feature_previews,
-    model_sql
+    model_sql,
+    clear_existing=false
 ) %}
 {# -- Normalize partition_by to a list -- #}
 {%- set partition_cols = partition_by if partition_by is iterable and partition_by is not string else ([partition_by] if partition_by else []) -%}
@@ -98,6 +100,15 @@ ALTER TABLE @target SET TBLPROPERTIES (
     "{{ key }}" = {{ scope__quote_property(value) }}{{ "," if not loop.last }}
 {%- endfor %}
 );
+{%- endif %}
+
+{# -- DELETE existing data for full-refresh idempotency -- #}
+{%- if clear_existing %}
+DECLARE TABLE @target_rw
+LOCATION @deltaPath
+OPTIONS (LAYOUT = DELTA);
+
+DELETE FROM @target_rw WHERE true;
 {%- endif %}
 
 {# -- EXTRACT from SS files -- #}
