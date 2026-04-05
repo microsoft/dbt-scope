@@ -4,12 +4,6 @@
 
 1. Windows pre-reqs
 
-   ```powershell
-   winget install -e --id Microsoft.VisualStudioCode
-   ```
-
-2. Get a fresh new WSL machine up:
-
    > ⚠️ Warning: this removes your WSL machine and recreates it fresh.
 
    ```powershell
@@ -17,7 +11,7 @@
    & "$GIT_ROOT\.scripts\bootstrap-dev-env.ps1"
    ```
 
-3. Clone the repo, and open VSCode in it:
+2. Clone the repo, and open VSCode in it:
 
    ```bash
    cd ~/
@@ -38,7 +32,7 @@
    code .
    ```
 
-4. Run the bootstrapper script from inside the WSL, that installs all tools idempotently:
+3. Run the bootstrapper script, which installs all tools idempotently:
 
    ```bash
    GIT_ROOT=$(git rev-parse --show-toplevel)
@@ -46,7 +40,7 @@
    source ~/.bashrc
    ```
 
-5. Login to github and make sure to authorize `Microsoft`:
+4. Login to github and make sure to authorize `Microsoft`:
 
    ```bash
    gh auth login
@@ -54,17 +48,18 @@
 
 ## Quick start
 
-```powershell
-winget install -e --id Astral-sh.uv # one-time install for uv
-cp .env.example .env   # fill in your ADLA/storage values
-.\.scripts\run.ps1 all # uv venv, sync, build, lint, unit-test, debug, integration-test
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh  # one-time install for uv
+cp .env.example .env      # fill in your ADLA/storage values
+.scripts/run.sh all       # uv venv, sync, build, lint, unit-test, debug, integration-test
 ```
 
 ## Dev script
 
-```powershell
-.\.scripts\run.ps1 <target>
+All development tasks go through a single entry-point — [`.scripts/run.sh`](.scripts/run.sh):
 
+```bash
+.scripts/run.sh <target>
 ```
 
 | Target             | What it does                                    | Cloud? |
@@ -83,9 +78,9 @@ Each target is idempotent — auto-creates the uv-managed `.venv` and syncs deps
 
 ## Running tests
 
-```powershell
-.\.scripts\run.ps1 unit-test          # fast, no credentials
-.\.scripts\run.ps1 integration-test   # generates SS data via datagen, runs dbt, verifies Delta
+```bash
+.scripts/run.sh unit-test          # fast, no credentials
+.scripts/run.sh integration-test   # generates SS data via datagen, runs dbt, verifies Delta
 ```
 
 Integration tests are self-contained — they generate their own SS test data on Cosmos via ADLA, run dbt models against it, and verify the resulting Delta tables. The only prerequisites are ADLA + ADLS + `az login`.

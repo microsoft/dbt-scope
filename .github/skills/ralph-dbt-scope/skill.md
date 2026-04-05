@@ -19,7 +19,7 @@ Iterative development loop to make the `dbt-scope` adapter bulletproof against r
 **You MUST follow this order:**
 
 1. **Analyze diffs** — understand what changed (Step 0)
-2. **Run the full pipeline** — `.\.scripts\run.ps1 all` (Step 1)
+2. **Run the full pipeline** — `.scripts/run.sh all` (Step 1)
 3. **Fix failures** — diagnose errors, fix code, re-run failing target (Step 2)
 4. **Confirm green** — re-run `all` to verify no regressions (Step 3)
 5. **Signal completion** — only after ALL targets are green (Step 4)
@@ -37,11 +37,11 @@ Execute the regression testing loop: analyze diffs → run full pipeline → fix
 ## Context
 
 - **Project**: `dbt-scope` — a dbt adapter that generates SCOPE scripts and submits them as ADLA jobs via REST API
-- **Build system**: `uv` with `pyproject.toml`, PowerShell dev script
+- **Build system**: `uv` with `pyproject.toml`, bash dev script
 - **Python**: 3.10+
 - **Auth**: `az login` required for debug/integration targets
 - **Config**: `.env` file required (copy from `.env.example`)
-- **Logs**: PowerShell transcript + pytest logs in `.logs/`
+- **Logs**: Bash transcript + pytest logs in `.logs/`
 
 ### Key directories
 
@@ -51,10 +51,10 @@ Execute the regression testing loop: analyze diffs → run full pipeline → fix
 | `dbt/include/scope/macros/` | Jinja macros for materializations                                                                 |
 | `tests/unit/`               | Unit tests (fast, no credentials)                                                                 |
 | `tests/integration/`        | Integration tests (ADLA + az login + .env)                                                        |
-| `.scripts/run.ps1`          | Dev script — all targets                                                                          |
+| `.scripts/run.sh`           | Dev script — all targets                                                                          |
 | `pyproject.toml`            | Project config and dependencies                                                                   |
 
-### Pipeline targets (run by `.\.scripts\run.ps1 all`)
+### Pipeline targets (run by `.scripts/run.sh all`)
 
 | Target             | What it does                                     | Cloud? |
 | ------------------ | ------------------------------------------------ | ------ |
@@ -70,8 +70,8 @@ Execute the regression testing loop: analyze diffs → run full pipeline → fix
 
 ## Step 0: Analyze Git Diffs
 
-```powershell
-cd E:\git\dbt-scope
+```bash
+cd ~/dbt-scope
 
 # Committed changes vs main
 git --no-pager diff main...HEAD -- dbt/ tests/ .scripts/ pyproject.toml
@@ -101,9 +101,9 @@ If NO code changes are detected (only docs/images, no untracked code files), ski
 
 ## Step 1: Run the Full Pipeline
 
-```powershell
-cd E:\git\dbt-scope
-.\.scripts\run.ps1 all
+```bash
+cd ~/dbt-scope
+.scripts/run.sh all
 ```
 
 This runs all targets in sequence: venv → install → build → lint → unit-test → debug → integration-test.
@@ -121,13 +121,13 @@ When a target fails, analyze the error and fix the code.
 
 - Check `pyproject.toml` for dependency issues
 - Check for import errors in `dbt/adapters/scope/__init__.py`
-- Re-run: `.\.scripts\run.ps1 install`
+- Re-run: `.scripts/run.sh install`
 
 ### If `build` fails
 
 - Check `pyproject.toml` build config
 - Check for missing `__init__.py` files
-- Re-run: `.\.scripts\run.ps1 build`
+- Re-run: `.scripts/run.sh build`
 
 ### If `lint` fails
 
@@ -135,7 +135,7 @@ When a target fails, analyze the error and fix the code.
 - If unfixable issues remain, manually fix them in the source files
 - Ruff config: line length 100, double quotes, rule set: E, W, F, I, N, UP, B, SIM, T20, RUF
 - `print()` is forbidden in library code (allowed in tests)
-- Re-run: `.\.scripts\run.ps1 lint`
+- Re-run: `.scripts/run.sh lint`
 
 ### If `unit-test` fails
 
@@ -143,11 +143,11 @@ When a target fails, analyze the error and fix the code.
 2. Check the test file in `tests/unit/` and the code under test in `dbt/adapters/scope/`
 3. Fix either the implementation or the test (prefer fixing implementation unless the test expectation is wrong)
 4. Re-run a single test for fast iteration:
-   ```powershell
-   uv run pytest tests\unit\test_script_builder.py -v
-   uv run pytest tests\unit\test_script_builder.py::TestClass::test_method -v
+   ```bash
+   uv run pytest tests/unit/test_script_builder.py -v
+   uv run pytest tests/unit/test_script_builder.py::TestClass::test_method -v
    ```
-5. Once the individual test passes, re-run: `.\.scripts\run.ps1 unit-test`
+5. Once the individual test passes, re-run: `.scripts/run.sh unit-test`
 
 ### If `debug` fails
 
@@ -155,7 +155,7 @@ When a target fails, analyze the error and fix the code.
 - Requires `.env` with ADLA/storage values
 - Check `dbt/adapters/scope/connections.py` for REST API issues
 - Check `tests/integration/dbt_project/` for profiles/project config
-- Re-run: `.\.scripts\run.ps1 debug`
+- Re-run: `.scripts/run.sh debug`
 
 ### If a failure is caused by missing prerequisites (not code)
 
@@ -170,7 +170,7 @@ If `az login` is not authenticated, `.env` is missing required values, or ADLA/A
 2. Integration tests in `tests/integration/test_dbt_scope.py` run the full dbt pipeline: datagen → dbt run → verify Delta tables
 3. Check `tests/integration/conftest.py` for fixtures and `tests/integration/datagen.py` for test data generation
 4. Fix the adapter code, macros, or test expectations as appropriate
-5. Re-run: `.\.scripts\run.ps1 integration-test`
+5. Re-run: `.scripts/run.sh integration-test`
 
 ### Key conventions to follow when fixing code
 
@@ -182,8 +182,8 @@ Scan the existing codebase to get an understanding of the coding style, project 
 
 Once individual targets pass, re-run the full pipeline to confirm no regressions:
 
-```powershell
-.\.scripts\run.ps1 all
+```bash
+.scripts/run.sh all
 ```
 
 If any target regresses, go back to Step 2 and fix the new failure.

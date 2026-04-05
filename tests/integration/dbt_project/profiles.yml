@@ -1,6 +1,6 @@
 # profiles.yml for integration testing
 # All sensitive values sourced from environment variables.
-# Set them in .env (see .env.example) — run.ps1 loads it automatically.
+# Set them in .env (see .env.example) — run.sh loads it automatically.
 dbt_scope_test:
   target: dev
   outputs:

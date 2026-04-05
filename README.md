@@ -100,9 +100,9 @@ The scope jobs end up looking like this in ADLA:
 
 ## Install
 
-```powershell
-winget install -e --id Astral-sh.uv  # one-time install for uv on Windows
-uv sync --extra dev                  # creates .venv and installs dbt-scope + dev deps
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh  # one-time install for uv
+uv sync --extra dev                               # creates .venv and installs dbt-scope + dev deps
 ```
 
 ## Configure
