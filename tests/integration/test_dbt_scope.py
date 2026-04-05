@@ -13,9 +13,14 @@ from __future__ import annotations
 import logging
 import os
 
-import duckdb
 import pytest
-from conftest import ScenarioConfig, count_delta_log_files, run_dbt, verify_delta_with_duckdb
+from conftest import (
+    ScenarioConfig,
+    count_delta_log_files,
+    query_delta_with_duckdb,
+    run_dbt,
+    verify_delta_with_duckdb,
+)
 from datagen import dataset_to_records, submit_datagen_job
 
 log = logging.getLogger(__name__)
@@ -337,29 +342,15 @@ class TestFilteredEdition:
         )
 
         # Verify all rows in Delta have edition == "Standard"
-        from conftest import _get_storage_token
-
-        conn = duckdb.connect()
-        try:
-            conn.execute("INSTALL delta; LOAD delta; INSTALL azure; LOAD azure;")
-            token = _get_storage_token()
-            conn.execute(
-                f"CREATE SECRET az1 (TYPE AZURE, PROVIDER ACCESS_TOKEN, ACCESS_TOKEN '{token}');"
-            )
-
-            non_standard = conn.execute(
-                f"SELECT DISTINCT edition FROM delta_scan('{delta_filtered}') "
-                f"WHERE edition != 'Standard'"
-            ).fetchall()
-            assert non_standard == [], (
-                f"Found non-Standard editions in filtered Delta: {non_standard}"
-            )
-            log.info(
-                "Filtered edition test passed: %d Standard rows",
-                len(expected_standard),
-            )
-        finally:
-            conn.close()
+        non_standard = query_delta_with_duckdb(
+            f"SELECT DISTINCT edition FROM delta_scan('{delta_filtered}') "
+            "WHERE edition != 'Standard'"
+        )
+        assert non_standard == [], f"Found non-Standard editions in filtered Delta: {non_standard}"
+        log.info(
+            "Filtered edition test passed: %d Standard rows",
+            len(expected_standard),
+        )
 
 
 # ---------------------------------------------------------------------------

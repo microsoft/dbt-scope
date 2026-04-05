@@ -19,11 +19,10 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from azure.identity import AzureCliCredential
 from datagen import ScopeDataset, make_default_dataset, submit_datagen_job
 from dbt.cli.main import dbtRunner
 
-from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK, FileLock
+from dbt.adapters.scope.delta_lake import get_default_delta_client
 
 PROJECT_DIR = Path(__file__).parent / "dbt_project"
 REPO_ROOT = Path(__file__).parent.parent.parent
@@ -49,6 +48,10 @@ def _delta_path(table_name: str) -> str:
     container = _env("SCOPE_CONTAINER")
     base = _env("SCOPE_DELTA_BASE_PATH")
     return f"abfss://{container}@{storage}.dfs.core.windows.net/{base}/{table_name}"
+
+
+def _delta_client():
+    return get_default_delta_client()
 
 
 # -- Datagen datasets --------------------------------------------------------
@@ -189,112 +192,18 @@ def _flush_dbt_logs(log_dir: Path) -> None:
 
 
 def count_delta_log_files(delta_path: str) -> int:
-    """Count JSON transaction-log files in a Delta table's ``_delta_log/`` directory.
-
-    Uses ``az storage blob list`` to enumerate ``*.json`` commit files.
-    Returns 0 on any error (bad path, auth issue, etc.).
-    """
-    import re as _re
-    import subprocess
-
-    m = _re.match(r"abfss://([^@]+)@([^.]+)\.dfs\.core\.windows\.net/(.+)", delta_path)
-    if not m:
-        log.warning("count_delta_log_files: bad path format: %s", delta_path)
-        return 0
-
-    container, account, prefix = m.group(1), m.group(2), m.group(3)
-
-    result = subprocess.run(
-        [
-            "az",
-            "storage",
-            "blob",
-            "list",
-            "--container-name",
-            container,
-            "--prefix",
-            f"{prefix}/_delta_log/",
-            "--account-name",
-            account,
-            "--auth-mode",
-            "login",
-            "--query",
-            "[?ends_with(name, '.json')].name",
-            "-o",
-            "json",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        shell=True,
-    )
-    if result.returncode != 0:
-        log.warning("count_delta_log_files: az CLI failed: %s", result.stderr)
-        return 0
-
-    blobs = json.loads(result.stdout)
-    log.info("count_delta_log_files(%s) → %d JSON files", delta_path, len(blobs))
-    return len(blobs)
+    """Count JSON transaction-log files in a Delta table's ``_delta_log/`` directory."""
+    return _delta_client().count_delta_log_files(delta_path)
 
 
 def verify_delta(delta_path: str) -> dict:
-    """Verify Delta table via az CLI. Returns parquet_count + partition list."""
-    import re as _re
-
-    log.info("Verifying Delta table via az CLI at %s", delta_path)
-
-    m = _re.match(r"abfss://([^@]+)@([^.]+)\.dfs\.core\.windows\.net/(.+)", delta_path)
-    if not m:
-        log.warning("Bad Delta path format: %s", delta_path)
-        return {"parquet_count": 0, "partitions": [], "error": f"Bad path: {delta_path}"}
-
-    container, account, prefix = m.group(1), m.group(2), m.group(3)
-
-    import subprocess
-
-    result = subprocess.run(
-        [
-            "az",
-            "storage",
-            "blob",
-            "list",
-            "--container-name",
-            container,
-            "--prefix",
-            f"{prefix}/",
-            "--account-name",
-            account,
-            "--auth-mode",
-            "login",
-            "--query",
-            "[?properties.contentLength>`0`].name",
-            "-o",
-            "json",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        shell=True,
-    )
-    if result.returncode != 0:
-        log.warning("az storage blob list failed: %s", result.stderr)
-        return {"parquet_count": 0, "partitions": [], "error": result.stderr}
-
-    blobs = json.loads(result.stdout)
-    parquet = [b for b in blobs if b.endswith(".parquet")]
-    partitions = sorted(
-        {pm.group(1) for b in blobs if (pm := _re.search(r"event_year_date[^=]*=(\d+)", b))}
-    )
-    log.info("Delta verify result: %d parquet files, %d partitions", len(parquet), len(partitions))
-    return {"parquet_count": len(parquet), "partitions": partitions}
+    """Verify Delta table layout via the shared Delta Lake client."""
+    return _delta_client().describe_table_files(delta_path)
 
 
-def _get_storage_token() -> str:
-    """Acquire an Azure Storage token using the file-locked credential."""
-    cred = AzureCliCredential()
-    with FileLock(AZ_CLI_TOKEN_LOCK):
-        token = cred.get_token("https://storage.azure.com/.default")
-    return token.token
+def query_delta_with_duckdb(query: str) -> list[tuple]:
+    """Execute a read-only DuckDB query with Delta + Azure extensions preloaded."""
+    return _delta_client().fetchall(query)
 
 
 def verify_delta_with_duckdb(
@@ -313,20 +222,12 @@ def verify_delta_with_duckdb(
         dict with keys: total_rows, partition_counts, errors.
     """
     log.info("Verifying Delta table with DuckDB at %s", delta_path)
-    conn = duckdb.connect()
-    conn.execute("INSTALL delta;")
-    conn.execute("LOAD delta;")
-    conn.execute("INSTALL azure;")
-    conn.execute("LOAD azure;")
-
-    token = _get_storage_token()
-    conn.execute(f"CREATE SECRET az1 (TYPE AZURE, PROVIDER ACCESS_TOKEN, ACCESS_TOKEN '{token}');")
+    delta_client = _delta_client()
     result_info: dict = {"total_rows": 0, "partition_counts": {}, "errors": []}
 
     try:
         # Total row count
-        row = conn.execute(f"SELECT COUNT(*) AS cnt FROM delta_scan('{delta_path}')").fetchone()
-        total = row[0] if row else 0
+        total = delta_client.get_total_row_count(delta_path)
         result_info["total_rows"] = total
 
         if expected_total_rows is not None and total != expected_total_rows:
@@ -336,12 +237,7 @@ def verify_delta_with_duckdb(
 
         # Per-partition row counts
         try:
-            rows = conn.execute(
-                f"SELECT event_year_date, COUNT(*) AS cnt "
-                f"FROM delta_scan('{delta_path}') "
-                f"GROUP BY event_year_date ORDER BY event_year_date"
-            ).fetchall()
-            partition_counts = {str(r[0]): r[1] for r in rows}
+            partition_counts = delta_client.get_partition_counts(delta_path, "event_year_date")
             result_info["partition_counts"] = partition_counts
 
             if expected_manifest:
@@ -362,8 +258,6 @@ def verify_delta_with_duckdb(
     except duckdb.Error as e:
         result_info["errors"].append(f"Delta scan failed: {e}")
         log.error("DuckDB Delta scan failed: %s", e)
-    finally:
-        conn.close()
 
     log.info(
         "DuckDB verify result: total_rows=%d, partitions=%d, errors=%d",

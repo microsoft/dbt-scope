@@ -92,10 +92,9 @@ class ScopeAdapter(BaseAdapter):
             from azure.identity import AzureCliCredential
             from azure.storage.filedatalake import DataLakeServiceClient
 
-            from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK, FileLock
+            from dbt.adapters.scope.delta_lake import LockedTokenCredential
 
-            with FileLock(AZ_CLI_TOKEN_LOCK):
-                credential = AzureCliCredential()
+            credential = LockedTokenCredential(AzureCliCredential())
             service = DataLakeServiceClient(
                 account_url=f"https://{creds.storage_account}.dfs.core.windows.net",
                 credential=credential,
@@ -206,9 +205,9 @@ class ScopeAdapter(BaseAdapter):
         from ADLS — no ADLA compute cost.  Returns the max value as a string
         (e.g. ``"20260404"``), or ``None`` if the table is empty or unreadable.
         """
-        from dbt.adapters.scope.delta_introspection import get_max_partition
+        from dbt.adapters.scope.delta_lake import get_default_delta_client
 
-        return get_max_partition(delta_location, partition_col)
+        return get_default_delta_client().get_max_partition(delta_location, partition_col)
 
     @available
     def get_max_partition_value_cached(self, delta_location: str, partition_col: str) -> str | None:
@@ -250,9 +249,9 @@ class ScopeAdapter(BaseAdapter):
             self._partition_validation_cache: dict[str, bool] = {}
         if delta_location in self._partition_validation_cache:
             return
-        from dbt.adapters.scope.delta_introspection import validate_partition_column
+        from dbt.adapters.scope.delta_lake import get_default_delta_client
 
-        validate_partition_column(delta_location, partition_col)
+        get_default_delta_client().validate_partition_column(delta_location, partition_col)
         self._partition_validation_cache[delta_location] = True
 
     @available
