@@ -57,7 +57,7 @@ The `lookback` parameter (default `1`) controls how many recent batches to repro
 
 ```mermaid
 flowchart TB
-    subgraph Sources["ADLS — SS source files"]
+    subgraph Sources["ADLS Gen1 — SS source files"]
         direction LR
         SS1["📂 /2026/04/01/<br/>20260401_*.ss"]
         SS2["📂 /2026/04/02/<br/>20260402_*.ss"]
@@ -96,7 +96,7 @@ flowchart TB
 
     BatchCalc -- "one script<br/>per pending batch" --> Batch
     INS -- "REST API<br/>submit + poll" --> Job
-    Job -- "reads SS files" --> SS1
+    SS1 -- "reads SS files" --> Job
     Job -- "writes partition" --> P1
 
     style DEL fill:#fee,stroke:#c00
