@@ -78,16 +78,21 @@ flowchart TB
         S1["SET @@FeaturePreviews<br/>#DECLARE @startDate, @endDate"]
         DDL["CREATE TABLE IF NOT EXISTS<br/>PARTITIONED BY event_year_date<br/>OPTIONS LAYOUT = DELTA"]
         DEL["DELETE FROM @target<br/>WHERE partition in batch range<br/><i>only if delete_before_insert</i>"]
-        EXT["EXTRACT FROM SS files<br/>WHERE _date in batch range"]
+        EXT["EXTRACT FROM SS files<br/>WHERE _date in batch range<br/>→ @data rowset"]
+        TX["@batch_data =<br/>SELECT …, _date.ToString(…) AS partition_col<br/>FROM @data<br/><i>← your dbt model (.sql)</i>"]
         INS["INSERT INTO @target<br/>SELECT * FROM @batch_data"]
-        S1 --> DDL --> DEL --> EXT --> INS
+        S1 --> DDL --> DEL --> EXT --> TX --> INS
     end
 
-    subgraph ADLA["ADLA"]
-        Job["SCOPE job<br/>compile + execute"]
+    subgraph ADLA["ADLA — executes SCOPE script"]
+        direction LR
+        Read["📖 EXTRACT<br/>SS → @data"]
+        SqlTx["🔀 SQL Transform<br/><i>your dbt model (.sql)</i><br/>@data → @batch_data"]
+        Write["💾 INSERT<br/>@batch_data → Delta"]
+        Read --> SqlTx --> Write
     end
 
-    subgraph Target["ADLS Gen2 — Delta table"]
+    subgraph Target["ADLS Gen2 — Delta Lake table"]
         direction LR
         P1["📂 event_year_date=20260401/<br/>part-*.parquet"]
         P2["📂 event_year_date=20260402/<br/>part-*.parquet"]
@@ -95,12 +100,14 @@ flowchart TB
     end
 
     BatchCalc -- "one script<br/>per pending batch" --> Batch
-    INS -- "REST API<br/>submit + poll" --> Job
-    SS1 -- "reads SS files" --> Job
-    Job -- "writes partition" --> P1
+    Batch -- "REST API<br/>submit + poll" --> ADLA
+    SS1 -- "reads SS" --> Read
+    Write -- "writes partitions" --> P1
 
     style DEL fill:#fee,stroke:#c00
     style Detect fill:#e8f4e8,stroke:#2a2
+    style SqlTx fill:#e8e0f8,stroke:#6a3cbc
+    style TX fill:#e8e0f8,stroke:#6a3cbc
 ```
 
 On **full refresh**, every batch from `begin` to today runs and there is no `DELETE` step.
