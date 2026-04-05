@@ -3,16 +3,30 @@
   <img src="https://rakirahman.blob.core.windows.net/public/images/Misc/dbt-scope.png" alt="Logo" width="30%">
   <h3 align="center">ADLA - dbt</h3>
   <p align="center">
-    Incremental data transformation for ADLA using dbt.
+    Incremental data transformation for ADLA using dbt to get data into Delta Lake tables.
     <br />
     <br />
     <a href="https://docs.getdbt.com/">dbt Docs</a>
     ·
     <a href="https://azure.microsoft.com/en-us/products/data-lake-analytics">Azure Data Lake Analytics docs</a>
+    ·
+    <a href="https://delta.io/">Delta Lake</a>
   </p>
 </p>
 
 ---
+
+## What is this?
+
+This is an [opinionated](https://www.merriam-webster.com/dictionary/opinionated) [dbt adapter](https://docs.getdbt.com/docs/connect-adapters?version=1.12) that makes it easier to test and schedule ADLA via dbt CLI without requiring an external orchestrator (such as [Data Factory](https://learn.microsoft.com/en-us/azure/data-factory/introduction)) to get non-Delta Lake source data lightly-transformed with SQL and incrementally ingestied via ADLA compute into Delta Lake Tables using quasi ANSI-SQL syntax. 
+
+The adapter handles performing non-SQL syntax generation at compile time in the dbt adapter using [dbt macros](https://docs.getdbt.com/docs/build/jinja-macros?version=1.12).
+
+As a result of this conscious design decision, the adapter **does not** encourage working with non-SQL constructs such as pre-processing imperative directives like `#FOO`. 
+
+> In fact, in the future, the adapter can/will use [sqlglot](https://github.com/tobymao/sqlglot) to block non-SQL syntax in the model SQL like `#FOO`, the goal here is to keep the business logic as close to ANSI-SQL as possible for portability across engines. As a result of this, a tradeoff is the ADLA feature surface is limited in this dbt adapter to only support run-time syntax, not ADLA compile-time syntax such as `#FOO` or `#IFDEF` etc.
+
+## Key features
 
 - **Clean SQL models** — write `SELECT ... FROM @data`; macros generate `#DECLARE`, `EXTRACT`, `INSERT INTO`
 - **Microbatch incremental** — append-only by default; opt into idempotent `DELETE+INSERT` per partition with `delete_before_insert: true`. dbt retry/backfill built in
