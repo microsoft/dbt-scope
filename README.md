@@ -57,14 +57,7 @@ The `lookback` parameter (default `1`) controls how many recent batches to repro
 
 ```mermaid
 flowchart TB
-    subgraph Sources["ADLS Gen1 — SS source files"]
-        direction LR
-        SS1["📂 /2026/04/01/<br/>20260401_*.ss"]
-        SS2["📂 /2026/04/02/<br/>20260402_*.ss"]
-        SS3["📂 /2026/04/03/<br/>20260403_*.ss"]
-    end
-
-    subgraph dbt["dbt-core microbatch"]
+    subgraph dbt["dbt-core — microbatch orchestrator"]
         direction TB
         Detect["Adapter checks ADLS<br/><i>_delta_log/ exists?</i>"]
         Config["Model config<br/><i>begin, lookback, batch_size</i>"]
@@ -73,41 +66,40 @@ flowchart TB
         Config --> BatchCalc
     end
 
-    subgraph Batch["Generated SCOPE script (one per batch)"]
+    subgraph ADLA["ADLA — runs one SCOPE script per batch"]
         direction TB
         S1["SET @@FeaturePreviews<br/>#DECLARE @startDate, @endDate"]
         DDL["CREATE TABLE IF NOT EXISTS<br/>PARTITIONED BY event_year_date<br/>OPTIONS LAYOUT = DELTA"]
         DEL["DELETE FROM @target<br/>WHERE partition in batch range<br/><i>only if delete_before_insert</i>"]
-        EXT["EXTRACT FROM SS files<br/>WHERE _date in batch range<br/>→ @data rowset"]
-        TX["@batch_data =<br/>SELECT …, _date.ToString(…) AS partition_col<br/>FROM @data<br/><i>← your dbt model (.sql)</i>"]
-        INS["INSERT INTO @target<br/>SELECT * FROM @batch_data"]
+        EXT["📖 EXTRACT FROM SS files<br/>WHERE _date in batch range<br/>→ @data rowset"]
+        TX["🔀 SQL Transform — your dbt model (.sql)<br/>SELECT …, _date.ToString(…) AS partition_col<br/>FROM @data → @batch_data"]
+        INS["💾 INSERT INTO @target<br/>SELECT * FROM @batch_data"]
         S1 --> DDL --> DEL --> EXT --> TX --> INS
     end
 
-    subgraph ADLA["ADLA — executes SCOPE script"]
+    subgraph Storage["Azure Data Lake Storage"]
         direction LR
-        Read["📖 EXTRACT<br/>SS → @data"]
-        SqlTx["🔀 SQL Transform<br/><i>your dbt model (.sql)</i><br/>@data → @batch_data"]
-        Write["💾 INSERT<br/>@batch_data → Delta"]
-        Read --> SqlTx --> Write
+        subgraph Sources["Gen1 — SS source files"]
+            direction TB
+            SS1["📂 /2026/04/01/<br/>20260401_*.ss"]
+            SS2["📂 /2026/04/02/<br/>20260402_*.ss"]
+            SS3["📂 /2026/04/03/<br/>20260403_*.ss"]
+        end
+        subgraph Target["Gen2 — Delta Lake table"]
+            direction TB
+            P1["📂 event_year_date=20260401/<br/>part-*.parquet"]
+            P2["📂 event_year_date=20260402/<br/>part-*.parquet"]
+            DL["📄 _delta_log/"]
+        end
     end
 
-    subgraph Target["ADLS Gen2 — Delta Lake table"]
-        direction LR
-        P1["📂 event_year_date=20260401/<br/>part-*.parquet"]
-        P2["📂 event_year_date=20260402/<br/>part-*.parquet"]
-        DL["📄 _delta_log/"]
-    end
-
-    BatchCalc -- "one script<br/>per pending batch" --> Batch
-    Batch -- "REST API<br/>submit + poll" --> ADLA
-    SS1 -- "reads SS" --> Read
-    Write -- "writes partitions" --> P1
+    BatchCalc -- "one SCOPE script per batch<br/>(REST API submit + poll)" --> ADLA
+    EXT -. "reads SS files" .-> Sources
+    INS -- "writes partitions" --> Target
 
     style DEL fill:#fee,stroke:#c00
-    style Detect fill:#e8f4e8,stroke:#2a2
-    style SqlTx fill:#e8e0f8,stroke:#6a3cbc
     style TX fill:#e8e0f8,stroke:#6a3cbc
+    style Detect fill:#e8f4e8,stroke:#2a2
 ```
 
 On **full refresh**, every batch from `begin` to today runs and there is no `DELETE` step.
