@@ -80,6 +80,10 @@
             {%- call statement('main') -%}
                 {{ scope_script }}
             {%- endcall -%}
+
+            {# Mark this table so subsequent batches (where dbt-core sets
+               should_full_refresh()=False) know to skip. #}
+            {% do adapter.mark_full_refresh_completed(identifier) %}
         {%- else -%}
             {# Subsequent batch — skip to avoid duplicating data #}
             {{ log("SCOPE: Skipping batch " ~ batch_start ~ " (full refresh already loaded all data)", info=True) }}
@@ -110,10 +114,32 @@
 
     {%- else -%}
         {# -- Incremental run -- #}
-        {%- if strategy == 'microbatch' -%}
+
+        {# Safety: dbt-core's microbatch runner sets should_full_refresh()=True
+           only for batch 0.  Subsequent batches (where should_full_refresh()=False)
+           enter this branch.  If a full refresh already ran in this dbt invocation,
+           batch 0 loaded ALL data — skip to avoid duplicating. #}
+        {%- if adapter.is_full_refresh_completed(identifier) -%}
+            {{ log("SCOPE: Skipping batch " ~ batch_start ~ " (full refresh already loaded all data in batch 0)", info=True) }}
+            {%- call statement('main') -%}
+                -- no-op: full refresh already loaded all data in batch 0
+            {%- endcall -%}
+
+        {%- elif strategy == 'microbatch' -%}
             {# -- Microbatch: DELETE + INSERT per batch window -- #}
 
             {%- if batch_start and batch_end -%}
+                {# -- Normalize partition_by for high-watermark detection -- #}
+                {%- set partition_cols = partition_by if partition_by is iterable and partition_by is not string else ([partition_by] if partition_by else []) -%}
+
+                {# -- Validate partition column exists in Delta (hard error if missing) -- #}
+                {%- if partition_cols and delta_location -%}
+                    {% do adapter.validate_delta_partition_column(delta_location, partition_cols[0]) %}
+                {%- endif -%}
+
+                {# -- Query high watermark: MAX(partition_col) from Delta -- #}
+                {%- set max_processed = adapter.get_max_partition_value_cached(delta_location, partition_cols[0]) if partition_cols and delta_location else none -%}
+
                 {# -- days_per_batch: widen the window -- #}
                 {%- if days_per_batch > 1 -%}
                     {%- set batch_start_dt = modules.datetime.datetime.strptime(batch_start[:10], '%Y-%m-%d') -%}
@@ -132,6 +158,46 @@
                         {%- set widened_end_dt = batch_start_dt + modules.datetime.timedelta(days=days_per_batch) -%}
                         {%- set widened_end = widened_end_dt.strftime('%Y-%m-%d') -%}
 
+                        {# -- High-watermark skip: check if entire widened window is already in Delta -- #}
+                        {%- set last_date_in_window = (widened_end_dt - modules.datetime.timedelta(days=1)).strftime('%Y%m%d') -%}
+                        {%- if max_processed and last_date_in_window <= max_processed -%}
+                            {{ log("SCOPE: Skipping batch " ~ batch_start ~ " → " ~ widened_end ~ " — already in Delta (high watermark: " ~ max_processed ~ ")", info=True) }}
+                            {%- call statement('main') -%}
+                                -- no-op: batch already processed (high watermark: {{ max_processed }})
+                            {%- endcall -%}
+                        {%- else -%}
+                            {%- set scope_script = scope__build_incremental_script(
+                                identifier,
+                                delta_location,
+                                ss_source_path,
+                                partition_by,
+                                scope_settings,
+                                scope_columns,
+                                feature_previews,
+                                sql,
+                                batch_start,
+                                widened_end,
+                                delete_before_insert
+                            ) -%}
+
+                            {{ log("SCOPE: Microbatch " ~ batch_start ~ " → " ~ widened_end ~ " (days_per_batch=" ~ days_per_batch ~ ") for " ~ identifier, info=True) }}
+
+                            {% do adapter.set_next_job_name(identifier ~ "_" ~ batch_start ~ "_" ~ widened_end) %}
+                            {%- call statement('main') -%}
+                                {{ scope_script }}
+                            {%- endcall -%}
+                        {%- endif -%}
+                    {%- endif -%}
+                {%- else -%}
+                    {# -- Standard single-day batch -- #}
+                    {# -- High-watermark skip: check if this day is already in Delta -- #}
+                    {%- set batch_start_compact = batch_start[:10].replace("-", "") -%}
+                    {%- if max_processed and batch_start_compact <= max_processed -%}
+                        {{ log("SCOPE: Skipping batch " ~ batch_start ~ " — already in Delta (high watermark: " ~ max_processed ~ ")", info=True) }}
+                        {%- call statement('main') -%}
+                            -- no-op: batch already processed (high watermark: {{ max_processed }})
+                        {%- endcall -%}
+                    {%- else -%}
                         {%- set scope_script = scope__build_incremental_script(
                             identifier,
                             delta_location,
@@ -142,39 +208,17 @@
                             feature_previews,
                             sql,
                             batch_start,
-                            widened_end,
+                            batch_end,
                             delete_before_insert
                         ) -%}
 
-                        {{ log("SCOPE: Microbatch " ~ batch_start ~ " → " ~ widened_end ~ " (days_per_batch=" ~ days_per_batch ~ ") for " ~ identifier, info=True) }}
+                        {{ log("SCOPE: Microbatch " ~ batch_start ~ " → " ~ batch_end ~ " for " ~ identifier, info=True) }}
 
-                        {% do adapter.set_next_job_name(identifier ~ "_" ~ batch_start ~ "_" ~ widened_end) %}
+                        {% do adapter.set_next_job_name(identifier ~ "_" ~ batch_start ~ "_" ~ batch_end) %}
                         {%- call statement('main') -%}
                             {{ scope_script }}
                         {%- endcall -%}
                     {%- endif -%}
-                {%- else -%}
-                    {# -- Standard single-day batch -- #}
-                    {%- set scope_script = scope__build_incremental_script(
-                        identifier,
-                        delta_location,
-                        ss_source_path,
-                        partition_by,
-                        scope_settings,
-                        scope_columns,
-                        feature_previews,
-                        sql,
-                        batch_start,
-                        batch_end,
-                        delete_before_insert
-                    ) -%}
-
-                    {{ log("SCOPE: Microbatch " ~ batch_start ~ " → " ~ batch_end ~ " for " ~ identifier, info=True) }}
-
-                    {% do adapter.set_next_job_name(identifier ~ "_" ~ batch_start ~ "_" ~ batch_end) %}
-                    {%- call statement('main') -%}
-                        {{ scope_script }}
-                    {%- endcall -%}
                 {%- endif -%}
             {%- else -%}
                 {{ exceptions.raise_compiler_error(

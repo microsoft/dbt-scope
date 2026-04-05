@@ -179,6 +179,26 @@ class ScopeAdapter(BaseAdapter):
         handle._next_job_name = name
 
     @available
+    def mark_full_refresh_completed(self, table_name: str) -> None:
+        """Record that a full refresh was completed for *table_name* in this run.
+
+        Called from the microbatch macro after batch 0's full refresh succeeds.
+        Subsequent batches check ``is_full_refresh_completed`` to avoid
+        duplicating data when dbt-core sets ``should_full_refresh()=False``
+        for batches after the first one.
+        """
+        if not hasattr(self, "_full_refresh_tables"):
+            self._full_refresh_tables: set[str] = set()
+        self._full_refresh_tables.add(table_name)
+
+    @available
+    def is_full_refresh_completed(self, table_name: str) -> bool:
+        """Return True if *table_name* had a full refresh in this dbt run."""
+        if not hasattr(self, "_full_refresh_tables"):
+            return False
+        return table_name in self._full_refresh_tables
+
+    @available
     def get_max_partition_value(self, delta_location: str, partition_col: str) -> str | None:
         """Query ``MAX(partition_col)`` from a Delta table via DuckDB.
 
@@ -189,6 +209,51 @@ class ScopeAdapter(BaseAdapter):
         from dbt.adapters.scope.delta_introspection import get_max_partition
 
         return get_max_partition(delta_location, partition_col)
+
+    @available
+    def get_max_partition_value_cached(self, delta_location: str, partition_col: str) -> str | None:
+        """Cached version of ``get_max_partition_value``.
+
+        Queries Delta once per table per dbt run and caches the result.
+        Subsequent calls for the same ``(delta_location, partition_col)``
+        return the cached value without hitting DuckDB again.  This is the
+        high-watermark used by the incremental macro to skip already-processed
+        batches.
+        """
+        if not hasattr(self, "_max_partition_cache"):
+            self._max_partition_cache: dict[str, str | None] = {}
+        cache_key = f"{delta_location}:{partition_col}"
+        if cache_key not in self._max_partition_cache:
+            self._max_partition_cache[cache_key] = self.get_max_partition_value(
+                delta_location, partition_col
+            )
+            log.info(
+                "High-watermark for %s.%s = %s",
+                delta_location.rsplit("/", 1)[-1],
+                partition_col,
+                self._max_partition_cache[cache_key],
+            )
+        return self._max_partition_cache[cache_key]
+
+    @available
+    def validate_delta_partition_column(self, delta_location: str, partition_col: str) -> None:
+        """Raise if the Delta table exists but lacks *partition_col*.
+
+        Called from the incremental macro to enforce that the partition column
+        is present.  If the table doesn't exist yet, the check is skipped
+        (it will be created with the correct schema).
+
+        Results are cached per table — a DuckDB schema scan is only performed
+        once per ``delta_location`` per dbt run.
+        """
+        if not hasattr(self, "_partition_validation_cache"):
+            self._partition_validation_cache: dict[str, bool] = {}
+        if delta_location in self._partition_validation_cache:
+            return
+        from dbt.adapters.scope.delta_introspection import validate_partition_column
+
+        validate_partition_column(delta_location, partition_col)
+        self._partition_validation_cache[delta_location] = True
 
     @available
     def get_where_connector(self, model_sql: str) -> str:

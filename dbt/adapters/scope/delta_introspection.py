@@ -88,6 +88,55 @@ def get_max_partition(delta_location: str, partition_col: str) -> str | None:
             conn.close()
 
 
+def get_delta_columns(delta_location: str) -> list[str] | None:
+    """Return the column names of a Delta table, or ``None`` if unreadable.
+
+    Uses DuckDB ``delta_scan`` with ``LIMIT 0`` to read the schema without
+    scanning data.
+    """
+    conn = None
+    try:
+        conn = _make_duckdb_conn()
+        description = conn.execute(
+            f"SELECT * FROM delta_scan('{delta_location}') LIMIT 0"
+        ).description
+        columns = [col[0] for col in description]
+        log.debug("get_delta_columns(%s) → %s", delta_location, columns)
+        return columns
+    except Exception:
+        log.debug("get_delta_columns(%s) → None (error)", delta_location, exc_info=True)
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def validate_partition_column(delta_location: str, partition_col: str) -> None:
+    """Raise if the Delta table at *delta_location* exists but lacks *partition_col*.
+
+    This enforces that incremental models have the expected column present.
+    If the table doesn't exist or can't be read, the check is silently skipped
+    (the table will be created with the correct schema on first run).
+    """
+    columns = get_delta_columns(delta_location)
+    if columns is None:
+        return  # Table doesn't exist or DuckDB can't read it — skip validation
+    if partition_col not in columns:
+        from dbt_common.exceptions import DbtRuntimeError
+
+        raise DbtRuntimeError(
+            f"Delta table at '{delta_location}' exists but does not contain "
+            f"column '{partition_col}'. "
+            f"Available columns: {columns}. "
+            f"The model requires column '{partition_col}' for incremental processing."
+        )
+    log.debug(
+        "validate_partition_column(%s, %s) → OK",
+        delta_location,
+        partition_col,
+    )
+
+
 def parse_abfss(location: str) -> tuple[str, str, str] | None:
     """Parse an ``abfss://`` URL into ``(container, account, path)``.
 

@@ -95,57 +95,49 @@ class TestFullRefresh:
 
 
 class TestIncrementalAppend:
-    """Incremental append: historical -> full refresh -> new data -> incremental."""
+    """Incremental append: first run creates table, new data → incremental picks it up.
+
+    No ``--full-refresh`` or ``--event-time-start/end`` — the adapter auto-detects
+    the high watermark from Delta and only processes new batches.
+    """
 
     @pytest.mark.timeout(3600)
     def test_incremental_append_picks_up_new_data(
         self, append_scenario: ScenarioConfig, request: pytest.FixtureRequest
     ):
-        """After full refresh, generating new SS data and running incremental
+        """After initial run, generating new SS data and running again
         should add new partitions without removing existing ones.
 
-        Uses ``--event-time-start/end`` to target the new data range, since
-        the default lookback window only covers recent days.
+        The adapter queries Delta for MAX(partition_col) and skips
+        already-processed batches automatically.
         """
         vars_ = _dbt_vars(append_scenario)
         adla_account = os.environ.get("SCOPE_ADLA_ACCOUNT", "")
         test_name = _test_id(request)
 
-        # Step 1: Full refresh with historical data
-        log.info("Step 1: Running full refresh with historical data")
+        # Step 1: Initial run — table doesn't exist, so dbt does full refresh
+        log.info("Step 1: Initial run (auto full-refresh on new table)")
         result = run_dbt(
-            ["run", "--full-refresh", "--select", "append_no_delete"],
+            ["run", "--select", "append_no_delete"],
             extra_vars=vars_,
-            test_name=f"{test_name}_full_refresh",
+            test_name=f"{test_name}_initial",
         )
-        assert result.success, f"Full refresh failed: {result.result}"
+        assert result.success, f"Initial run failed: {result.result}"
 
         before_info = verify_delta_with_duckdb(append_scenario.delta_location)
-        assert before_info["total_rows"] > 0, "Full refresh produced no rows"
-        log.info("After full refresh: %d rows", before_info["total_rows"])
+        assert before_info["total_rows"] > 0, "Initial run produced no rows"
+        log.info("After initial run: %d rows", before_info["total_rows"])
 
         # Step 2: Generate new SS data (phase 2)
         log.info("Step 2: Generating new SS data for incremental test")
         submit_datagen_job(append_scenario.new_data, adla_account=adla_account, au=5)
 
-        # Step 3: Incremental run targeting the new data date range
-        log.info("Step 3: Running incremental with new data range")
-        new_start = append_scenario.new_data.start_date
-        new_end_date = append_scenario.new_data.date_range[-1]
-        # end is exclusive, so add 1 day
-        from datetime import timedelta
-
-        new_end = (new_end_date + timedelta(days=1)).isoformat()
+        # Step 3: Incremental run — no --event-time-start/end needed
+        # The adapter auto-detects the high watermark from Delta and skips
+        # already-processed batches, only processing new data.
+        log.info("Step 3: Running incremental (auto high-watermark detection)")
         result = run_dbt(
-            [
-                "run",
-                "--select",
-                "append_no_delete",
-                "--event-time-start",
-                new_start,
-                "--event-time-end",
-                new_end,
-            ],
+            ["run", "--select", "append_no_delete"],
             extra_vars=vars_,
             test_name=f"{test_name}_incremental",
         )
@@ -177,14 +169,19 @@ class TestIncrementalAppend:
 
 
 class TestIncrementalDeleteInsert:
-    """Incremental with delete_before_insert: idempotent partition replacement."""
+    """Incremental with delete_before_insert: idempotent partition replacement.
+
+    No ``--full-refresh`` or ``--event-time-start/end`` — the adapter auto-detects
+    the high watermark from Delta.
+    """
 
     @pytest.mark.timeout(3600)
     def test_delete_insert_is_idempotent(
         self, delete_insert_scenario: ScenarioConfig, request: pytest.FixtureRequest
     ):
-        """Running the same batch range twice with delete+insert should not
-        create duplicate data — partition count should stay the same."""
+        """Running the same data twice should not create duplicate data —
+        the high-watermark skip ensures the second run is a no-op for
+        already-processed batches."""
         delta_del = f"{delete_insert_scenario.delta_location}_del"
         test_name = _test_id(request)
 
@@ -195,49 +192,33 @@ class TestIncrementalDeleteInsert:
             "datagen_start_date": delete_insert_scenario.historical.start_date,
         }
 
-        # Step 1: Full refresh
-        log.info("Step 1: Running full refresh for idempotent delete+insert test")
+        # Step 1: Initial run — table doesn't exist, dbt does full refresh
+        log.info("Step 1: Initial run for idempotent delete+insert test")
         result = run_dbt(
-            ["run", "--full-refresh", "--select", "idempotent_delete_insert"],
+            ["run", "--select", "idempotent_delete_insert"],
             extra_vars=vars_,
-            test_name=f"{test_name}_full_refresh",
+            test_name=f"{test_name}_initial",
         )
-        assert result.success, f"Full refresh failed: {result.result}"
+        assert result.success, f"Initial run failed: {result.result}"
 
         first_info = verify_delta_with_duckdb(
             delta_del,
             expected_total_rows=delete_insert_scenario.historical.total_expected_rows,
         )
-        assert first_info["total_rows"] > 0, "Full refresh produced no rows"
-        log.info("After full refresh: %d rows", first_info["total_rows"])
+        assert first_info["total_rows"] > 0, "Initial run produced no rows"
+        log.info("After initial run: %d rows", first_info["total_rows"])
 
-        # Step 2: Re-run the same full range incrementally (delete+insert)
-        log.info("Step 2: Re-running same range incrementally to test idempotency")
-        # Use --event-time-start/end to cover the full historical range,
-        # proving delete+insert is idempotent across the entire date span.
-        hist_start = delete_insert_scenario.historical.start_date
-        hist_end_date = delete_insert_scenario.historical.date_range[-1]
-        from datetime import timedelta
-
-        hist_end = (hist_end_date + timedelta(days=1)).isoformat()
+        # Step 2: Re-run incrementally — high-watermark should skip all batches
+        log.info("Step 2: Re-running incrementally to test idempotency")
         result = run_dbt(
-            [
-                "run",
-                "--select",
-                "idempotent_delete_insert",
-                "--event-time-start",
-                hist_start,
-                "--event-time-end",
-                hist_end,
-            ],
+            ["run", "--select", "idempotent_delete_insert"],
             extra_vars=vars_,
             test_name=f"{test_name}_incremental",
         )
         assert result.success, f"Incremental re-run failed: {result.result}"
 
         second_info = verify_delta_with_duckdb(delta_del)
-        # With delete+insert, row count should stay the same after re-run
-        # (delete removes old data, insert adds it back)
+        # Row count should stay the same — high-watermark skip prevents reprocessing
         assert second_info["total_rows"] == first_info["total_rows"], (
             f"Row count changed after idempotent re-run: "
             f"first={first_info['total_rows']}, second={second_info['total_rows']}"
@@ -252,7 +233,11 @@ class TestIncrementalDeleteInsert:
     def test_delete_insert_picks_up_new_data(
         self, delete_insert_scenario: ScenarioConfig, request: pytest.FixtureRequest
     ):
-        """After initial run, new SS data should be picked up by incremental run."""
+        """After initial run, new SS data should be picked up by incremental run.
+
+        No ``--event-time-start/end`` — the adapter queries Delta for the
+        high watermark and only processes batches after it.
+        """
         adla_account = os.environ.get("SCOPE_ADLA_ACCOUNT", "")
         delta_del = f"{delete_insert_scenario.delta_location}_del_new"
         test_name = _test_id(request)
@@ -264,50 +249,32 @@ class TestIncrementalDeleteInsert:
             "datagen_start_date": delete_insert_scenario.historical.start_date,
         }
 
-        # Step 1: Full refresh with historical data
-        log.info("Step 1: Running full refresh for delete+insert new data test")
+        # Step 1: Initial run — table doesn't exist, dbt does full refresh
+        log.info("Step 1: Initial run for delete+insert new data test")
         result = run_dbt(
-            ["run", "--full-refresh", "--select", "idempotent_delete_insert"],
+            ["run", "--select", "idempotent_delete_insert"],
             extra_vars=vars_,
-            test_name=f"{test_name}_full_refresh",
+            test_name=f"{test_name}_initial",
         )
-        assert result.success, f"Full refresh failed: {result.result}"
+        assert result.success, f"Initial run failed: {result.result}"
 
         before_info = verify_delta_with_duckdb(delta_del)
-        assert before_info["total_rows"] > 0, "Full refresh produced no rows"
-        log.info("After full refresh: %d rows", before_info["total_rows"])
+        assert before_info["total_rows"] > 0, "Initial run produced no rows"
+        log.info("After initial run: %d rows", before_info["total_rows"])
 
         # Step 2: Generate new SS data
         log.info("Step 2: Generating new SS data for delete+insert incremental test")
         submit_datagen_job(delete_insert_scenario.new_data, adla_account=adla_account, au=5)
 
-        # Step 3: Incremental run targeting the new data date range
-        log.info("Step 3: Running incremental with new data range")
-        new_start = delete_insert_scenario.new_data.start_date
-        new_end_date = delete_insert_scenario.new_data.date_range[-1]
-        from datetime import timedelta
-
-        new_end = (new_end_date + timedelta(days=1)).isoformat()
+        # Step 3: Incremental run — auto high-watermark detection
+        log.info("Step 3: Running incremental (auto high-watermark detection)")
         result = run_dbt(
-            [
-                "run",
-                "--select",
-                "idempotent_delete_insert",
-                "--event-time-start",
-                new_start,
-                "--event-time-end",
-                new_end,
-            ],
+            ["run", "--select", "idempotent_delete_insert"],
             extra_vars=vars_,
             test_name=f"{test_name}_incremental",
         )
         assert result.success, f"Incremental run failed: {result.result}"
 
-        # DuckDB: verify combined data
-        {
-            **delete_insert_scenario.historical.expected_rows_per_partition(),
-            **delete_insert_scenario.new_data.expected_rows_per_partition(),
-        }
         # DuckDB: verify new rows were added
         log.info("Verifying delete+insert incremental results")
         after_info = verify_delta_with_duckdb(delta_del)
