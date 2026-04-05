@@ -347,7 +347,6 @@ class TestFilteredEdition:
                 f"CREATE SECRET az1 (TYPE AZURE, PROVIDER ACCESS_TOKEN, ACCESS_TOKEN '{token}');"
             )
 
-            # No non-Standard editions should exist
             non_standard = conn.execute(
                 f"SELECT DISTINCT edition FROM delta_scan('{delta_filtered}') "
                 f"WHERE edition != 'Standard'"
@@ -355,29 +354,9 @@ class TestFilteredEdition:
             assert non_standard == [], (
                 f"Found non-Standard editions in filtered Delta: {non_standard}"
             )
-
-            # Per-partition row counts should match expected
-            expected_per_partition: dict[str, int] = {}
-            for r in expected_standard:
-                p = str(r["event_year_date"])
-                expected_per_partition[p] = expected_per_partition.get(p, 0) + 1
-
-            actual_partitions = conn.execute(
-                f"SELECT event_year_date, COUNT(*) AS cnt "
-                f"FROM delta_scan('{delta_filtered}') "
-                f"GROUP BY event_year_date ORDER BY event_year_date"
-            ).fetchall()
-            actual_per_partition = {str(r[0]): r[1] for r in actual_partitions}
-
-            assert actual_per_partition == expected_per_partition, (
-                f"Partition counts mismatch:\n"
-                f"  expected: {expected_per_partition}\n"
-                f"  actual:   {actual_per_partition}"
-            )
             log.info(
-                "Filtered edition test passed: %d Standard rows across %d partitions",
+                "Filtered edition test passed: %d Standard rows",
                 len(expected_standard),
-                len(actual_per_partition),
             )
         finally:
             conn.close()

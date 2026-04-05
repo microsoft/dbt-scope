@@ -15,12 +15,15 @@
 ---
 
 - **Clean SQL models** — write `SELECT ... FROM @data`; macros generate `#DECLARE`, `EXTRACT`, `INSERT INTO`
-- **Microbatch incremental** — `DELETE+INSERT` per date partition, with dbt retry/backfill built in. `DELETE` is optional if the target can handle deduplication
+- **Microbatch incremental** — append-only by default; opt into idempotent `DELETE+INSERT` per partition with `delete_before_insert: true`. dbt retry/backfill built in
+- **Batch bin-packing** — `days_per_batch` groups multiple days into a single SCOPE job to reduce ADLA overhead
+- **High-watermark skip** — queries `MAX(partition_col)` from Delta via DuckDB and skips already-processed batches
+- **Smart WHERE injection** — models with an existing `WHERE` clause get date filters merged with `AND`, not duplicated
 - **Declarative table properties** — compression, checkpoint intervals via `scope_settings`
 
 ## How it works
 
-SS files live on ADLS in date-partitioned directories. `dbt run` generates a SCOPE script per batch and submits each as an ADLA job. Each job reads only its date range (FileSet partition elimination), optionally deletes the target partition in Delta (for idempotent re-runs), and inserts into a Delta table on ADLS.
+SS files live on ADLS in date-partitioned directories. `dbt run` generates a SCOPE script per batch and submits each as an ADLA job. Each job reads only its date range (FileSet partition elimination), optionally deletes the target partition in Delta (when `delete_before_insert: true`), and inserts into a Delta table on ADLS.
 
 ### How dbt picks which batches to run
 
@@ -34,7 +37,7 @@ The adapter detects existing Delta tables by checking ADLS for `_delta_log/` dir
 
 The `lookback` parameter (default `1`) controls how many recent batches to reprocess on each incremental run, catching late-arriving SS files. For gap recovery (e.g. backfilling a missed week), use the CLI flags.
 
-The adapter also exposes `get_max_partition_value(delta_location, partition_col)` which queries `MAX(partition_col)` from the Delta transaction log via DuckDB — useful for automation scripts that need to determine where processing left off.
+**High-watermark skip** — on each incremental run the adapter queries `MAX(partition_col)` from the Delta transaction log via DuckDB (no ADLA compute). Batches whose partition value is ≤ the high watermark are emitted as no-ops, avoiding redundant SCOPE jobs. The result is cached once per `dbt run` invocation.
 
 ### What each SCOPE job does
 
@@ -60,7 +63,7 @@ flowchart TB
         direction TB
         S1["SET @@FeaturePreviews<br/>#DECLARE @startDate, @endDate"]
         DDL["CREATE TABLE IF NOT EXISTS<br/>PARTITIONED BY event_year_date<br/>OPTIONS LAYOUT = DELTA"]
-        DEL["DELETE FROM @target<br/>WHERE partition in batch range"]
+        DEL["DELETE FROM @target<br/>WHERE partition in batch range<br/><i>only if delete_before_insert</i>"]
         EXT["EXTRACT FROM SS files<br/>WHERE _date in batch range"]
         INS["INSERT INTO @target<br/>SELECT * FROM @batch_data"]
         S1 --> DDL --> DEL --> EXT --> INS
@@ -87,7 +90,7 @@ flowchart TB
 ```
 
 On **full refresh**, every batch from `begin` to today runs and there is no `DELETE` step.
-On **incremental**, only the lookback window runs. The `DELETE` step (red) makes each batch idempotent — re-running the same date range replaces the partition rather than creating duplicates. Table detection (green) checks ADLS for `_delta_log/` to determine if the model should run incrementally.
+On **incremental**, only the lookback window runs. The `DELETE` step (red) is **opt-in** via `delete_before_insert: true` — when enabled, re-running the same date range replaces the partition rather than creating duplicates. When omitted (default), batches are append-only. Table detection (green) checks ADLS for `_delta_log/` to determine if the model should run incrementally. Batches already present in Delta (per the high-watermark check) are skipped automatically.
 
 The scope jobs end up looking like this in ADLA:
 
@@ -127,7 +130,7 @@ my_project:
 | `database`    | Storage account name                         |
 | `schema`      | ADLS container                               |
 | `table`       | Full-refresh: `CREATE TABLE` + `INSERT INTO` |
-| `incremental` | Microbatch: `DELETE` partition + `INSERT`    |
+| `incremental` | Microbatch: `INSERT` (append); opt-in `DELETE+INSERT` via `delete_before_insert` |
 | model SQL     | `SELECT` from `@data` (extracted SS rowset)  |
 
 ## Usage
@@ -155,7 +158,7 @@ SELECT logical_server_name_DT_String AS server_name,
 FROM @data
 ```
 
-### Incremental (microbatch)
+### Incremental (microbatch) — append-only
 
 ```sql
 {{ config(
@@ -168,6 +171,7 @@ FROM @data
     partition_by='event_year_date',
     delta_location='abfss://ctr@acct.dfs.core.windows.net/delta/my_model',
     ss_source_path='/my/cosmos/path/to/MyStream',
+    days_per_batch=15,
     scope_columns=[
         {'name': 'server_name', 'type': 'string'},
         {'name': 'event_year_date', 'type': 'string'}
@@ -178,6 +182,72 @@ SELECT logical_server_name_DT_String AS server_name,
        _date.ToString("yyyyMMdd") AS event_year_date
 FROM @data
 ```
+
+### Incremental (microbatch) — idempotent delete+insert
+
+Add `delete_before_insert: true` to DELETE the partition range before INSERT, making re-runs safe against duplicates:
+
+```sql
+{{ config(
+    materialized='incremental',
+    incremental_strategy='microbatch',
+    event_time='event_year_date',
+    batch_size='day',
+    begin='2026-04-01',
+    lookback=1,
+    partition_by='event_year_date',
+    delta_location='abfss://ctr@acct.dfs.core.windows.net/delta/my_model',
+    ss_source_path='/my/cosmos/path/to/MyStream',
+    delete_before_insert=true,
+    days_per_batch=15,
+    scope_columns=[
+        {'name': 'server_name', 'type': 'string'},
+        {'name': 'event_year_date', 'type': 'string'}
+    ]
+) }}
+
+SELECT logical_server_name_DT_String AS server_name,
+       _date.ToString("yyyyMMdd") AS event_year_date
+FROM @data
+```
+
+### Incremental with a filter
+
+Models that already have a `WHERE` clause work seamlessly — the adapter uses sqlglot to detect the existing `WHERE` and merges the batch date filter with `AND`:
+
+```sql
+{{ config(
+    materialized='incremental',
+    incremental_strategy='microbatch',
+    event_time='event_year_date',
+    batch_size='day',
+    begin='2026-04-01',
+    lookback=1,
+    partition_by=['event_year_date', 'edition'],
+    delta_location='abfss://ctr@acct.dfs.core.windows.net/delta/my_filtered_model',
+    ss_source_path='/my/cosmos/path/to/MyStream',
+    scope_columns=[
+        {'name': 'server_name', 'type': 'string'},
+        {'name': 'edition', 'type': 'string'},
+        {'name': 'event_year_date', 'type': 'string'}
+    ]
+) }}
+
+SELECT logical_server_name_DT_String AS server_name,
+       edition,
+       _date.ToString("yyyyMMdd") AS event_year_date
+FROM @data
+WHERE edition == "Standard"
+```
+
+### Incremental config reference
+
+| Config               | Default   | Description                                                                |
+| -------------------- | --------- | -------------------------------------------------------------------------- |
+| `delete_before_insert` | `false` | DELETE the partition range before INSERT for idempotent re-runs             |
+| `days_per_batch`     | `1`       | Days per SCOPE job. `15` → a 30-day backlog produces 2 jobs instead of 30  |
+| `partition_by`       | —         | Single column name or list of columns. First column drives date partitioning |
+| `lookback`           | `1`       | How many recent batches to reprocess, catching late-arriving SS files       |
 
 `dbt retry` re-runs failed batches. `dbt run --event-time-start/end` backfills a range.
 
