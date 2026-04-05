@@ -42,7 +42,13 @@
 
    ```bash
    GIT_ROOT=$(git rev-parse --show-toplevel)
-   chmod +x ${GIT_ROOT}/.scripts/bootstrap-dev-env.sh && ${GIT_ROOT}/contrib/bootstrap-dev-env.sh
+   chmod +x ${GIT_ROOT}/.scripts/bootstrap-dev-env.sh && ${GIT_ROOT}/.scripts/bootstrap-dev-env.sh
+   ```
+
+5. Login to github:
+
+   ```bash
+   gh auth login
    ```
 
 ## Quick start
