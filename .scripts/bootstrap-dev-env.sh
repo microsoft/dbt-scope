@@ -19,6 +19,7 @@ PACKAGES=""
 if ! command -v jq &> /dev/null; then PACKAGES="jq"; fi
 if ! command -v python3 &> /dev/null; then PACKAGES="${PACKAGES:+$PACKAGES }python3"; fi
 if ! command -v pip &> /dev/null; then PACKAGES="${PACKAGES:+$PACKAGES }python3-pip"; fi
+if is_wsl && ! command -v gh &> /dev/null; then PACKAGES="${PACKAGES:+$PACKAGES }gh"; fi
 if [ -n "$PACKAGES" ]; then
     echo "Installing packages from apt, this will take a couple minutes: $PACKAGES"
     sudo apt-get update > /dev/null 2>&1
