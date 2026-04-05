@@ -251,6 +251,7 @@ class DuckDbDeltaLakeClient(DeltaLakeClient):
         conn = self._connection_factory()
         try:
             conn.execute(_DUCKDB_EXTENSION_SQL)
+            conn.execute("SET azure_transport_option_type = 'curl';")
             token = self._credential.get_token(_STORAGE_SCOPE).token
             escaped_token = _sql_literal(token)
             conn.execute(
