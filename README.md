@@ -57,8 +57,8 @@ After each successful SCOPE job:
 
 1. **Watermark updated** — `_checkpoint/watermark.json` records `{version, modifiedTime, batchId}`
 2. **Sources recorded** — a JSONL diff in `_checkpoint/sources/{batchId}` lists every file processed in that batch
-3. **Compaction** — every `source_compaction_interval` batches, a parquet snapshot replaces JSONL diffs with a single consolidated file
-4. **Retention** — `source_retention_files` caps the number of files in `_checkpoint/sources/`, deleting the oldest first
+3. **Compaction** — every `source_compaction_interval` batches, a parquet snapshot is written containing all history (latest snapshot + JSONL diffs since + current batch). All files persist on disk — **compaction never deletes anything**
+4. **Retention** — `source_retention_files` caps the total number of files in `_checkpoint/sources/`, deleting the oldest first. This is the **only** mechanism that removes files
 
 On **full refresh**, the checkpoint is deleted before processing begins. The adapter re-discovers all files and starts fresh at `batch_id=0`.
 

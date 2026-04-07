@@ -7,6 +7,7 @@ without any Azure credentials or SCOPE execution.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -299,12 +300,18 @@ class TestCheckpointLifecycle:
         sources = checkpoint_mgr.list_source_files(DELTA_LOC)
         assert "4.parquet" in sources
 
-        # Old parquet snapshot (batch 2) should have been deleted
-        assert "2.parquet" not in sources, f"Old snapshot should be deleted, got {sources}"
+        # Old parquet snapshot (batch 2) persists — compaction never deletes files
+        assert "2.parquet" in sources, f"Old snapshot should persist, got {sources}"
 
-        # Read full snapshot to verify all 10 records
-        import os
+        # All JSONL diffs persist too
+        assert "0" in sources
+        assert "1" in sources
+        assert "3" in sources
 
+        # Total: 3 JSONL + 2 parquet = 5 files
+        assert len(sources) == 5, f"Expected 5 files, got {sources}"
+
+        # Latest snapshot (4.parquet) has full history: all 10 records
         import duckdb
 
         parquet_key = next(k for k in adls_store if k.endswith("4.parquet"))
@@ -485,3 +492,201 @@ class TestCheckpointLifecycle:
         finally:
             conn.close()
             os.remove(tmp)
+
+    def test_dump_checkpoint_to_disk(self, checkpoint_mgr, adls_store):
+        """Run 110 batches and dump checkpoint files to /tmp for inspection.
+
+        Validates that each parquet snapshot == previous parquet + JSONL diffs
+        between the two snapshots.  Retention is set high enough so no files
+        are trimmed — all JSONL diffs stay on disk for validation.
+
+        After the test, inspect the output with::
+
+            ls -la /tmp/dbt_scope_checkpoint_demo/_checkpoint/sources/
+            duckdb -c "SELECT * FROM read_parquet('/tmp/dbt_scope_checkpoint_demo/_checkpoint/sources/100.parquet') LIMIT 20"
+        """
+        import json
+        import shutil
+
+        import duckdb
+
+        output_dir = "/tmp/dbt_scope_checkpoint_demo"
+        shutil.rmtree(output_dir, ignore_errors=True)
+
+        num_batches = 110
+        files_per_batch = 2
+        compaction_interval = 10
+        retention_files = 500  # High enough so nothing is trimmed
+
+        for batch_id in range(num_batches):
+            paths = [f"/shares/b{batch_id}/file_{i}.ss" for i in range(files_per_batch)]
+            times = [
+                datetime(2026, (batch_id % 12) + 1, 1, i, 0, tzinfo=timezone.utc)
+                for i in range(files_per_batch)
+            ]
+            checkpoint_mgr.write_batch_sources(
+                DELTA_LOC,
+                batch_id=batch_id,
+                file_paths=paths,
+                modification_times=times,
+                compaction_interval=compaction_interval,
+            )
+            wm = Watermark(version=batch_id, modified_time=times[-1].isoformat(), batch_id=batch_id)
+            checkpoint_mgr.write_watermark(DELTA_LOC, wm)
+
+        # Dump in-memory store to disk
+        sources_dir = os.path.join(output_dir, "_checkpoint", "sources")
+        os.makedirs(sources_dir, exist_ok=True)
+
+        prefix = "delta/lifecycle_test/_checkpoint/"
+        for key, data in sorted(adls_store.items()):
+            if not key.startswith(prefix):
+                continue
+            rel = key.removeprefix(prefix)
+            dest = os.path.join(output_dir, "_checkpoint", rel)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "wb") as f:
+                f.write(data)
+
+        # Verify files landed
+        files = sorted(os.listdir(sources_dir))
+        print(f"\n{'=' * 60}")
+        print(f"Checkpoint dumped to: {output_dir}")
+        print(f"Sources files ({len(files)}):")
+        jsonl = [f for f in files if not f.endswith(".parquet")]
+        parquet = [f for f in files if f.endswith(".parquet")]
+        print(f"  JSONL diffs: {len(jsonl)}")
+        print(f"  Parquet snapshots: {parquet}")
+        print("\nInspect with:")
+        print(f"  ls {sources_dir}/")
+        if parquet:
+            print(
+                f"  duckdb -c \"SELECT * FROM read_parquet('{sources_dir}/{parquet[-1]}') LIMIT 20\""
+            )
+        print(f"{'=' * 60}\n")
+
+        assert "100.parquet" in files
+
+        # Total: JSONL for every non-compaction batch, parquet for compaction batches.
+        # Compaction fires when batch_id > 0 AND batch_id % interval == 0.
+        # Batch 0 is always JSONL regardless of interval.
+        compaction_batch_ids = [
+            b for b in range(num_batches) if b > 0 and b % compaction_interval == 0
+        ]
+        expected_parquet_count = len(compaction_batch_ids)
+        expected_jsonl_count = num_batches - expected_parquet_count
+        assert len(jsonl) == expected_jsonl_count, (
+            f"Expected {expected_jsonl_count} JSONL, got {len(jsonl)}"
+        )
+        assert len(parquet) == expected_parquet_count, (
+            f"Expected {expected_parquet_count} parquet, got {len(parquet)}"
+        )
+
+        # -----------------------------------------------------------------
+        # Validate each parquet snapshot = previous parquet + JSONL diffs
+        # between the two snapshots (inclusive of the compaction batch itself,
+        # whose records go directly into the parquet — no JSONL for it).
+        # -----------------------------------------------------------------
+        parquet_snapshots = sorted(parquet, key=lambda p: int(p.removesuffix(".parquet")))
+
+        for idx, snap_name in enumerate(parquet_snapshots):
+            snap_id = int(snap_name.removesuffix(".parquet"))
+            snap_path = os.path.join(sources_dir, snap_name)
+
+            # Read actual parquet content
+            conn = duckdb.connect()
+            try:
+                actual_rows = conn.execute(
+                    f"SELECT * FROM read_parquet('{snap_path}') ORDER BY \"batchId\", path"
+                ).fetchall()
+                cols = [
+                    d[0]
+                    for d in conn.execute(
+                        f"DESCRIBE SELECT * FROM read_parquet('{snap_path}')"
+                    ).fetchall()
+                ]
+            finally:
+                conn.close()
+
+            # Build expected: previous parquet + JSONL diffs since + current batch
+            expected_records: list[dict] = []
+
+            if idx > 0:
+                # Read previous parquet snapshot
+                prev_snap = parquet_snapshots[idx - 1]
+                prev_path = os.path.join(sources_dir, prev_snap)
+                conn = duckdb.connect()
+                try:
+                    prev_rows = conn.execute(
+                        f"SELECT * FROM read_parquet('{prev_path}')"
+                    ).fetchall()
+                    prev_cols = [
+                        d[0]
+                        for d in conn.execute(
+                            f"DESCRIBE SELECT * FROM read_parquet('{prev_path}')"
+                        ).fetchall()
+                    ]
+                    for row in prev_rows:
+                        expected_records.append(dict(zip(prev_cols, row, strict=False)))
+                finally:
+                    conn.close()
+                prev_snap_id = int(prev_snap.removesuffix(".parquet"))
+            else:
+                prev_snap_id = -1
+
+            # Read JSONL diffs between previous snapshot and this one.
+            # Compaction batches (10, 20, ...) don't have JSONL — those records
+            # are written directly into the parquet by _write_snapshot_parquet.
+            for bid in range(prev_snap_id + 1, snap_id):
+                jsonl_path = os.path.join(sources_dir, str(bid))
+                if not os.path.exists(jsonl_path):
+                    raise AssertionError(
+                        f"JSONL {bid} should exist on disk (retention={retention_files})"
+                    )
+                with open(jsonl_path) as f:
+                    for line in f:
+                        if line.strip():
+                            expected_records.append(json.loads(line))
+
+            # The compaction batch itself (snap_id) has no JSONL — its records
+            # were passed directly to _write_snapshot_parquet. We know exactly
+            # what they are: files_per_batch records for this batch_id.
+            # Reconstruct them to match the format in the parquet.
+            for i in range(files_per_batch):
+                expected_records.append(
+                    {
+                        "path": f"/shares/b{snap_id}/file_{i}.ss",
+                        "batchId": snap_id,
+                    }
+                )
+
+            # Compare record counts
+            assert len(actual_rows) == len(expected_records), (
+                f"{snap_name}: expected {len(expected_records)} records, got {len(actual_rows)}"
+            )
+
+            # Compare batchId + path for each record (skip timestamp fields
+            # since they have processing-time jitter)
+            def sort_key(r):
+                return (r.get("batchId", 0), r.get("path", ""))
+
+            actual_dicts = sorted(
+                [dict(zip(cols, row, strict=False)) for row in actual_rows],
+                key=sort_key,
+            )
+            expected_records.sort(key=sort_key)
+
+            for i, (actual, expected) in enumerate(
+                zip(actual_dicts, expected_records, strict=True)
+            ):
+                assert actual["batchId"] == expected["batchId"], (
+                    f"{snap_name} record {i}: batchId {actual['batchId']} != {expected['batchId']}"
+                )
+                assert actual["path"] == expected["path"], (
+                    f"{snap_name} record {i}: path {actual['path']} != {expected['path']}"
+                )
+
+        print(
+            f"Validated {len(parquet_snapshots)} parquet snapshots: "
+            f"each = previous parquet + intermediate JSONL diffs ✓"
+        )

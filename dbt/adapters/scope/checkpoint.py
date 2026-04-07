@@ -183,20 +183,25 @@ class CheckpointManager:
 
         On compaction boundaries (``batch_id > 0`` and
         ``batch_id % compaction_interval == 0``), a **parquet snapshot** is
-        written containing ALL history (previous snapshot + JSONL diffs +
-        this batch).  Otherwise a JSONL diff is written.
+        written containing ALL history (previous snapshot + JSONL diffs since
+        that snapshot + this batch).  Otherwise a JSONL diff is written.
 
-        Layout::
+        JSONL diffs and parquet snapshots are **never** deleted by compaction —
+        they remain on disk.  File count is bounded separately by
+        :meth:`cleanup_sources` (retention).
 
-            0             ← JSONL diff (batch 0)
-            1             ← JSONL diff
-            ...
-            9             ← JSONL diff
-            10.parquet    ← full snapshot (batches 0-10)
-            11            ← JSONL diff
-            ...
-            19            ← JSONL diff
-            20.parquet    ← full snapshot (batches 0-20)
+        Layout after 21 batches with ``compaction_interval=10``::
+
+            _checkpoint/sources/
+              0             ← JSONL diff (batch 0)
+              1             ← JSONL diff
+              ...
+              9             ← JSONL diff
+              10.parquet    ← full snapshot (batches 0-10)
+              11            ← JSONL diff
+              ...
+              19            ← JSONL diff
+              20.parquet    ← full snapshot (batches 0-20)
         """
         parsed = AbfssLocation.parse(delta_location)
         if parsed is None:
@@ -260,19 +265,21 @@ class CheckpointManager:
     def _write_snapshot_parquet(
         self, fs, sources_dir: str, batch_id: int, current_batch_records: list[dict]
     ) -> None:
-        """Write a full-history parquet snapshot.
+        """Write a full-history parquet snapshot (Spark-style compaction).
 
-        Reads the most recent parquet snapshot (if any) + all JSONL diffs
-        since that snapshot, UNIONs them with the current batch records,
-        and writes ``{batch_id}.parquet``.
+        Reads the most recent parquet snapshot (if any) + JSONL diffs written
+        since that snapshot + the current batch records, and writes a single
+        ``{batch_id}.parquet``.  Old parquet snapshots and JSONL diffs are
+        **never** deleted here — that is handled by :meth:`cleanup_sources`.
         """
         import os
 
         import duckdb
 
-        # Collect all history: previous snapshot + JSONL diffs
+        # Collect all history: latest snapshot + JSONL diffs since
         all_records: list[dict] = []
         snapshot_batch_id: int = -1
+        latest_snapshot_path: str | None = None
 
         # Two-pass: first find the latest parquet snapshot, then read JSONL diffs
         # that arrived AFTER the snapshot (to avoid double-counting).
@@ -286,44 +293,48 @@ class CheckpointManager:
             if name.endswith(".parquet"):
                 try:
                     snap_id = int(name.removesuffix(".parquet"))
-                    snapshot_batch_id = max(snapshot_batch_id, snap_id)
+                    if snap_id > snapshot_batch_id:
+                        snapshot_batch_id = snap_id
+                        latest_snapshot_path = path_info.name
                 except ValueError:
                     pass
 
+        # Read the latest parquet snapshot (skip older ones — they're subsets)
+        if latest_snapshot_path is not None:
+            try:
+                file_client = fs.get_file_client(latest_snapshot_path)
+                parquet_bytes = file_client.download_file().readall()
+                snap_name = latest_snapshot_path.rsplit("/", 1)[-1]
+                tmp_path = f"/tmp/dbt_scope_read_{snap_name}"
+                with open(tmp_path, "wb") as tmp_f:
+                    tmp_f.write(parquet_bytes)
+                conn = duckdb.connect()
+                try:
+                    rows = conn.execute(f"SELECT * FROM read_parquet('{tmp_path}')").fetchall()
+                    cols = [
+                        d[0]
+                        for d in conn.execute(
+                            f"DESCRIBE SELECT * FROM read_parquet('{tmp_path}')"
+                        ).fetchall()
+                    ]
+                    for row in rows:
+                        all_records.append(dict(zip(cols, row, strict=False)))
+                finally:
+                    conn.close()
+                    os.remove(tmp_path)
+            except Exception:
+                log.warning("Failed to read snapshot %s", latest_snapshot_path, exc_info=True)
+
+        # Read JSONL diffs written after the latest snapshot
         for name, full_path in file_entries:
             if name.endswith(".parquet"):
-                # Read previous snapshot
-                try:
-                    file_client = fs.get_file_client(full_path)
-                    parquet_bytes = file_client.download_file().readall()
-                    tmp_path = f"/tmp/dbt_scope_read_{name}"
-                    with open(tmp_path, "wb") as tmp_f:
-                        tmp_f.write(parquet_bytes)
-                    conn = duckdb.connect()
-                    try:
-                        rows = conn.execute(f"SELECT * FROM read_parquet('{tmp_path}')").fetchall()
-                        cols = [
-                            d[0]
-                            for d in conn.execute(
-                                f"DESCRIBE SELECT * FROM read_parquet('{tmp_path}')"
-                            ).fetchall()
-                        ]
-                        for row in rows:
-                            all_records.append(dict(zip(cols, row, strict=False)))
-                    finally:
-                        conn.close()
-                        os.remove(tmp_path)
-                except Exception:
-                    log.warning("Failed to read snapshot %s", name, exc_info=True)
                 continue
 
-            # JSONL diff files (numeric names, no extension)
             try:
                 jsonl_batch_id = int(name)
             except ValueError:
                 continue
 
-            # Skip JSONL diffs already folded into the latest parquet snapshot
             if jsonl_batch_id <= snapshot_batch_id:
                 continue
 
@@ -366,17 +377,6 @@ class CheckpointManager:
         file_client = fs.get_file_client(dest_path)
         file_client.upload_data(parquet_data, overwrite=True)
         os.remove(parquet_local)
-
-        # Delete old parquet snapshots (replaced by new one)
-        import contextlib
-
-        for path_info in fs.get_paths(path=sources_dir, recursive=False):
-            if getattr(path_info, "is_directory", False):
-                continue
-            name = path_info.name.rsplit("/", 1)[-1]
-            if name.endswith(".parquet") and name != f"{batch_id}.parquet":
-                with contextlib.suppress(Exception):
-                    fs.get_file_client(path_info.name).delete_file()
 
         log.info(
             "Wrote snapshot %d.parquet (%d total records)",
