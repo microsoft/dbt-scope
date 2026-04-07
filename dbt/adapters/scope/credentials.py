@@ -30,6 +30,7 @@ class ScopeCredentials(Credentials):
     storage_account: str = ""
     container: str = ""
     delta_base_path: str = "delta"
+    adls_gen1_account: str = ""
     au: int = 100
     priority: int = 1
     poll_interval_seconds: int = 5
@@ -52,6 +53,7 @@ class ScopeCredentials(Credentials):
             "storage_account",
             "container",
             "delta_base_path",
+            "adls_gen1_account",
             "au",
             "priority",
         )

@@ -1,15 +1,15 @@
 {{
     config(
         materialized='incremental',
-        incremental_strategy='microbatch',
-        event_time='event_year_date',
-        batch_size='day',
-        begin=var('datagen_start_date', '2026-02-01'),
-        lookback=1,
-        partition_by=['event_year_date', 'edition'],
+        incremental_strategy='append',
+        partition_by='event_year_date',
         delta_location=var('delta_location'),
-        ss_source_path=var('ss_source_path'),
-        days_per_batch=32,
+        source_root=var('source_root'),
+        source_pattern=var('source_pattern', '.*\\.ss$'),
+        max_files_per_trigger=var('max_files_per_trigger', 50),
+        safety_buffer_seconds=0,
+        source_compaction_interval=1,
+        source_retention_files=100,
         au=4,
         priority=1,
         scope_settings={
@@ -23,7 +23,11 @@
             {'name': 'state', 'type': 'string'},
             {'name': 'region_name', 'type': 'string'},
             {'name': 'max_size_bytes', 'type': 'long'},
-            {'name': 'event_year_date', 'type': 'string'}
+            {'name': 'source_file_uri', 'type': 'string'},
+            {'name': 'source_file_length', 'type': 'long'},
+            {'name': 'source_file_created', 'type': 'DateTime'},
+            {'name': 'source_file_modified', 'type': 'DateTime'},
+            {'name': 'event_year_date', 'type': 'string', 'extract': false}
         ]
     )
 }}
@@ -35,5 +39,9 @@ SELECT
     state,
     region_name,
     max_size_bytes,
-    _date.ToString("yyyyMMdd") AS event_year_date
+    source_file_uri,
+    (long)(source_file_length ?? 0L) AS source_file_length,
+    (DateTime)(source_file_created ?? DateTime.MinValue) AS source_file_created,
+    (DateTime)(source_file_modified ?? DateTime.MinValue) AS source_file_modified,
+    DateTime.UtcNow.ToString("yyyyMMdd") AS event_year_date
 FROM @data

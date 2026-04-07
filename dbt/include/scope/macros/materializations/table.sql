@@ -1,11 +1,10 @@
 {# ============================================================
    table.sql — Full-refresh materialization for SCOPE Delta tables
 
-   Generates a complete SCOPE script that:
-     1. Creates a Delta table (if not exists)
-     2. Sets table properties (compression, etc.)
-     3. Reads SS source files via FileSet + Extractors.SStream()
-     4. Inserts the transformed data
+   File-based processing: Discovers all source files, processes
+   them in batches of max_files_per_trigger, and writes to Delta.
+   The first batch DELETEs existing data; subsequent batches INSERT
+   only (same batching loop as incremental.sql).
    ============================================================ #}
 
 {% materialization table, adapter='scope' %}
@@ -15,71 +14,112 @@
         database=database, schema=schema, identifier=identifier, type='table'
     ) -%}
 
-    {# -- Build the script config from model config + credentials -- #}
-    {%- set model_config = config.get('model_config', {}) -%}
+    {# -- Pull config values -- #}
     {%- set delta_location = config.get('delta_location', '') -%}
-    {%- set ss_source_path = config.get('ss_source_path', '') -%}
+    {%- set source_root = config.get('source_root', '') -%}
+    {%- set source_pattern = config.get('source_pattern', '.*\\.ss$') -%}
+    {%- set max_files_per_trigger = config.get('max_files_per_trigger', 50) | int -%}
+    {%- set safety_buffer_seconds = config.get('safety_buffer_seconds', 30) | int -%}
+    {%- set source_compaction_interval = config.get('source_compaction_interval', 10) | int -%}
+    {%- set source_retention_files = config.get('source_retention_files', 100) | int -%}
     {%- set partition_by = config.get('partition_by', none) -%}
     {%- set scope_settings = config.get('scope_settings', {}) -%}
-    {%- set au = config.get('au', none) -%}
-    {%- set priority = config.get('priority', none) -%}
     {%- set scope_columns = config.get('scope_columns', []) -%}
     {%- set feature_previews = config.get('scope_feature_previews', 'EnableDeltaTableDynamicInsert:on') -%}
 
-    {# -- Generate the SCOPE script -- #}
-    {%- set scope_script = scope__build_full_refresh_script(
-        identifier,
-        delta_location,
-        ss_source_path,
-        partition_by,
-        scope_settings,
-        scope_columns,
-        feature_previews,
-        sql,
-        clear_existing=true
+    {# -- Delete checkpoint for full refresh -- #}
+    {% do adapter.delete_checkpoint(delta_location) %}
+
+    {# -- Batching loop: discover → submit → checkpoint → repeat -- #}
+    {# NOTE: file_batch MUST live in the namespace — see incremental.sql for details. #}
+    {%- set ns = namespace(
+        batch_num=0,
+        total_files=0,
+        file_batch=adapter.discover_files(
+            source_root, source_pattern, max_files_per_trigger, delta_location, safety_buffer_seconds
+        )
     ) -%}
 
-    {{ log("Submitting SCOPE full-refresh job for " ~ identifier, info=True) }}
+    {%- if ns.file_batch | length == 0 -%}
+        {{ log("SCOPE: No files found for full-refresh of " ~ identifier, info=True) }}
+        {%- call statement('main') -%}
+            -- no-op: no source files found
+        {%- endcall -%}
+    {%- else -%}
+        {%- for _ in range(1000) -%}
+            {%- if ns.file_batch | length == 0 -%}
+                {# Break out of loop #}
+            {%- else -%}
+                {%- set ns.batch_num = ns.batch_num + 1 -%}
+                {%- set ns.total_files = ns.total_files + ns.file_batch | length -%}
 
-    {% do adapter.set_next_job_name(identifier ~ "_full-refresh") %}
-    {%- call statement('main') -%}
-        {{ scope_script }}
-    {%- endcall -%}
+                {%- set scope_script = scope__build_file_based_script(
+                    identifier,
+                    delta_location,
+                    partition_by,
+                    scope_settings,
+                    scope_columns,
+                    feature_previews,
+                    sql,
+                    ns.file_batch,
+                    is_full_refresh=(ns.batch_num == 1)
+                ) -%}
+
+                {{ log("SCOPE: full-refresh " ~ identifier ~ " batch " ~ ns.batch_num ~ " (" ~ ns.file_batch | length ~ " files)", info=True) }}
+
+                {%- set job_suffix = "full-refresh_batch" ~ ns.batch_num ~ "_" ~ ns.file_batch | length ~ "files" -%}
+                {% do adapter.set_next_job_name(identifier ~ "_" ~ job_suffix) %}
+                {%- call statement('main') -%}
+                    {{ scope_script }}
+                {%- endcall -%}
+
+                {% do adapter.update_checkpoint(delta_location, source_root, source_pattern, ns.file_batch, source_compaction_interval, source_retention_files) %}
+
+                {# -- Discover next batch (watermark advanced) -- #}
+                {%- set ns.file_batch = adapter.discover_files(
+                    source_root, source_pattern, max_files_per_trigger, delta_location, safety_buffer_seconds
+                ) -%}
+            {%- endif -%}
+        {%- endfor -%}
+
+        {{ log("SCOPE: " ~ identifier ~ " full-refresh complete — " ~ ns.batch_num ~ " batches, " ~ ns.total_files ~ " files total", info=True) }}
+    {%- endif -%}
 
     {{ return({'relations': [target_relation]}) }}
 {% endmaterialization %}
 
 
 {# ============================================================
-   Macro: build the full-refresh SCOPE script as a string
+   Macro: build a file-based SCOPE script
    ============================================================ #}
-{% macro scope__build_full_refresh_script(
+{% macro scope__build_file_based_script(
     table_name,
     delta_location,
-    ss_source_path,
     partition_by,
     scope_settings,
     scope_columns,
     feature_previews,
     model_sql,
-    clear_existing=false
+    source_files,
+    is_full_refresh=false,
+    is_incremental=false
 ) %}
 {# -- Normalize partition_by to a list -- #}
 {%- set partition_cols = partition_by if partition_by is iterable and partition_by is not string else ([partition_by] if partition_by else []) -%}
-{# Only the first partition column is date-derived and excluded from EXTRACT #}
-{%- set derived_col = partition_cols[0] if partition_cols else none -%}
 
 {# -- Header -- #}
 // ============================================================
 // Generated by dbt-scope adapter
 // Model: {{ table_name }}
-// Strategy: full-refresh
+// Strategy: {{ 'full-refresh' if is_full_refresh else 'incremental' }} ({{ source_files | length }} files)
 // ============================================================
 
 SET @@FeaturePreviews = "{{ feature_previews }}";
+{% if is_incremental %}
+SET @@DeltaLakeCommitCondition = "FailIfPartitionConflict";
+{% endif %}
 
 #DECLARE @deltaPath string = "{{ delta_location }}";
-#DECLARE @ssBase string = "{{ ss_source_path }}";
 
 {# -- CREATE TABLE IF NOT EXISTS -- #}
 CREATE TABLE IF NOT EXISTS @target (
@@ -103,7 +143,7 @@ ALTER TABLE @target SET TBLPROPERTIES (
 {%- endif %}
 
 {# -- DELETE existing data for full-refresh idempotency -- #}
-{%- if clear_existing %}
+{%- if is_full_refresh %}
 DECLARE TABLE @target_rw
 LOCATION @deltaPath
 OPTIONS (LAYOUT = DELTA);
@@ -111,18 +151,30 @@ OPTIONS (LAYOUT = DELTA);
 DELETE FROM @target_rw WHERE true;
 {%- endif %}
 
-{# -- EXTRACT from SS files -- #}
+{# -- EXTRACT from explicit file list (exclude extract=false, use FILE.* for virtual columns) -- #}
+{%- set extract_columns = [] -%}
+{%- for col in scope_columns -%}
+    {%- if col.get('extract', true) != false -%}
+        {%- do extract_columns.append(col) -%}
+    {%- endif -%}
+{%- endfor -%}
+{# Map of virtual column names to SCOPE FILE.* functions #}
+{%- set virtual_map = {
+    'source_file_uri': 'FILE.URI()',
+    'source_file_length': 'FILE.LENGTH()',
+    'source_file_created': 'FILE.CREATED()',
+    'source_file_modified': 'FILE.MODIFIED()'
+} -%}
 @data =
     EXTRACT
-{%- for col in scope_columns %}
-{%-   if col.name != derived_col %}
-        {{ col.name }} : {{ col.type }},
+{%- for col in extract_columns %}
+{%-   if col.name in virtual_map %}
+        {{ col.name }} = {{ virtual_map[col.name] }}{{ "," if not loop.last }}
+{%-   else %}
+        {{ col.name }} : {{ col.type }}{{ "," if not loop.last }}
 {%-   endif %}
 {%- endfor %}
-        _date : DateTime,
-        _serial : int,
-        _source_file = FILE.URI()
-    FROM @ssBase + "/{_date:yyyy}/{_date:MM}/{_date:dd}/{_date:yyyy}{_date:MM}{_date:dd}_{*}_{_serial}.ss"
+    FROM {{ source_files | map('tojson') | join(',\n         ') }}
     USING Extractors.SStream();
 
 {# -- User's transformation + INSERT -- #}

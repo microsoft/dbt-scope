@@ -1,7 +1,7 @@
 """Integration test fixtures.
 
 Two-phase datagen simulates a production lifecycle:
-  Phase 1: Historical data (31 days) -> full refresh
+  Phase 1: Historical data (5 days) -> full refresh
   Phase 2: New data arrives (2 more days) -> incremental picks it up
 
 All names are descriptive so you can trace SS streams and Delta tables
@@ -15,6 +15,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from datetime import date, timedelta
 from pathlib import Path
 
 import duckdb
@@ -67,7 +68,7 @@ class ScenarioConfig:
     delta_location: str  # Where the Delta table lands
 
 
-def _build_scenario(label: str, historical_days: int = 31, new_days: int = 2) -> ScenarioConfig:
+def _build_scenario(label: str, historical_days: int = 5, new_days: int = 2) -> ScenarioConfig:
     """Build a test scenario with datagen datasets."""
     ss_root = _env("SCOPE_SS_TEST_ROOT")
     stream = f"{label}_{_PREFIX}"
@@ -79,10 +80,12 @@ def _build_scenario(label: str, historical_days: int = 31, new_days: int = 2) ->
         days=historical_days,
         files_per_day=2,
     )
+    # new_data starts right after the historical window
+    new_start = (date.fromisoformat("2026-02-01") + timedelta(days=historical_days)).isoformat()
     new_data = make_default_dataset(
         ss_root=ss_root,
         stream_name=stream,  # same stream -- new files appear in later dates
-        start_date="2026-03-04",  # starts after historical
+        start_date=new_start,
         days=new_days,
         files_per_day=2,
     )
@@ -102,17 +105,6 @@ def append_scenario() -> ScenarioConfig:
     adla = _env("SCOPE_ADLA_ACCOUNT")
 
     log.info("Generating historical SS files for append scenario")
-    submit_datagen_job(scenario.historical, adla_account=adla, au=5)
-    return scenario
-
-
-@pytest.fixture(scope="session")
-def delete_insert_scenario() -> ScenarioConfig:
-    """Scenario: incremental with delete+insert -- idempotent partition replacement."""
-    scenario = _build_scenario("delete_insert")
-    adla = _env("SCOPE_ADLA_ACCOUNT")
-
-    log.info("Generating historical SS files for delete+insert scenario")
     submit_datagen_job(scenario.historical, adla_account=adla, au=5)
     return scenario
 
@@ -256,8 +248,12 @@ def verify_delta_with_duckdb(
             result_info["errors"].append(f"Partition query failed: {e}")
 
     except duckdb.Error as e:
+        err_msg = str(e)
         result_info["errors"].append(f"Delta scan failed: {e}")
-        log.error("DuckDB Delta scan failed: %s", e)
+        if "No files in log segment" in err_msg or "does not exist" in err_msg:
+            log.debug("Delta table does not exist yet at %s (expected on first run)", delta_path)
+        else:
+            log.error("DuckDB Delta scan failed: %s", e)
 
     log.info(
         "DuckDB verify result: total_rows=%d, partitions=%d, errors=%d",
@@ -267,5 +263,32 @@ def verify_delta_with_duckdb(
     )
     if result_info["errors"]:
         for err in result_info["errors"]:
-            log.warning("DuckDB verify error: %s", err)
+            if "No files in log segment" in err or "does not exist" in err:
+                log.debug("DuckDB verify (expected): %s", err)
+            else:
+                log.warning("DuckDB verify error: %s", err)
     return result_info
+
+
+# -- Watermark + sources checkpoint verification ------------------------------
+
+
+def read_watermark(delta_path: str):
+    """Read the watermark checkpoint for a Delta table."""
+    from dbt.adapters.scope.checkpoint import CheckpointManager
+
+    return CheckpointManager().read_watermark(delta_path)
+
+
+def list_source_files(delta_path: str) -> list[str]:
+    """List files in ``_checkpoint/sources/``."""
+    from dbt.adapters.scope.checkpoint import CheckpointManager
+
+    return CheckpointManager().list_source_files(delta_path)
+
+
+def read_batch_source(delta_path: str, batch_id: int) -> list[dict]:
+    """Read a batch JSONL file from ``_checkpoint/sources/{batch_id}``."""
+    from dbt.adapters.scope.checkpoint import CheckpointManager
+
+    return CheckpointManager().read_batch_source(delta_path, batch_id)

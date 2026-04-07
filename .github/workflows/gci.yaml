@@ -67,6 +67,7 @@ jobs:
           SCOPE_SS_TEST_ROOT: ${{ secrets.SCOPE_SS_TEST_ROOT }}
           SCOPE_AU: ${{ secrets.SCOPE_AU }}
           SCOPE_PRIORITY: ${{ secrets.SCOPE_PRIORITY }}
+          SCOPE_ADLS_GEN1_ACCOUNT: ${{ secrets.SCOPE_ADLS_GEN1_ACCOUNT }}
         run: |
           set -euo pipefail
           {
@@ -77,6 +78,7 @@ jobs:
             echo "SCOPE_SS_TEST_ROOT=${SCOPE_SS_TEST_ROOT}"
             echo "SCOPE_AU=${SCOPE_AU}"
             echo "SCOPE_PRIORITY=${SCOPE_PRIORITY}"
+            echo "SCOPE_ADLS_GEN1_ACCOUNT=${SCOPE_ADLS_GEN1_ACCOUNT}"
           } > .env
 
       - name: "📦 Install"

@@ -9,9 +9,12 @@ import agate
 from dbt.adapters.base import BaseAdapter, available
 from dbt_common.exceptions import DbtRuntimeError
 
+from dbt.adapters.scope.adls_gen1_client import AdlsGen1Client
+from dbt.adapters.scope.checkpoint import CheckpointManager
 from dbt.adapters.scope.column import ScopeColumn
 from dbt.adapters.scope.connections import ScopeConnectionHandle, ScopeConnectionManager
 from dbt.adapters.scope.credentials import ScopeCredentials
+from dbt.adapters.scope.file_tracker import FileTracker
 from dbt.adapters.scope.relation import ScopeRelation
 from dbt.adapters.scope.script_builder import ColumnDef, ScriptConfig
 
@@ -122,7 +125,7 @@ class ScopeAdapter(BaseAdapter):
             log.info("list_relations_without_caching found %d Delta tables", len(relations))
             return relations
         except Exception:
-            log.info("list_relations_without_caching failed, returning []", exc_info=True)
+            log.debug("No Delta tables found at %s (path may not exist yet)", creds.delta_base_path)
             return []
 
     def quote(self, identifier: str) -> str:
@@ -164,7 +167,7 @@ class ScopeAdapter(BaseAdapter):
     # ------------------------------------------------------------------
 
     def valid_incremental_strategies(self) -> list[str]:
-        return ["microbatch", "append", "delete+insert"]
+        return ["microbatch", "append"]
 
     # ------------------------------------------------------------------
     # Custom adapter methods (called from macros)
@@ -178,92 +181,113 @@ class ScopeAdapter(BaseAdapter):
         handle._next_job_name = name
 
     @available
-    def mark_full_refresh_completed(self, table_name: str) -> None:
-        """Record that a full refresh was completed for *table_name* in this run.
+    def discover_files(
+        self,
+        source_root: str,
+        source_pattern: str,
+        max_files_per_trigger: int,
+        delta_location: str,
+        safety_buffer_seconds: int = 30,
+    ) -> list[str]:
+        """Discover unprocessed source files and return a batch of file paths.
 
-        Called from the microbatch macro after batch 0's full refresh succeeds.
-        Subsequent batches check ``is_full_refresh_completed`` to avoid
-        duplicating data when dbt-core sets ``should_full_refresh()=False``
-        for batches after the first one.
+        Orchestrates the file-based processing loop:
+          1. Read watermark from ``_checkpoint/watermark.json``
+          2. LIST files on ADLS Gen1 under *source_root*
+          3. Filter by regex *source_pattern* and watermark
+          4. Return up to *max_files_per_trigger* file paths
         """
-        if not hasattr(self, "_full_refresh_tables"):
-            self._full_refresh_tables: set[str] = set()
-        self._full_refresh_tables.add(table_name)
+        tracker = self._get_file_tracker()
+        watermark = self._get_checkpoint_manager().read_watermark(delta_location)
+
+        all_unprocessed = tracker.discover_unprocessed_files(
+            root=source_root,
+            pattern=source_pattern,
+            watermark=watermark,
+            safety_buffer_seconds=safety_buffer_seconds,
+        )
+        batch = FileTracker.get_next_batch(all_unprocessed, max_files_per_trigger)
+
+        log.info(
+            "discover_files: root=%s, pattern=%s, unprocessed=%d, batch=%d",
+            source_root,
+            source_pattern,
+            len(all_unprocessed),
+            len(batch),
+        )
+        return [f.path for f in batch]
 
     @available
-    def is_full_refresh_completed(self, table_name: str) -> bool:
-        """Return True if *table_name* had a full refresh in this dbt run."""
-        if not hasattr(self, "_full_refresh_tables"):
-            return False
-        return table_name in self._full_refresh_tables
+    def update_checkpoint(
+        self,
+        delta_location: str,
+        source_root: str,
+        source_pattern: str,
+        file_paths: list[str],
+        source_compaction_interval: int = 10,
+        source_retention_files: int = 100,
+    ) -> None:
+        """Update the watermark checkpoint after a successful SCOPE job.
 
-    @available
-    def get_max_partition_value(self, delta_location: str, partition_col: str) -> str | None:
-        """Query ``MAX(partition_col)`` from a Delta table via DuckDB.
-
-        Uses DuckDB's ``delta_scan`` to read the Delta transaction log directly
-        from ADLS — no ADLA compute cost.  Returns the max value as a string
-        (e.g. ``"20260404"``), or ``None`` if the table is empty or unreadable.
+        Also writes per-batch JSONL to ``_checkpoint/sources/{batch_id}``,
+        triggers compaction at interval boundaries, and enforces retention.
         """
-        from dbt.adapters.scope.delta_lake import get_default_delta_client
+        gen1 = self._get_gen1_client()
+        checkpoint = self._get_checkpoint_manager()
 
-        return get_default_delta_client().get_max_partition(delta_location, partition_col)
+        # Get current watermark
+        current = checkpoint.read_watermark(delta_location)
 
-    @available
-    def get_max_partition_value_cached(self, delta_location: str, partition_col: str) -> str | None:
-        """Cached version of ``get_max_partition_value``.
+        # Reconstruct FileInfo objects for the processed files
+        all_files = gen1.list_files(source_root, pattern=source_pattern)
+        processed = [f for f in all_files if f.path in set(file_paths)]
 
-        Queries Delta once per table per dbt run and caches the result.
-        Subsequent calls for the same ``(delta_location, partition_col)``
-        return the cached value without hitting DuckDB again.  This is the
-        high-watermark used by the incremental macro to skip already-processed
-        batches.
-        """
-        if not hasattr(self, "_max_partition_cache"):
-            self._max_partition_cache: dict[str, str | None] = {}
-        cache_key = f"{delta_location}:{partition_col}"
-        if cache_key not in self._max_partition_cache:
-            self._max_partition_cache[cache_key] = self.get_max_partition_value(
-                delta_location, partition_col
-            )
-            log.info(
-                "High-watermark for %s.%s = %s",
-                delta_location.rsplit("/", 1)[-1],
-                partition_col,
-                self._max_partition_cache[cache_key],
-            )
-        return self._max_partition_cache[cache_key]
-
-    @available
-    def validate_delta_partition_column(self, delta_location: str, partition_col: str) -> None:
-        """Raise if the Delta table exists but lacks *partition_col*.
-
-        Called from the incremental macro to enforce that the partition column
-        is present.  If the table doesn't exist yet, the check is skipped
-        (it will be created with the correct schema).
-
-        Results are cached per table — a DuckDB schema scan is only performed
-        once per ``delta_location`` per dbt run.
-        """
-        if not hasattr(self, "_partition_validation_cache"):
-            self._partition_validation_cache: dict[str, bool] = {}
-        if delta_location in self._partition_validation_cache:
+        if not processed:
+            log.warning("update_checkpoint: no matching files found for paths")
             return
-        from dbt.adapters.scope.delta_lake import get_default_delta_client
 
-        get_default_delta_client().validate_partition_column(delta_location, partition_col)
-        self._partition_validation_cache[delta_location] = True
+        new_watermark = FileTracker.compute_new_watermark(processed, current)
+
+        # Write watermark
+        checkpoint.write_watermark(delta_location, new_watermark)
+
+        # Write per-batch sources (JSONL diff or parquet snapshot at interval)
+        checkpoint.write_batch_sources(
+            delta_location,
+            batch_id=new_watermark.batch_id,
+            file_paths=[f.path for f in processed],
+            modification_times=[f.modification_time for f in processed],
+            compaction_interval=source_compaction_interval,
+        )
+
+        # Retention cleanup
+        checkpoint.cleanup_sources(
+            delta_location,
+            max_files=source_retention_files,
+        )
 
     @available
-    def get_where_connector(self, model_sql: str) -> str:
-        """Return ``'AND'`` if *model_sql* already has a ``WHERE``, else ``'WHERE'``.
+    def delete_checkpoint(self, delta_location: str) -> None:
+        """Delete the watermark checkpoint (for full refresh)."""
+        self._get_checkpoint_manager().delete_watermark(delta_location)
 
-        Called from Jinja macros to merge date predicates without
-        producing duplicate ``WHERE`` clauses.
-        """
-        from dbt.adapters.scope.sqlglot_parser import parser
-
-        return "AND" if parser.has_top_level_where(model_sql) else "WHERE"
+    @available
+    def has_unprocessed_files(
+        self,
+        source_root: str,
+        source_pattern: str,
+        delta_location: str,
+        safety_buffer_seconds: int = 30,
+    ) -> bool:
+        """Are there unprocessed files at the source?"""
+        files = self.discover_files(
+            source_root=source_root,
+            source_pattern=source_pattern,
+            max_files_per_trigger=1,
+            delta_location=delta_location,
+            safety_buffer_seconds=safety_buffer_seconds,
+        )
+        return len(files) > 0
 
     def submit_scope_script(
         self,
@@ -297,7 +321,12 @@ class ScopeAdapter(BaseAdapter):
         # Parse column definitions from sources.yml metadata
         raw_columns = model_config.get("columns", [])
         columns = [
-            ColumnDef(name=c["name"], scope_type=c.get("type", "string")) for c in raw_columns
+            ColumnDef(
+                name=c["name"],
+                scope_type=c.get("type", "string"),
+                extract=c.get("extract", True),
+            )
+            for c in raw_columns
         ]
 
         return ScriptConfig(
@@ -307,14 +336,16 @@ class ScopeAdapter(BaseAdapter):
             delta_base_path=creds.delta_base_path,
             table_name=table_name,
             partition_by=model_config.get("partition_by"),
-            ss_base_path=model_config.get("ss_source_path", ""),
+            source_root=model_config.get("source_root", ""),
+            source_pattern=model_config.get("source_pattern", ""),
+            max_files_per_trigger=model_config.get("max_files_per_trigger", 50),
+            safety_buffer_seconds=model_config.get("safety_buffer_seconds", 30),
+            adls_gen1_account=model_config.get("adls_gen1_account", creds.adls_gen1_account),
             scope_settings=model_config.get("scope_settings", {}),
             feature_previews=creds.scope_feature_previews or "EnableDeltaTableDynamicInsert:on",
             au=model_config.get("au", creds.au),
             priority=model_config.get("priority", creds.priority),
             columns=columns,
-            delete_before_insert=model_config.get("delete_before_insert", False),
-            days_per_batch=model_config.get("days_per_batch", 1),
         )
 
     # ------------------------------------------------------------------
@@ -323,3 +354,25 @@ class ScopeAdapter(BaseAdapter):
 
     def _credentials(self) -> ScopeCredentials:
         return self.config.credentials  # type: ignore[return-value]
+
+    def _get_gen1_client(self) -> AdlsGen1Client:
+        """Return an ADLS Gen1 client for the configured account."""
+        if not hasattr(self, "_gen1_client"):
+            creds = self._credentials()
+            self._gen1_client = AdlsGen1Client(account=creds.adls_gen1_account)
+        return self._gen1_client
+
+    def _get_checkpoint_manager(self) -> CheckpointManager:
+        """Return the checkpoint manager singleton."""
+        if not hasattr(self, "_checkpoint_manager"):
+            self._checkpoint_manager = CheckpointManager()
+        return self._checkpoint_manager
+
+    def _get_file_tracker(self) -> FileTracker:
+        """Return the file tracker singleton."""
+        if not hasattr(self, "_file_tracker"):
+            self._file_tracker = FileTracker(
+                gen1_client=self._get_gen1_client(),
+                checkpoint_manager=self._get_checkpoint_manager(),
+            )
+        return self._file_tracker

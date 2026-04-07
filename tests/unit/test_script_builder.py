@@ -1,12 +1,6 @@
 """Tests for ScriptBuilder — pure unit tests, no ADLA calls."""
 
-import re
-
-import sqlglot
-from sqlglot import exp
-
 from dbt.adapters.scope.script_builder import ColumnDef, ScriptBuilder, ScriptConfig
-from dbt.adapters.scope.sqlglot_parser import _normalize_scope_sql
 
 
 class TestScriptBuilderFullRefresh:
@@ -14,10 +8,9 @@ class TestScriptBuilderFullRefresh:
         script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
         assert 'SET @@FeaturePreviews = "EnableDeltaTableDynamicInsert:on"' in script
 
-    def test_generates_declare_paths(self, sample_config):
+    def test_generates_declare_delta_path(self, sample_config):
         script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
         assert "#DECLARE @deltaPath" in script
-        assert "#DECLARE @ssBase" in script
         assert sample_config.resolved_delta_location in script
 
     def test_generates_create_table(self, sample_config):
@@ -47,25 +40,46 @@ class TestScriptBuilderFullRefresh:
         script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
         assert "ALTER TABLE" not in script
 
-    def test_generates_extract(self, sample_config):
+    def test_generates_extract_from_explicit_files(self, sample_config):
         script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
         assert "EXTRACT" in script
         assert "Extractors.SStream()" in script
-        assert "_date : DateTime" in script
-        assert "FILE.URI()" in script
+        # Should contain the explicit file paths
+        assert "20260401_010000_0.ss" in script
+        assert "20260401_020000_0.ss" in script
 
-    def test_partition_column_excluded_from_extract(self, sample_config):
+    def test_extractable_columns_in_extract(self, sample_config):
+        """Only columns with extract=True should appear in EXTRACT."""
         script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
-        # event_year_date should NOT appear in EXTRACT (it's derived from _date)
         lines = script.split("\n")
         extract_section = False
+        found_cols = set()
         for line in lines:
             if "EXTRACT" in line:
                 extract_section = True
             if "USING Extractors" in line:
                 extract_section = False
-            if extract_section and "event_year_date" in line:
-                raise AssertionError("partition column event_year_date should not be in EXTRACT")
+            if extract_section:
+                for col in sample_config.columns:
+                    if col.name in line and ":" in line:
+                        found_cols.add(col.name)
+        expected = {c.name for c in sample_config.columns if c.extract}
+        assert found_cols == expected, (
+            f"EXTRACT columns mismatch: got {found_cols}, expected {expected}"
+        )
+        # event_year_date should NOT be in EXTRACT (extract=False)
+        assert "event_year_date" not in found_cols
+
+    def test_no_virtual_columns_in_extract(self, sample_config):
+        """Virtual columns _date, _serial, _source_file should NOT appear."""
+        script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
+        extract_start = script.index("EXTRACT")
+        extract_end = script.index("USING Extractors")
+        extract_section = script[extract_start:extract_end]
+        # Check for virtual columns as standalone column definitions
+        assert "_date : DateTime" not in extract_section
+        assert "_serial : int" not in extract_section
+        assert "FILE.URI()" not in extract_section
 
     def test_generates_insert(self, sample_config):
         script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
@@ -89,62 +103,57 @@ class TestScriptBuilderFullRefresh:
         extract_pos = script.index("EXTRACT")
         assert create_pos < delete_pos < extract_pos
 
+    def test_empty_file_list(self, sample_config):
+        """ScriptBuilder should handle an empty file list."""
+        sample_config.source_files = []
+        script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
+        assert "EXTRACT" in script
+        assert "FROM " in script
+
 
 class TestScriptBuilderIncremental:
-    def test_generates_batch_declares(self, sample_config):
-        script = ScriptBuilder.build_incremental(
-            sample_config, "SELECT * FROM @data", "2026-04-01", "2026-04-02"
-        )
-        assert '#DECLARE @startDate string = "2026-04-01"' in script
-        assert '#DECLARE @endDate string = "2026-04-02"' in script
-
-    def test_generates_delete_partition_when_enabled(self, sample_config):
-        sample_config.delete_before_insert = True
-        script = ScriptBuilder.build_incremental(
-            sample_config, "SELECT * FROM @data", "2026-04-01", "2026-04-02"
-        )
-        assert "DELETE FROM @target_rw" in script
-        assert "event_year_date >= @startDate" in script
-        assert "event_year_date < @endDate" in script
-
-    def test_no_delete_by_default(self, sample_config):
-        assert sample_config.delete_before_insert is False
-        script = ScriptBuilder.build_incremental(
-            sample_config, "SELECT * FROM @data", "2026-04-01", "2026-04-02"
-        )
-        assert "DELETE" not in script
-        assert "target_rw" not in script
-        # INSERT should still be present
-        assert "INSERT INTO @target" in script
-
-    def test_generates_date_filter(self, sample_config):
-        script = ScriptBuilder.build_incremental(
-            sample_config, "SELECT * FROM @data", "2026-04-01", "2026-04-02"
-        )
-        assert "DateTime.Parse(@startDate)" in script
-        assert "DateTime.Parse(@endDate)" in script
-
     def test_generates_commit_condition(self, sample_config):
-        script = ScriptBuilder.build_incremental(
-            sample_config, "SELECT * FROM @data", "2026-04-01", "2026-04-02"
-        )
+        script = ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
         assert "FailIfPartitionConflict" in script
 
-    def test_header_contains_batch_info(self, sample_config):
-        script = ScriptBuilder.build_incremental(
-            sample_config, "SELECT * FROM @data", "2026-04-01", "2026-04-02"
-        )
-        assert "microbatch" in script
-        assert "2026-04-01" in script
+    def test_header_contains_file_count(self, sample_config):
+        script = ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
+        assert "incremental" in script
+        assert "2 files" in script
+
+    def test_generates_extract_from_files(self, sample_config):
+        script = ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
+        assert "20260401_010000_0.ss" in script
+        assert "EXTRACT" in script
+        assert "Extractors.SStream()" in script
+
+    def test_no_date_declares(self, sample_config):
+        """Incremental should not have @startDate/@endDate declares."""
+        script = ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
+        assert "@startDate" not in script
+        assert "@endDate" not in script
+
+    def test_no_date_filter_in_transform(self, sample_config):
+        """No date predicate should be injected into user SQL."""
+        script = ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
+        assert "DateTime.Parse" not in script
 
     def test_multi_prop_single_tblproperties(self, sample_config):
         """Multiple scope_settings produce a single ALTER TABLE in incremental scripts."""
-        script = ScriptBuilder.build_incremental(
-            sample_config, "SELECT * FROM @data", "2026-04-01", "2026-04-02"
-        )
+        script = ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
         assert script.count("ALTER TABLE") == 1
         assert '"microsoft.scope.compression" = "zstd#11"' in script
         assert '"delta.checkpointInterval" = 5' in script
+
+    def test_no_delete_in_incremental(self, sample_config):
+        """Incremental should not have DELETE statements."""
+        script = ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
+        assert "DELETE" not in script
+
+    def test_insert_present(self, sample_config):
+        script = ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
+        assert "INSERT INTO @target" in script
+        assert "SELECT * FROM @batch_data" in script
 
 
 class TestScriptBuilderMultiPartition:
@@ -154,70 +163,28 @@ class TestScriptBuilderMultiPartition:
         script = ScriptBuilder.build_full_refresh(multi_partition_config, "SELECT * FROM @data")
         assert "PARTITIONED BY (event_year_date, edition)" in script
 
-    def test_multi_partition_excludes_only_date_col_from_extract(self, multi_partition_config):
-        """Only the first (date-derived) partition column is excluded from EXTRACT.
-        Additional partition columns like 'edition' are real data and must be extracted."""
+    def test_extractable_columns_in_extract(self, multi_partition_config):
+        """Only columns with extract=True should be in EXTRACT."""
         script = ScriptBuilder.build_full_refresh(multi_partition_config, "SELECT * FROM @data")
         lines = script.split("\n")
         extract_section = False
-        found_edition = False
+        found = set()
         for line in lines:
             if "EXTRACT" in line:
                 extract_section = True
             if "USING Extractors" in line:
                 extract_section = False
             if extract_section:
-                if "event_year_date" in line:
-                    raise AssertionError("event_year_date should not be in EXTRACT")
-                if "edition" in line and ":" in line:
-                    found_edition = True
-        assert found_edition, "edition should be in EXTRACT (it's a real data column)"
+                for col in multi_partition_config.columns:
+                    if col.name in line and ":" in line:
+                        found.add(col.name)
+        expected = {c.name for c in multi_partition_config.columns if c.extract}
+        assert found == expected
 
-    def test_multi_partition_delete_uses_first_col(self, multi_partition_config):
-        multi_partition_config.delete_before_insert = True
-        script = ScriptBuilder.build_incremental(
-            multi_partition_config, "SELECT * FROM @data", "2026-04-01", "2026-04-02"
-        )
-        assert "DELETE FROM @target_rw" in script
-        # Should use first partition column (event_year_date) for date range
-        assert "event_year_date >= @startDate" in script
-
-    def test_multi_partition_incremental_batch(self, multi_partition_config):
-        script = ScriptBuilder.build_incremental(
-            multi_partition_config, "SELECT * FROM @data", "2026-04-01", "2026-04-02"
-        )
+    def test_multi_partition_incremental(self, multi_partition_config):
+        script = ScriptBuilder.build_incremental(multi_partition_config, "SELECT * FROM @data")
         assert "PARTITIONED BY (event_year_date, edition)" in script
         assert "INSERT INTO @target" in script
-
-
-class TestScriptBuilderDaysPerBatch:
-    """Tests for the days_per_batch config."""
-
-    def test_days_per_batch_default_is_one(self, sample_config):
-        assert sample_config.days_per_batch == 1
-
-    def test_days_per_batch_set(self, sample_config):
-        sample_config.days_per_batch = 15
-        assert sample_config.days_per_batch == 15
-
-    def test_wide_date_range_incremental(self, sample_config):
-        """With days_per_batch=15, a single script covers 15 days."""
-        sample_config.days_per_batch = 15
-        script = ScriptBuilder.build_incremental(
-            sample_config, "SELECT * FROM @data", "2026-02-01", "2026-02-16"
-        )
-        assert '#DECLARE @startDate string = "2026-02-01"' in script
-        assert '#DECLARE @endDate string = "2026-02-16"' in script
-        assert "INSERT INTO @target" in script
-
-
-class TestScriptBuilderCheckpoint:
-    def test_generates_checkpoint_query(self, sample_config):
-        script = ScriptBuilder.build_checkpoint(sample_config, "event_year_date")
-        assert "MAX(event_year_date)" in script
-        assert "DECLARE TABLE @target" in script
-        assert sample_config.resolved_delta_location in script
-        assert "OUTPUT @checkpoint" in script
 
 
 class TestScriptBuilderDrop:
@@ -249,110 +216,124 @@ class TestScriptConfig:
         cfg = ScriptConfig(partition_by="event_year_date")
         assert cfg.partition_by == "event_year_date"
 
+    def test_source_files_default_empty(self):
+        cfg = ScriptConfig()
+        assert cfg.source_files == []
 
-class TestScriptBuilderFilteredSQL:
-    """Tests for model SQL that already contains a WHERE clause."""
+    def test_max_files_per_trigger_default(self):
+        cfg = ScriptConfig()
+        assert cfg.max_files_per_trigger == 50
 
-    def test_incremental_with_existing_where_uses_and(self, sample_config):
-        """When model SQL has WHERE, the date predicate is injected with AND."""
-        model_sql = (
-            "SELECT col_str, col_long, col_dt,\n"
-            '    _date.ToString("yyyyMMdd") AS event_year_date\n'
-            "FROM @data\n"
-            'WHERE col_str == "hello"'
-        )
-        script = ScriptBuilder.build_incremental(
-            sample_config, model_sql, "2026-04-01", "2026-04-02"
-        )
-        assert "AND _date >= DateTime.Parse(@startDate)" in script
-        assert "AND _date < DateTime.Parse(@endDate)" in script
-        # Must NOT have a second WHERE — only the user's WHERE and ANDs
-        batch_section = script.split("@batch_data =")[1].split("INSERT INTO")[0]
-        where_count = batch_section.upper().count("WHERE")
-        assert where_count == 1, f"Expected 1 WHERE, found {where_count}"
+    def test_safety_buffer_default(self):
+        cfg = ScriptConfig()
+        assert cfg.safety_buffer_seconds == 30
 
-    def test_incremental_without_where_uses_where(self, sample_config):
-        """When model SQL has no WHERE, date predicate uses WHERE (existing behavior)."""
-        model_sql = "SELECT * FROM @data"
-        script = ScriptBuilder.build_incremental(
-            sample_config, model_sql, "2026-04-01", "2026-04-02"
-        )
-        assert "WHERE _date >= DateTime.Parse(@startDate)" in script
-        assert "AND _date < DateTime.Parse(@endDate)" in script
 
-    def test_full_refresh_with_existing_where_no_date_filter(self, sample_config):
-        """Full refresh never injects date filter, even with WHERE in model SQL."""
-        model_sql = 'SELECT * FROM @data WHERE col_str == "hello"'
-        script = ScriptBuilder.build_full_refresh(sample_config, model_sql)
-        assert 'WHERE col_str == "hello"' in script
+class TestScriptBuilderModelSQL:
+    """Tests for model SQL handling in the new file-based approach."""
+
+    def test_model_sql_with_where_preserved(self, sample_config):
+        """Model SQL with WHERE clause should be preserved as-is."""
+        model_sql = 'SELECT * FROM @data WHERE edition == "Standard"'
+        script = ScriptBuilder.build_incremental(sample_config, model_sql)
+        assert 'WHERE edition == "Standard"' in script
         assert "DateTime.Parse" not in script
-
-    def test_incremental_with_complex_where(self, sample_config):
-        """Model SQL with multi-condition WHERE still gets AND for date predicate."""
-        model_sql = (
-            'SELECT col_str, col_long\nFROM @data\nWHERE col_str == "hello" AND col_long > 100'
-        )
-        script = ScriptBuilder.build_incremental(
-            sample_config, model_sql, "2026-04-01", "2026-04-02"
-        )
-        assert 'WHERE col_str == "hello" AND col_long > 100' in script
-        assert "AND _date >= DateTime.Parse(@startDate)" in script
 
     def test_trailing_semicolon_stripped(self, sample_config):
         """Model SQL with trailing semicolon doesn't break injection."""
         model_sql = "SELECT * FROM @data;"
-        script = ScriptBuilder.build_incremental(
-            sample_config, model_sql, "2026-04-01", "2026-04-02"
-        )
-        assert "WHERE _date >= DateTime.Parse(@startDate)" in script
+        script = ScriptBuilder.build_incremental(sample_config, model_sql)
         assert "INSERT INTO @target" in script
 
-    def test_no_duplicate_where_via_sqlglot(self, multi_partition_config):
-        """Regression: filtered model SQL must produce exactly one WHERE clause.
-
-        Uses sqlglot to parse the generated batch SELECT and assert no
-        duplicate WHERE nodes exist — mirrors the ADLA error
-        E_CSC_USER_DUPLICATECLAUSES.
-        """
-        # Exact model SQL from filtered_edition.sql
+    def test_model_sql_preserved_verbatim(self, sample_config):
+        """User SQL should appear in the script unmodified (minus trailing ;)."""
         model_sql = (
             "SELECT\n"
-            "    logical_server_name,\n"
-            "    logical_database_name,\n"
-            "    edition,\n"
-            "    state,\n"
-            "    region_name,\n"
-            "    max_size_bytes,\n"
-            '    _date.ToString("yyyyMMdd") AS event_year_date\n'
-            "FROM @data\n"
-            'WHERE edition == "Standard"'
+            "    col_str,\n"
+            '    DateTime.UtcNow.ToString("yyyyMMdd") AS event_year_date\n'
+            "FROM @data"
         )
-        script = ScriptBuilder.build_incremental(
-            multi_partition_config, model_sql, "2026-02-01", "2026-03-05"
-        )
-
-        # Extract the @batch_data assignment (between "@batch_data =" and ";")
-        batch_match = re.search(r"@batch_data\s*=\s*(.*?);", script, re.DOTALL)
-        assert batch_match, "Could not find @batch_data assignment in script"
-        batch_sql = batch_match.group(1).strip()
-
-        # 1) String-level check: only one WHERE keyword
-        where_count = len(re.findall(r"\bWHERE\b", batch_sql, re.IGNORECASE))
-        assert where_count == 1, (
-            f"Expected exactly 1 WHERE in batch SQL, found {where_count}:\n{batch_sql}"
-        )
-
-        # 2) sqlglot parse of normalised batch SQL — must have exactly one Where node
-        normalized = _normalize_scope_sql(batch_sql)
-        parsed = sqlglot.parse_one(normalized, error_level=sqlglot.ErrorLevel.IGNORE)
-        assert isinstance(parsed, exp.Select), f"Expected Select node, got {type(parsed).__name__}"
-        where_nodes = list(parsed.find_all(exp.Where))
-        assert len(where_nodes) == 1, (
-            f"sqlglot found {len(where_nodes)} WHERE nodes, expected 1:\n{batch_sql}"
-        )
+        script = ScriptBuilder.build_full_refresh(sample_config, model_sql)
+        assert 'DateTime.UtcNow.ToString("yyyyMMdd") AS event_year_date' in script
 
 
 class TestColumnDef:
     def test_render(self):
         col = ColumnDef(name="my_col", scope_type="string")
         assert col.render() == "    my_col string"
+
+    def test_extract_default_true(self):
+        col = ColumnDef(name="my_col", scope_type="string")
+        assert col.extract is True
+
+    def test_extract_false(self):
+        col = ColumnDef(name="event_year_date", scope_type="string", extract=False)
+        assert col.extract is False
+
+
+class TestVirtualColumns:
+    """Tests for FILE.* virtual column support in EXTRACT."""
+
+    def test_source_file_uri_uses_file_uri(self):
+        config = ScriptConfig(
+            delta_location="abfss://c@a.dfs.core.windows.net/d/t",
+            table_name="t",
+            source_files=["/shares/test/a.ss"],
+            columns=[
+                ColumnDef(name="col_a", scope_type="string"),
+                ColumnDef(name="source_file_uri", scope_type="string"),
+            ],
+        )
+        script = ScriptBuilder.build_incremental(config, "SELECT * FROM @data")
+        assert "source_file_uri = FILE.URI()" in script
+        assert "col_a : string" in script
+
+    def test_all_four_virtual_columns(self):
+        config = ScriptConfig(
+            delta_location="abfss://c@a.dfs.core.windows.net/d/t",
+            table_name="t",
+            source_files=["/shares/test/a.ss"],
+            columns=[
+                ColumnDef(name="col_a", scope_type="string"),
+                ColumnDef(name="source_file_uri", scope_type="string"),
+                ColumnDef(name="source_file_length", scope_type="long"),
+                ColumnDef(name="source_file_created", scope_type="DateTime"),
+                ColumnDef(name="source_file_modified", scope_type="DateTime"),
+            ],
+        )
+        script = ScriptBuilder.build_full_refresh(config, "SELECT * FROM @data")
+        assert "source_file_uri = FILE.URI()" in script
+        assert "source_file_length = FILE.LENGTH()" in script
+        assert "source_file_created = FILE.CREATED()" in script
+        assert "source_file_modified = FILE.MODIFIED()" in script
+        # Normal column still uses : syntax
+        assert "col_a : string" in script
+        # Virtual columns still in CREATE TABLE with normal type syntax
+        assert "source_file_uri string" in script
+
+    def test_virtual_columns_in_create_table_normal_syntax(self):
+        config = ScriptConfig(
+            delta_location="abfss://c@a.dfs.core.windows.net/d/t",
+            table_name="t",
+            source_files=["/shares/test/a.ss"],
+            columns=[
+                ColumnDef(name="source_file_uri", scope_type="string"),
+            ],
+        )
+        script = ScriptBuilder.build_incremental(config, "SELECT * FROM @data")
+        # CREATE TABLE should have normal syntax
+        create_section = script.split("CREATE TABLE IF NOT EXISTS")[1].split("LOCATION")[0]
+        assert "source_file_uri string" in create_section
+
+    def test_non_virtual_column_not_treated_as_virtual(self):
+        config = ScriptConfig(
+            delta_location="abfss://c@a.dfs.core.windows.net/d/t",
+            table_name="t",
+            source_files=["/shares/test/a.ss"],
+            columns=[
+                ColumnDef(name="my_custom_col", scope_type="string"),
+            ],
+        )
+        script = ScriptBuilder.build_incremental(config, "SELECT * FROM @data")
+        assert "my_custom_col : string" in script
+        assert "FILE." not in script
