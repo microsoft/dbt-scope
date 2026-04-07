@@ -110,3 +110,13 @@ jobs:
         run: |
           set -euo pipefail
           .scripts/run.sh integration-test
+
+      - name: "📦 Upload failure logs"
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: failure-logs
+          path: |
+            /tmp/imds-router.log
+            .logs/
+          retention-days: 7
