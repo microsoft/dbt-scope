@@ -106,17 +106,6 @@ def append_scenario() -> ScenarioConfig:
     return scenario
 
 
-@pytest.fixture(scope="session")
-def delete_insert_scenario() -> ScenarioConfig:
-    """Scenario: incremental with delete+insert -- idempotent partition replacement."""
-    scenario = _build_scenario("delete_insert")
-    adla = _env("SCOPE_ADLA_ACCOUNT")
-
-    log.info("Generating historical SS files for delete+insert scenario")
-    submit_datagen_job(scenario.historical, adla_account=adla, au=5)
-    return scenario
-
-
 # -- dbt runner ---------------------------------------------------------------
 
 
@@ -256,8 +245,12 @@ def verify_delta_with_duckdb(
             result_info["errors"].append(f"Partition query failed: {e}")
 
     except duckdb.Error as e:
+        err_msg = str(e)
         result_info["errors"].append(f"Delta scan failed: {e}")
-        log.error("DuckDB Delta scan failed: %s", e)
+        if "No files in log segment" in err_msg or "does not exist" in err_msg:
+            log.debug("Delta table does not exist yet at %s (expected on first run)", delta_path)
+        else:
+            log.error("DuckDB Delta scan failed: %s", e)
 
     log.info(
         "DuckDB verify result: total_rows=%d, partitions=%d, errors=%d",
@@ -267,7 +260,10 @@ def verify_delta_with_duckdb(
     )
     if result_info["errors"]:
         for err in result_info["errors"]:
-            log.warning("DuckDB verify error: %s", err)
+            if "No files in log segment" in err or "does not exist" in err:
+                log.debug("DuckDB verify (expected): %s", err)
+            else:
+                log.warning("DuckDB verify error: %s", err)
     return result_info
 
 
