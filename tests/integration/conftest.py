@@ -269,3 +269,27 @@ def verify_delta_with_duckdb(
         for err in result_info["errors"]:
             log.warning("DuckDB verify error: %s", err)
     return result_info
+
+
+# -- Watermark + sources checkpoint verification ------------------------------
+
+
+def read_watermark(delta_path: str):
+    """Read the watermark checkpoint for a Delta table."""
+    from dbt.adapters.scope.checkpoint import CheckpointManager
+
+    return CheckpointManager().read_watermark(delta_path)
+
+
+def list_source_files(delta_path: str) -> list[str]:
+    """List files in ``_checkpoint/sources/``."""
+    from dbt.adapters.scope.checkpoint import CheckpointManager
+
+    return CheckpointManager().list_source_files(delta_path)
+
+
+def read_batch_source(delta_path: str, batch_id: int) -> list[dict]:
+    """Read a batch JSONL file from ``_checkpoint/sources/{batch_id}``."""
+    from dbt.adapters.scope.checkpoint import CheckpointManager
+
+    return CheckpointManager().read_batch_source(delta_path, batch_id)

@@ -7,19 +7,15 @@
         begin=var('datagen_start_date', '2026-02-01'),
         lookback=1,
         partition_by='event_year_date',
-        delta_location=var('delta_location_with_delete'),
+        delta_location=var('delta_location_retention'),
         source_root=var('source_root'),
         source_pattern=var('source_pattern', '.*\\.ss$'),
-        max_files_per_trigger=var('max_files_per_trigger', 50),
+        max_files_per_trigger=10,
         safety_buffer_seconds=0,
         source_compaction_interval=1,
-        source_retention_files=100,
+        source_retention_files=3,
         au=4,
         priority=1,
-        scope_settings={
-            'microsoft.scope.compression': 'vorder:zstd#11',
-            'delta.checkpointInterval': 10
-        },
         scope_columns=[
             {'name': 'logical_server_name', 'type': 'string'},
             {'name': 'logical_database_name', 'type': 'string'},

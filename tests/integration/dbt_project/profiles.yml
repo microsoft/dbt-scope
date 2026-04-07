@@ -12,6 +12,7 @@ dbt_scope_test:
       storage_account: "{{ env_var('SCOPE_STORAGE_ACCOUNT') }}"
       container: "{{ env_var('SCOPE_CONTAINER') }}"
       delta_base_path: "{{ env_var('SCOPE_DELTA_BASE_PATH', 'delta') }}"
+      adls_gen1_account: "{{ env_var('SCOPE_ADLS_GEN1_ACCOUNT') }}"
       au: "{{ env_var('SCOPE_AU', '5') | int }}"
       priority: "{{ env_var('SCOPE_PRIORITY', '1') | int }}"
       poll_interval_seconds: 5
