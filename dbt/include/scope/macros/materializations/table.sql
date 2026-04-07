@@ -22,6 +22,7 @@
     {%- set safety_buffer_seconds = config.get('safety_buffer_seconds', 30) | int -%}
     {%- set source_compaction_interval = config.get('source_compaction_interval', 10) | int -%}
     {%- set source_retention_files = config.get('source_retention_files', 100) | int -%}
+    {%- set starting_timestamp = config.get('starting_timestamp', none) -%}
     {%- set partition_by = config.get('partition_by', none) -%}
     {%- set scope_settings = config.get('scope_settings', {}) -%}
     {%- set scope_columns = config.get('scope_columns', []) -%}
@@ -36,7 +37,7 @@
         batch_num=0,
         total_files=0,
         file_batch=adapter.discover_files(
-            source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds
+            source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds, starting_timestamp
         )
     ) -%}
 
@@ -77,7 +78,7 @@
 
                 {# -- Discover next batch (watermark advanced) -- #}
                 {%- set ns.file_batch = adapter.discover_files(
-                    source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds
+                    source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds, starting_timestamp
                 ) -%}
             {%- endif -%}
         {%- endfor -%}

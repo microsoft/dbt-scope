@@ -7,6 +7,7 @@
         source_roots=var('source_roots'),
         source_patterns=var('source_patterns', ['.*\\.ss$']),
         max_files_per_trigger=var('max_files_per_trigger', 50),
+        starting_timestamp='1900-01-01T00:00:00+00:00',
         safety_buffer_seconds=0,
         source_compaction_interval=1,
         source_retention_files=100,

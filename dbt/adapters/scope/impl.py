@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 import agate
@@ -10,7 +11,7 @@ from dbt.adapters.base import BaseAdapter, available
 from dbt_common.exceptions import DbtRuntimeError
 
 from dbt.adapters.scope.adls_gen1_client import AdlsGen1Client, FileInfo
-from dbt.adapters.scope.checkpoint import CheckpointManager
+from dbt.adapters.scope.checkpoint import CheckpointManager, Watermark
 from dbt.adapters.scope.column import ScopeColumn
 from dbt.adapters.scope.connections import ScopeConnectionHandle, ScopeConnectionManager
 from dbt.adapters.scope.credentials import ScopeCredentials
@@ -19,6 +20,28 @@ from dbt.adapters.scope.relation import ScopeRelation
 from dbt.adapters.scope.script_builder import ColumnDef, ScriptConfig
 
 log = logging.getLogger(__name__)
+
+
+def _parse_starting_timestamp(value: str) -> datetime:
+    """Parse an ISO-8601 UTC timestamp string, raising on bad input.
+
+    Returns a timezone-aware ``datetime`` in UTC.
+    """
+    try:
+        dt = datetime.fromisoformat(value)
+    except (ValueError, TypeError) as exc:
+        raise DbtRuntimeError(
+            f"Invalid starting_timestamp '{value}'. "
+            f"Expected an ISO-8601 UTC string such as '2026-04-07T10:00:00+00:00'."
+        ) from exc
+
+    if dt.tzinfo is None:
+        raise DbtRuntimeError(
+            f"starting_timestamp '{value}' is missing timezone info. "
+            f"Use an explicit UTC offset, e.g. '2026-04-07T10:00:00+00:00'."
+        )
+
+    return dt.astimezone(timezone.utc)
 
 
 class ScopeAdapter(BaseAdapter):
@@ -188,6 +211,7 @@ class ScopeAdapter(BaseAdapter):
         max_files_per_trigger: int,
         delta_location: str,
         safety_buffer_seconds: int = 30,
+        starting_timestamp: str | None = None,
     ) -> list[str]:
         """Discover unprocessed source files and return a batch of file paths.
 
@@ -196,9 +220,32 @@ class ScopeAdapter(BaseAdapter):
           1. For each (root, pattern): read watermark, LIST + filter files
           2. Union results and deduplicate by file path
           3. Return up to *max_files_per_trigger* file paths
+
+        If *starting_timestamp* is provided (ISO-8601 UTC) and no checkpoint
+        exists, only files modified after that timestamp are considered.  When
+        a checkpoint already exists the parameter is silently ignored.
         """
+        # Validate starting_timestamp early (fail fast on bad input)
+        starting_ts_dt = (
+            _parse_starting_timestamp(starting_timestamp) if starting_timestamp else None
+        )
+
         tracker = self._get_file_tracker()
         watermark = self._get_checkpoint_manager().read_watermark(delta_location)
+
+        # Determine effective watermark: checkpoint wins over starting_timestamp
+        used_starting_timestamp = False
+        if watermark is not None:
+            effective_watermark = watermark
+        elif starting_ts_dt is not None:
+            effective_watermark = Watermark(modified_time=starting_ts_dt.isoformat())
+            used_starting_timestamp = True
+            log.info(
+                "No checkpoint found — using starting_timestamp=%s as initial offset",
+                starting_timestamp,
+            )
+        else:
+            effective_watermark = None
 
         seen_paths: set[str] = set()
         all_unprocessed: list[FileInfo] = []
@@ -208,13 +255,20 @@ class ScopeAdapter(BaseAdapter):
                 unprocessed = tracker.discover_unprocessed_files(
                     root=root,
                     pattern=pattern,
-                    watermark=watermark,
+                    watermark=effective_watermark,
                     safety_buffer_seconds=safety_buffer_seconds,
                 )
                 for f in unprocessed:
                     if f.path not in seen_paths:
                         seen_paths.add(f.path)
                         all_unprocessed.append(f)
+
+        # If starting_timestamp was used and yielded nothing, check whether
+        # there are source files at all — if so, the timestamp is too late.
+        if used_starting_timestamp and not all_unprocessed:
+            self._validate_starting_timestamp_has_files(
+                tracker, source_roots, source_patterns, starting_timestamp
+            )
 
         # Sort by modification_time to maintain deterministic ordering
         all_unprocessed.sort(key=lambda f: f.modification_time)
@@ -228,6 +282,28 @@ class ScopeAdapter(BaseAdapter):
             len(batch),
         )
         return [f.path for f in batch]
+
+    @staticmethod
+    def _validate_starting_timestamp_has_files(
+        tracker: FileTracker,
+        source_roots: list[str],
+        source_patterns: list[str],
+        starting_timestamp: str | None,
+    ) -> None:
+        """Raise if starting_timestamp is after all available source files."""
+        for root in source_roots:
+            for pattern in source_patterns:
+                files = tracker.discover_unprocessed_files(
+                    root=root, pattern=pattern, watermark=None, safety_buffer_seconds=0
+                )
+                if files:
+                    raise DbtRuntimeError(
+                        f"starting_timestamp '{starting_timestamp}' is after all available "
+                        f"source files. The latest file has modificationTime "
+                        f"'{files[-1].modification_time.isoformat()}'. "
+                        f"Use an earlier timestamp or remove starting_timestamp."
+                    )
+        # No files exist at all — that's a legitimate empty source, not an error
 
     @available
     def update_checkpoint(
@@ -302,6 +378,7 @@ class ScopeAdapter(BaseAdapter):
         source_patterns: list[str],
         delta_location: str,
         safety_buffer_seconds: int = 30,
+        starting_timestamp: str | None = None,
     ) -> bool:
         """Are there unprocessed files at the source?"""
         files = self.discover_files(
@@ -310,6 +387,7 @@ class ScopeAdapter(BaseAdapter):
             max_files_per_trigger=1,
             delta_location=delta_location,
             safety_buffer_seconds=safety_buffer_seconds,
+            starting_timestamp=starting_timestamp,
         )
         return len(files) > 0
 
