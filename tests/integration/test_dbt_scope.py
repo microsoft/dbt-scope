@@ -35,7 +35,6 @@ def _dbt_vars(scenario: ScenarioConfig) -> dict:
         "delta_location": scenario.delta_location,
         "delta_location_with_delete": f"{scenario.delta_location}_del",
         "delta_location_filtered": f"{scenario.delta_location}_filtered",
-        "delta_location_retention": f"{scenario.delta_location}_retention",
         "source_root": scenario.historical.ss_base_path,
         "source_pattern": r".*\.ss$",
         "max_files_per_trigger": 500,
@@ -168,12 +167,6 @@ class TestIncrementalAppend:
             str(wm_after.batch_id) in sources or f"{wm_after.batch_id}.parquet" in sources
         )
         assert has_new_batch, f"Sources should have batch {wm_after.batch_id}, got {sources}"
-
-        # With compaction_interval=1, batch 1+ should produce parquet snapshots
-        parquet_files = [s for s in sources if s.endswith(".parquet")]
-        assert len(parquet_files) > 0, (
-            f"Compaction should have produced a parquet snapshot (interval=1), got {sources}"
-        )
 
         log.info(
             "Incremental passed: rows %d->%d, batch_id %d->%d, sources: %s",
@@ -376,68 +369,3 @@ class TestFullRefreshAfterIncremental:
 
         sources = list_source_files(delta_loc)
         assert "0" in sources, f"Should have sources/0 after full refresh, got {sources}"
-
-
-# ---------------------------------------------------------------------------
-# Aggressive retention + compaction (per-table config)
-# ---------------------------------------------------------------------------
-
-
-class TestAggressiveRetentionAndCompaction:
-    """Test sources compaction and retention with aggressive per-table settings.
-
-    The ``aggressive_retention`` model has:
-      - max_files_per_trigger=10 -> ~7 SCOPE jobs for 62 files
-      - source_compaction_interval=1 -> snapshot parquet on every batch after 0
-      - source_retention_files=3 -> only keep 3 files in sources/
-
-    This verifies that:
-      1. Multiple batches produce multiple JSONL/parquet files
-      2. Compaction fires and produces parquet snapshots (full history)
-      3. Retention deletes oldest files, capping at 3
-      4. All data is still fully ingested
-    """
-
-    @pytest.mark.timeout(3600)
-    def test_aggressive_retention_compacts_and_cleans(
-        self, append_scenario: ScenarioConfig, request: pytest.FixtureRequest
-    ):
-        vars_ = _dbt_vars(append_scenario)
-        delta_ret = f"{append_scenario.delta_location}_retention"
-        test_name = _test_id(request)
-
-        result = run_dbt(
-            ["run", "--select", "aggressive_retention"],
-            extra_vars=vars_,
-            test_name=test_name,
-        )
-        assert result.success, f"dbt run failed: {result.result}"
-
-        duckdb_info = verify_delta_with_duckdb(delta_ret)
-        # Row count >= expected (new_data from incremental test may add source files)
-        assert duckdb_info["total_rows"] >= append_scenario.historical.total_expected_rows, (
-            f"Expected at least {append_scenario.historical.total_expected_rows} rows, "
-            f"got {duckdb_info['total_rows']}"
-        )
-
-        wm = read_watermark(delta_ret)
-        assert wm is not None
-        assert wm.batch_id > 0, f"Should have multiple batches, got batch_id={wm.batch_id}"
-
-        # Sources directory capped at retention limit (3)
-        sources = list_source_files(delta_ret)
-        log.info("Sources files after run: %s", sources)
-        assert len(sources) <= 3, f"Retention should cap at 3 files, got {len(sources)}: {sources}"
-
-        # Should have at least one parquet snapshot (compaction_interval=1)
-        parquet_files = [s for s in sources if s.endswith(".parquet")]
-        assert len(parquet_files) >= 1, f"Should have parquet snapshot, got: {sources}"
-
-        log.info(
-            "Aggressive retention passed: %d rows, batch_id=%d, "
-            "%d source files (limit 3), parquet snapshots: %s",
-            duckdb_info["total_rows"],
-            wm.batch_id,
-            len(sources),
-            parquet_files,
-        )

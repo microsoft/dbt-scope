@@ -276,17 +276,29 @@ class CheckpointManager:
 
         # Collect all history: previous snapshot + JSONL diffs
         all_records: list[dict] = []
+        snapshot_batch_id: int = -1
 
-        # Find the latest existing parquet snapshot and all JSONL diffs
+        # Two-pass: first find the latest parquet snapshot, then read JSONL diffs
+        # that arrived AFTER the snapshot (to avoid double-counting).
+        file_entries: list[tuple[str, str]] = []  # (name, full_path)
         for path_info in fs.get_paths(path=sources_dir, recursive=False):
             if getattr(path_info, "is_directory", False):
                 continue
             name = path_info.name.rsplit("/", 1)[-1]
+            file_entries.append((name, path_info.name))
 
+            if name.endswith(".parquet"):
+                try:
+                    snap_id = int(name.removesuffix(".parquet"))
+                    snapshot_batch_id = max(snapshot_batch_id, snap_id)
+                except ValueError:
+                    pass
+
+        for name, full_path in file_entries:
             if name.endswith(".parquet"):
                 # Read previous snapshot
                 try:
-                    file_client = fs.get_file_client(path_info.name)
+                    file_client = fs.get_file_client(full_path)
                     parquet_bytes = file_client.download_file().readall()
                     tmp_path = f"/tmp/dbt_scope_read_{name}"
                     with open(tmp_path, "wb") as tmp_f:
@@ -311,11 +323,16 @@ class CheckpointManager:
 
             # JSONL diff files (numeric names, no extension)
             try:
-                int(name)
+                jsonl_batch_id = int(name)
             except ValueError:
                 continue
+
+            # Skip JSONL diffs already folded into the latest parquet snapshot
+            if jsonl_batch_id <= snapshot_batch_id:
+                continue
+
             try:
-                file_client = fs.get_file_client(path_info.name)
+                file_client = fs.get_file_client(full_path)
                 raw = file_client.download_file().readall().decode("utf-8")
                 for line in raw.strip().split("\n"):
                     if line.strip():
@@ -326,17 +343,25 @@ class CheckpointManager:
         # Add current batch records
         all_records.extend(current_batch_records)
 
-        # Write consolidated parquet via DuckDB
-        conn = duckdb.connect()
+        # Write consolidated parquet via DuckDB (NDJSON → read_json_auto → COPY)
         parquet_local = f"/tmp/dbt_scope_{batch_id}.parquet"
+        ndjson_local = f"/tmp/dbt_scope_{batch_id}.ndjson"
         try:
-            conn.execute(
-                "CREATE TABLE sources AS SELECT * FROM unnest(?::JSON[])",
-                [[json.dumps(r) for r in all_records]],
-            )
-            conn.execute(f"COPY sources TO '{parquet_local}' (FORMAT PARQUET)")
+            with open(ndjson_local, "w") as nf:
+                for r in all_records:
+                    nf.write(json.dumps(r) + "\n")
+
+            conn = duckdb.connect()
+            try:
+                conn.execute(
+                    f"CREATE TABLE sources AS SELECT * FROM read_json_auto('{ndjson_local}')"
+                )
+                conn.execute(f"COPY sources TO '{parquet_local}' (FORMAT PARQUET)")
+            finally:
+                conn.close()
         finally:
-            conn.close()
+            if os.path.exists(ndjson_local):
+                os.remove(ndjson_local)
 
         with open(parquet_local, "rb") as f:
             parquet_data = f.read()
