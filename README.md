@@ -29,7 +29,7 @@ As a result of this conscious design decision, the adapter **does not** encourag
 ## Key features
 
 - **Clean SQL models** — write `SELECT ... FROM @data`; macros generate `EXTRACT`, `INSERT INTO`
-- **File-based microbatch** — the adapter lists source files on ADLS Gen1, filters by watermark, and processes up to `max_files_per_trigger` per SCOPE job. No date-range orchestration needed - this is very similar to Apache Spark [Microbatch based structured streaming](https://spark.apache.org/docs/latest/streaming/getting-started.html)
+- **File-based incremental** — the adapter lists source files on ADLS Gen1, filters by watermark, and processes up to `max_files_per_trigger` per SCOPE job. Uses `append` strategy — dbt calls the macro once per `dbt run`, no date-range orchestration needed - this is very similar to Apache Spark [Microbatch based structured streaming](https://spark.apache.org/docs/latest/streaming/getting-started.html)
 - **Watermark checkpoint** — progress is tracked in `_checkpoint/watermark.json` alongside `_delta_log/`. Re-runs automatically skip already-processed files; full refresh resets the checkpoint
 - **Sources audit trail** — per-batch JSONL diffs record which files were processed. Configurable compaction (parquet snapshots) and retention keep the checkpoint directory bounded - similar once again to Spark structured streaming.
 - **Virtual file metadata** — `source_file_uri`, `source_file_length`, `source_file_created`, `source_file_modified` columns map to `FILE.*()` functions, giving each row lineage back to its source file
@@ -37,7 +37,7 @@ As a result of this conscious design decision, the adapter **does not** encourag
 
 ## How it works
 
-SS files live on ADLS Gen1. The adapter lists files under `source_root`, filters by regex and watermark, and processes them in batches of up to `max_files_per_trigger`. Each batch becomes a single SCOPE job with an explicit file list in the `EXTRACT FROM` clause. After a successful job, the watermark advances and a sources record is written to `_checkpoint/`.
+SS files live on ADLS Gen1. The adapter lists files under `source_root`, filters by regex and watermark, and processes them in batches of up to `max_files_per_trigger`. Each batch becomes a single SCOPE job with an explicit file list in the `EXTRACT FROM` clause. After a successful job, the watermark advances, a sources record is written to `_checkpoint/`, and the next batch is discovered — repeating until all files are processed.
 
 ### How dbt picks which files to process
 
@@ -66,10 +66,11 @@ On **full refresh**, the checkpoint is deleted before processing begins. The ada
 
 ```mermaid
 flowchart TB
-    subgraph dbt["dbt — file-based microbatch"]
+    subgraph dbt["dbt — file-based append with internal batching loop"]
         direction TB
         Discover["Adapter lists ADLS Gen1 files<br/><i>filter by regex + watermark</i>"]
         Batch["Take up to max_files_per_trigger<br/><i>oldest-first by modification_time</i>"]
+        More{"More<br/>files?"}
         Discover --> Batch
     end
 
@@ -77,7 +78,7 @@ flowchart TB
         direction TB
         S1["SET @@FeaturePreviews"]
         DDL["CREATE TABLE IF NOT EXISTS<br/>PARTITIONED BY partition_col<br/>OPTIONS LAYOUT = DELTA"]
-        DEL["DELETE FROM @target<br/>WHERE true<br/><i>only on full refresh</i>"]
+        DEL["DELETE FROM @target<br/>WHERE true<br/><i>only on first batch of full refresh</i>"]
         EXT["📖 EXTRACT FROM explicit file list<br/>+ FILE.URI(), FILE.LENGTH(), ...<br/>→ @data rowset"]
         TX["🔀 SQL Transform — your dbt model (.sql)<br/>SELECT … FROM @data<br/>→ @batch_data"]
         INS["💾 INSERT INTO @target<br/>SELECT * FROM @batch_data"]
@@ -87,7 +88,7 @@ flowchart TB
     subgraph Checkpoint["_checkpoint/ (ADLS Gen2)"]
         direction TB
         WM["📄 watermark.json<br/><i>{version, modifiedTime, batchId}</i>"]
-        SRC["📂 sources/<br/>0 (JSONL) · 1 (JSONL) · 2.parquet"]
+        SRC["📂 sources/<br/>0 (JSONL) · 1 (JSONL) · 10.parquet"]
     end
 
     subgraph Storage["Azure Data Lake Storage"]
@@ -111,14 +112,18 @@ flowchart TB
     INS -- "writes partitions" --> Target
     ADLA -- "on success" --> Checkpoint
     Checkpoint -. "watermark read<br/>at start" .-> Discover
+    Checkpoint --> More
+    More -- "yes" --> Discover
+    More -. "no → done" .-> Target
 
     style DEL fill:#fee,stroke:#c00
     style TX fill:#e8e0f8,stroke:#6a3cbc
     style Discover fill:#e8f4e8,stroke:#2a2
     style Checkpoint fill:#fff3cd,stroke:#856404
+    style More fill:#e8f4e8,stroke:#2a2
 ```
 
-On **full refresh**, every file is processed in batches and the `DELETE` step (red) clears the table before each batch inserts. On **incremental**, only files newer than the watermark are processed — no `DELETE` step. The checkpoint (yellow) tracks progress so re-runs skip already-processed files automatically.
+On **full refresh**, every file is processed in batches. The `DELETE` step (red) only runs on the first batch — subsequent batches append. On **incremental**, only files newer than the watermark are processed — no `DELETE` step. The checkpoint (yellow) tracks progress so re-runs skip already-processed files automatically. The batching loop continues until all unprocessed files are consumed.
 
 The scope jobs end up looking like this in ADLA:
 
@@ -160,7 +165,7 @@ my_project:
 | `database`    | Storage account name                                      |
 | `schema`      | ADLS container                                            |
 | `table`       | Full-refresh: `CREATE TABLE` + `INSERT INTO`              |
-| `incremental` | File-based microbatch: discover files → `INSERT` (append) |
+| `incremental` | File-based append: discover → process → checkpoint, looped until all files done |
 | model SQL     | `SELECT` from `@data` (extracted SS rowset)               |
 
 ## Usage
@@ -192,16 +197,12 @@ SELECT logical_server_name_DT_String AS server_name,
 FROM @data
 ```
 
-### Incremental (microbatch) — append-only
+### Incremental (append) — file-based
 
 ```sql
 {{ config(
     materialized='incremental',
-    incremental_strategy='microbatch',
-    event_time='event_year_date',
-    batch_size='day',
-    begin='2026-04-01',
-    lookback=1,
+    incremental_strategy='append',
     partition_by='event_year_date',
     delta_location='abfss://ctr@acct.dfs.core.windows.net/delta/my_model',
     source_root='/my/cosmos/path/to/MyStream',
@@ -235,11 +236,7 @@ Models can include `WHERE` clauses — the adapter passes through your SQL as-is
 ```sql
 {{ config(
     materialized='incremental',
-    incremental_strategy='microbatch',
-    event_time='event_year_date',
-    batch_size='day',
-    begin='2026-04-01',
-    lookback=1,
+    incremental_strategy='append',
     partition_by=['event_year_date', 'edition'],
     delta_location='abfss://ctr@acct.dfs.core.windows.net/delta/my_filtered_model',
     source_root='/my/cosmos/path/to/MyStream',

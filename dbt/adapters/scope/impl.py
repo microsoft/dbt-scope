@@ -125,7 +125,7 @@ class ScopeAdapter(BaseAdapter):
             log.info("list_relations_without_caching found %d Delta tables", len(relations))
             return relations
         except Exception:
-            log.info("list_relations_without_caching failed, returning []", exc_info=True)
+            log.debug("No Delta tables found at %s (path may not exist yet)", creds.delta_base_path)
             return []
 
     def quote(self, identifier: str) -> str:

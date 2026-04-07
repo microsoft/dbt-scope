@@ -1,11 +1,7 @@
 {{
     config(
         materialized='incremental',
-        incremental_strategy='microbatch',
-        event_time='event_year_date',
-        batch_size='day',
-        begin=var('datagen_start_date', '2026-02-01'),
-        lookback=1,
+        incremental_strategy='append',
         partition_by='event_year_date',
         delta_location=var('delta_location_filtered'),
         source_root=var('source_root'),

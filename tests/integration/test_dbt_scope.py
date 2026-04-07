@@ -38,7 +38,6 @@ def _dbt_vars(scenario: ScenarioConfig) -> dict:
         "source_root": scenario.historical.ss_base_path,
         "source_pattern": r".*\.ss$",
         "max_files_per_trigger": 500,
-        "datagen_start_date": scenario.historical.start_date,
     }
 
 
@@ -197,7 +196,6 @@ class TestIncrementalIdempotent:
             "source_root": delete_insert_scenario.historical.ss_base_path,
             "source_pattern": r".*\.ss$",
             "max_files_per_trigger": 500,
-            "datagen_start_date": delete_insert_scenario.historical.start_date,
         }
 
         result = run_dbt(
@@ -243,7 +241,6 @@ class TestIncrementalIdempotent:
             "source_root": delete_insert_scenario.historical.ss_base_path,
             "source_pattern": r".*\.ss$",
             "max_files_per_trigger": 500,
-            "datagen_start_date": delete_insert_scenario.historical.start_date,
         }
 
         result = run_dbt(

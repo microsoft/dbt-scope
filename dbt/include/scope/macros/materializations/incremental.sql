@@ -1,20 +1,23 @@
 {# ============================================================
    incremental.sql — File-based incremental materialization for SCOPE
 
-   Each microbatch iteration processes one batch of maxFilesPerTrigger
-   files from the ADLS Gen1 source. The adapter tracks progress via
-   a watermark checkpoint (_checkpoint/watermark.json) alongside
-   the Delta table's _delta_log.
+   Uses the ``append`` strategy with an internal batching loop:
+   the macro keeps discovering and processing files until no
+   unprocessed files remain, processing up to max_files_per_trigger
+   per SCOPE job.
 
-   Flow per iteration:
-     1. Read watermark from checkpoint
-     2. LIST files on ADLS Gen1, filter by regex + watermark
-     3. Take up to maxFilesPerTrigger files
-     4. Build SCOPE script with explicit file list
-     5. Submit SCOPE job
-     6. On success, update checkpoint with new watermark
+   Flow per dbt run:
+     loop:
+       1. Read watermark from _checkpoint/watermark.json
+       2. LIST files on ADLS Gen1, filter by regex + watermark
+       3. Take up to max_files_per_trigger files
+       4. Build SCOPE script with explicit file list
+       5. Submit SCOPE job
+       6. On success, update checkpoint with new watermark
+       7. If more files remain, repeat from step 1
+     end loop
 
-   Full refresh: delete checkpoint → process all files in batches.
+   Full refresh (--full-refresh): delete checkpoint → process all files.
    ============================================================ #}
 
 {% materialization incremental, adapter='scope' %}
@@ -27,7 +30,6 @@
     ) -%}
 
     {# -- Pull config values -- #}
-    {%- set strategy = config.get('incremental_strategy', 'microbatch') -%}
     {%- set delta_location = config.get('delta_location', '') -%}
     {%- set source_root = config.get('source_root', '') -%}
     {%- set source_pattern = config.get('source_pattern', '.*\\.ss$') -%}
@@ -44,57 +46,31 @@
     {%- set full_refresh_mode = (should_full_refresh()) -%}
 
     {%- if full_refresh_mode -%}
-        {# -- Full refresh: delete checkpoint, then discover all files -- #}
         {% do adapter.delete_checkpoint(delta_location) %}
+    {%- endif -%}
 
-        {%- set file_batch = adapter.discover_files(
-            source_root, source_pattern, max_files_per_trigger, delta_location, safety_buffer_seconds
-        ) -%}
+    {# -- Batching loop: discover → submit → checkpoint → repeat -- #}
+    {%- set ns = namespace(batch_num=0, total_files=0) -%}
+    {%- set file_batch = adapter.discover_files(
+        source_root, source_pattern, max_files_per_trigger, delta_location, safety_buffer_seconds
+    ) -%}
 
-        {%- if file_batch | length == 0 -%}
-            {{ log("SCOPE: No files found for full-refresh of " ~ identifier, info=True) }}
-            {%- call statement('main') -%}
-                -- no-op: no source files found for full refresh
-            {%- endcall -%}
-        {%- else -%}
-            {%- set scope_script = scope__build_file_based_script(
-                identifier,
-                delta_location,
-                partition_by,
-                scope_settings,
-                scope_columns,
-                feature_previews,
-                sql,
-                file_batch,
-                is_full_refresh=true
-            ) -%}
-
-            {{ log("SCOPE: Full refresh for " ~ identifier ~ " (" ~ file_batch | length ~ " files)", info=True) }}
-
-            {% do adapter.set_next_job_name(identifier ~ "_full-refresh") %}
-            {%- call statement('main') -%}
-                {{ scope_script }}
-            {%- endcall -%}
-
-            {# -- Update checkpoint after successful job -- #}
-            {% do adapter.update_checkpoint(delta_location, source_root, source_pattern, file_batch, source_compaction_interval, source_retention_files) %}
-        {%- endif -%}
-
+    {%- if file_batch | length == 0 -%}
+        {{ log("SCOPE: No " ~ ("" if full_refresh_mode else "unprocessed ") ~ "files for " ~ identifier ~ " — skipping", info=True) }}
+        {%- call statement('main') -%}
+            -- no-op: no source files found
+        {%- endcall -%}
     {%- else -%}
-        {# -- Incremental run: discover unprocessed files -- #}
-
-        {%- if strategy in ('microbatch', 'append') -%}
-
-            {%- set file_batch = adapter.discover_files(
-                source_root, source_pattern, max_files_per_trigger, delta_location, safety_buffer_seconds
-            ) -%}
-
+        {%- for _ in range(1000) -%}
             {%- if file_batch | length == 0 -%}
-                {{ log("SCOPE: No unprocessed files for " ~ identifier ~ " — skipping", info=True) }}
-                {%- call statement('main') -%}
-                    -- no-op: no unprocessed files found
-                {%- endcall -%}
+                {# Break out of loop — Jinja has no while, so we use for + break guard #}
             {%- else -%}
+                {%- set ns.batch_num = ns.batch_num + 1 -%}
+                {%- set ns.total_files = ns.total_files + file_batch | length -%}
+
+                {# Only DELETE on the first batch of a full refresh #}
+                {%- set is_first_full_refresh_batch = (full_refresh_mode and ns.batch_num == 1) -%}
+
                 {%- set scope_script = scope__build_file_based_script(
                     identifier,
                     delta_location,
@@ -104,42 +80,30 @@
                     feature_previews,
                     sql,
                     file_batch,
-                    is_incremental=true
+                    is_full_refresh=is_first_full_refresh_batch,
+                    is_incremental=(not is_first_full_refresh_batch)
                 ) -%}
 
-                {{ log("SCOPE: Incremental " ~ identifier ~ " (" ~ file_batch | length ~ " files)", info=True) }}
+                {%- set mode_label = "full-refresh" if full_refresh_mode else "incremental" -%}
+                {{ log("SCOPE: " ~ mode_label ~ " " ~ identifier ~ " batch " ~ ns.batch_num ~ " (" ~ file_batch | length ~ " files)", info=True) }}
 
-                {% do adapter.set_next_job_name(identifier ~ "_incremental_" ~ file_batch | length ~ "files") %}
+                {%- set job_suffix = mode_label ~ "_batch" ~ ns.batch_num ~ "_" ~ file_batch | length ~ "files" -%}
+                {% do adapter.set_next_job_name(identifier ~ "_" ~ job_suffix) %}
                 {%- call statement('main') -%}
                     {{ scope_script }}
                 {%- endcall -%}
 
-                {# -- Update checkpoint after successful job -- #}
                 {% do adapter.update_checkpoint(delta_location, source_root, source_pattern, file_batch, source_compaction_interval, source_retention_files) %}
-            {%- endif -%}
 
-        {%- else -%}
-            {{ exceptions.raise_compiler_error(
-                "Invalid incremental strategy '" ~ strategy ~ "' for dbt-scope. "
-                "Supported: microbatch, append"
-            ) }}
-        {%- endif -%}
+                {# -- Discover next batch (watermark advanced, so new files are eligible) -- #}
+                {%- set file_batch = adapter.discover_files(
+                    source_root, source_pattern, max_files_per_trigger, delta_location, safety_buffer_seconds
+                ) -%}
+            {%- endif -%}
+        {%- endfor -%}
+
+        {{ log("SCOPE: " ~ identifier ~ " complete — " ~ ns.batch_num ~ " batches, " ~ ns.total_files ~ " files total", info=True) }}
     {%- endif -%}
 
     {{ return({'relations': [target_relation]}) }}
 {% endmaterialization %}
-
-
-{# ============================================================
-   Strategy validation
-   ============================================================ #}
-{% macro scope__validate_get_incremental_strategy(raw_strategy) %}
-    {%- set valid = ['microbatch', 'append'] -%}
-    {%- if raw_strategy not in valid -%}
-        {{ exceptions.raise_compiler_error(
-            "Invalid incremental strategy '" ~ raw_strategy ~ "' for dbt-scope. "
-            "Valid strategies: " ~ valid | join(', ')
-        ) }}
-    {%- endif -%}
-    {{ return(raw_strategy) }}
-{% endmacro %}
