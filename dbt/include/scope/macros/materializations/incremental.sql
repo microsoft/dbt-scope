@@ -31,8 +31,8 @@
 
     {# -- Pull config values -- #}
     {%- set delta_location = config.get('delta_location', '') -%}
-    {%- set source_root = config.get('source_root', '') -%}
-    {%- set source_pattern = config.get('source_pattern', '.*\\.ss$') -%}
+    {%- set source_roots = config.get('source_roots', []) -%}
+    {%- set source_patterns = config.get('source_patterns', ['.*\\.ss$']) -%}
     {%- set max_files_per_trigger = config.get('max_files_per_trigger', 50) | int -%}
     {%- set safety_buffer_seconds = config.get('safety_buffer_seconds', 30) | int -%}
     {%- set source_compaction_interval = config.get('source_compaction_interval', 10) | int -%}
@@ -54,7 +54,7 @@
         batch_num=0,
         total_files=0,
         file_batch=adapter.discover_files(
-            source_root, source_pattern, max_files_per_trigger, delta_location, safety_buffer_seconds
+            source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds
         )
     ) -%}
 
@@ -96,11 +96,11 @@
                     {{ scope_script }}
                 {%- endcall -%}
 
-                {% do adapter.update_checkpoint(delta_location, source_root, source_pattern, ns.file_batch, source_compaction_interval, source_retention_files) %}
+                {% do adapter.update_checkpoint(delta_location, source_roots, source_patterns, ns.file_batch, source_compaction_interval, source_retention_files) %}
 
                 {# -- Discover next batch (watermark advanced, so new files are eligible) -- #}
                 {%- set ns.file_batch = adapter.discover_files(
-                    source_root, source_pattern, max_files_per_trigger, delta_location, safety_buffer_seconds
+                    source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds
                 ) -%}
             {%- endif -%}
         {%- endfor -%}
