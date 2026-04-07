@@ -9,7 +9,7 @@ import agate
 from dbt.adapters.base import BaseAdapter, available
 from dbt_common.exceptions import DbtRuntimeError
 
-from dbt.adapters.scope.adls_gen1_client import AdlsGen1Client
+from dbt.adapters.scope.adls_gen1_client import AdlsGen1Client, FileInfo
 from dbt.adapters.scope.checkpoint import CheckpointManager
 from dbt.adapters.scope.column import ScopeColumn
 from dbt.adapters.scope.connections import ScopeConnectionHandle, ScopeConnectionManager
@@ -183,35 +183,47 @@ class ScopeAdapter(BaseAdapter):
     @available
     def discover_files(
         self,
-        source_root: str,
-        source_pattern: str,
+        source_roots: list[str],
+        source_patterns: list[str],
         max_files_per_trigger: int,
         delta_location: str,
         safety_buffer_seconds: int = 30,
     ) -> list[str]:
         """Discover unprocessed source files and return a batch of file paths.
 
-        Orchestrates the file-based processing loop:
-          1. Read watermark from ``_checkpoint/watermark.json``
-          2. LIST files on ADLS Gen1 under *source_root*
-          3. Filter by regex *source_pattern* and watermark
-          4. Return up to *max_files_per_trigger* file paths
+        Orchestrates the file-based processing loop across the cross-product
+        of *source_roots* x *source_patterns*:
+          1. For each (root, pattern): read watermark, LIST + filter files
+          2. Union results and deduplicate by file path
+          3. Return up to *max_files_per_trigger* file paths
         """
         tracker = self._get_file_tracker()
         watermark = self._get_checkpoint_manager().read_watermark(delta_location)
 
-        all_unprocessed = tracker.discover_unprocessed_files(
-            root=source_root,
-            pattern=source_pattern,
-            watermark=watermark,
-            safety_buffer_seconds=safety_buffer_seconds,
-        )
+        seen_paths: set[str] = set()
+        all_unprocessed: list[FileInfo] = []
+
+        for root in source_roots:
+            for pattern in source_patterns:
+                unprocessed = tracker.discover_unprocessed_files(
+                    root=root,
+                    pattern=pattern,
+                    watermark=watermark,
+                    safety_buffer_seconds=safety_buffer_seconds,
+                )
+                for f in unprocessed:
+                    if f.path not in seen_paths:
+                        seen_paths.add(f.path)
+                        all_unprocessed.append(f)
+
+        # Sort by modification_time to maintain deterministic ordering
+        all_unprocessed.sort(key=lambda f: f.modification_time)
         batch = FileTracker.get_next_batch(all_unprocessed, max_files_per_trigger)
 
         log.info(
-            "discover_files: root=%s, pattern=%s, unprocessed=%d, batch=%d",
-            source_root,
-            source_pattern,
+            "discover_files: roots=%s, patterns=%s, unprocessed=%d, batch=%d",
+            source_roots,
+            source_patterns,
             len(all_unprocessed),
             len(batch),
         )
@@ -221,16 +233,19 @@ class ScopeAdapter(BaseAdapter):
     def update_checkpoint(
         self,
         delta_location: str,
-        source_root: str,
-        source_pattern: str,
+        source_roots: list[str],
+        source_patterns: list[str],
         file_paths: list[str],
         source_compaction_interval: int = 10,
         source_retention_files: int = 100,
     ) -> None:
         """Update the watermark checkpoint after a successful SCOPE job.
 
-        Also writes per-batch JSONL to ``_checkpoint/sources/{batch_id}``,
-        triggers compaction at interval boundaries, and enforces retention.
+        Iterates the cross-product of *source_roots* x *source_patterns* to
+        reconstruct ``FileInfo`` objects for the processed files, then writes
+        the checkpoint.  Also writes per-batch JSONL to
+        ``_checkpoint/sources/{batch_id}``, triggers compaction at interval
+        boundaries, and enforces retention.
         """
         gen1 = self._get_gen1_client()
         checkpoint = self._get_checkpoint_manager()
@@ -238,9 +253,18 @@ class ScopeAdapter(BaseAdapter):
         # Get current watermark
         current = checkpoint.read_watermark(delta_location)
 
-        # Reconstruct FileInfo objects for the processed files
-        all_files = gen1.list_files(source_root, pattern=source_pattern)
-        processed = [f for f in all_files if f.path in set(file_paths)]
+        # Reconstruct FileInfo objects across all rootxpattern combos
+        target_paths = set(file_paths)
+        seen_paths: set[str] = set()
+        processed: list[FileInfo] = []
+
+        for root in source_roots:
+            for pattern in source_patterns:
+                all_files = gen1.list_files(root, pattern=pattern)
+                for f in all_files:
+                    if f.path in target_paths and f.path not in seen_paths:
+                        seen_paths.add(f.path)
+                        processed.append(f)
 
         if not processed:
             log.warning("update_checkpoint: no matching files found for paths")
@@ -274,15 +298,15 @@ class ScopeAdapter(BaseAdapter):
     @available
     def has_unprocessed_files(
         self,
-        source_root: str,
-        source_pattern: str,
+        source_roots: list[str],
+        source_patterns: list[str],
         delta_location: str,
         safety_buffer_seconds: int = 30,
     ) -> bool:
         """Are there unprocessed files at the source?"""
         files = self.discover_files(
-            source_root=source_root,
-            source_pattern=source_pattern,
+            source_roots=source_roots,
+            source_patterns=source_patterns,
             max_files_per_trigger=1,
             delta_location=delta_location,
             safety_buffer_seconds=safety_buffer_seconds,
@@ -336,8 +360,8 @@ class ScopeAdapter(BaseAdapter):
             delta_base_path=creds.delta_base_path,
             table_name=table_name,
             partition_by=model_config.get("partition_by"),
-            source_root=model_config.get("source_root", ""),
-            source_pattern=model_config.get("source_pattern", ""),
+            source_roots=model_config.get("source_roots", []),
+            source_patterns=model_config.get("source_patterns", []),
             max_files_per_trigger=model_config.get("max_files_per_trigger", 50),
             safety_buffer_seconds=model_config.get("safety_buffer_seconds", 30),
             adls_gen1_account=model_config.get("adls_gen1_account", creds.adls_gen1_account),

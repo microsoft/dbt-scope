@@ -220,6 +220,22 @@ class TestScriptConfig:
         cfg = ScriptConfig()
         assert cfg.source_files == []
 
+    def test_source_roots_default_empty(self):
+        cfg = ScriptConfig()
+        assert cfg.source_roots == []
+
+    def test_source_patterns_default_empty(self):
+        cfg = ScriptConfig()
+        assert cfg.source_patterns == []
+
+    def test_source_roots_as_list(self):
+        cfg = ScriptConfig(source_roots=["/root1", "/root2"])
+        assert cfg.source_roots == ["/root1", "/root2"]
+
+    def test_source_patterns_as_list(self):
+        cfg = ScriptConfig(source_patterns=[r".*\.ss$", r".*\.csv$"])
+        assert cfg.source_patterns == [r".*\.ss$", r".*\.csv$"]
+
     def test_max_files_per_trigger_default(self):
         cfg = ScriptConfig()
         assert cfg.max_files_per_trigger == 50

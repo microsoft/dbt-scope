@@ -37,7 +37,7 @@ As a result of this conscious design decision, the adapter **does not** encourag
 
 ## How it works
 
-SS files live on ADLS Gen1. The adapter lists files under `source_root`, filters by regex and watermark, and processes them in batches of up to `max_files_per_trigger`. Each batch becomes a single SCOPE job with an explicit file list in the `EXTRACT FROM` clause. After a successful job, the watermark advances, a sources record is written to `_checkpoint/`, and the next batch is discovered — repeating until all files are processed.
+SS files live on ADLS Gen1. The adapter lists files under each `source_roots` entry, filters by each regex in `source_patterns` (cross-product), deduplicates by path, and processes them in batches of up to `max_files_per_trigger`. Each batch becomes a single SCOPE job with an explicit file list in the `EXTRACT FROM` clause. After a successful job, the watermark advances, a sources record is written to `_checkpoint/`, and the next batch is discovered — repeating until all files are processed.
 
 ### How dbt picks which files to process
 
@@ -176,8 +176,8 @@ my_project:
 {{ config(
     materialized='table',
     delta_location='abfss://ctr@acct.dfs.core.windows.net/delta/my_table',
-    source_root='/my/cosmos/path/to/MyStream',
-    source_pattern='.*\\.ss$',
+    source_roots=['/my/cosmos/path/to/MyStream'],
+    source_patterns=['.*\\.ss$'],
     max_files_per_trigger=100,
     partition_by='event_year_date',
     scope_columns=[
@@ -205,8 +205,8 @@ FROM @data
     incremental_strategy='append',
     partition_by='event_year_date',
     delta_location='abfss://ctr@acct.dfs.core.windows.net/delta/my_model',
-    source_root='/my/cosmos/path/to/MyStream',
-    source_pattern='.*\\.ss$',
+    source_roots=['/my/cosmos/path/to/MyStream'],
+    source_patterns=['.*\\.ss$'],
     max_files_per_trigger=50,
     source_compaction_interval=10,
     source_retention_files=100,
@@ -239,8 +239,8 @@ Models can include `WHERE` clauses — the adapter passes through your SQL as-is
     incremental_strategy='append',
     partition_by=['event_year_date', 'edition'],
     delta_location='abfss://ctr@acct.dfs.core.windows.net/delta/my_filtered_model',
-    source_root='/my/cosmos/path/to/MyStream',
-    source_pattern='.*\\.ss$',
+    source_roots=['/my/cosmos/path/to/MyStream'],
+    source_patterns=['.*\\.ss$'],
     max_files_per_trigger=50,
     scope_columns=[
         {'name': 'server_name', 'type': 'string'},
@@ -260,8 +260,8 @@ WHERE edition == "Standard"
 
 | Config                       | Default   | Description                                                                         |
 | ---------------------------- | --------- | ----------------------------------------------------------------------------------- |
-| `source_root`                | —         | ADLS Gen1 root path to list source files from                                       |
-| `source_pattern`             | `.*\.ss$` | Regex to filter files under `source_root`                                           |
+| `source_roots`               | `[]`      | List of ADLS Gen1 root paths to list source files from                              |
+| `source_patterns`            | `[]`      | List of regexes; the adapter discovers files for each root × pattern combo          |
 | `max_files_per_trigger`      | `50`      | Max files per SCOPE job. Larger = fewer jobs; smaller = faster feedback             |
 | `safety_buffer_seconds`      | `30`      | Skip files modified within the last N seconds (avoids partial writes)               |
 | `source_compaction_interval` | `10`      | Every N batches, write a parquet snapshot of all source history                     |

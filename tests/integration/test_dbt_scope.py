@@ -33,8 +33,8 @@ def _dbt_vars(scenario: ScenarioConfig) -> dict:
     return {
         "delta_location": scenario.delta_location,
         "delta_location_filtered": f"{scenario.delta_location}_filtered",
-        "source_root": scenario.historical.ss_base_path,
-        "source_pattern": r".*\.ss$",
+        "source_roots": [scenario.historical.ss_base_path],
+        "source_patterns": [r".*\.ss$"],
         "max_files_per_trigger": 500,
     }
 

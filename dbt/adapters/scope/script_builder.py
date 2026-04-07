@@ -48,9 +48,9 @@ class ScriptConfig:
     # Partitioning — single column name or list of column names
     partition_by: str | list[str] | None = None
 
-    # File-based source configuration
-    source_root: str = ""
-    source_pattern: str = ""
+    # File-based source configuration (cross-product of roots x patterns)
+    source_roots: list[str] = field(default_factory=list)
+    source_patterns: list[str] = field(default_factory=list)
     max_files_per_trigger: int = 50
     safety_buffer_seconds: int = 30
     adls_gen1_account: str = ""
