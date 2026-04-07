@@ -50,23 +50,26 @@
     {%- endif -%}
 
     {# -- Batching loop: discover → submit → checkpoint → repeat -- #}
-    {%- set ns = namespace(batch_num=0, total_files=0) -%}
-    {%- set file_batch = adapter.discover_files(
-        source_root, source_pattern, max_files_per_trigger, delta_location, safety_buffer_seconds
+    {%- set ns = namespace(
+        batch_num=0,
+        total_files=0,
+        file_batch=adapter.discover_files(
+            source_root, source_pattern, max_files_per_trigger, delta_location, safety_buffer_seconds
+        )
     ) -%}
 
-    {%- if file_batch | length == 0 -%}
+    {%- if ns.file_batch | length == 0 -%}
         {{ log("SCOPE: No " ~ ("" if full_refresh_mode else "unprocessed ") ~ "files for " ~ identifier ~ " — skipping", info=True) }}
         {%- call statement('main') -%}
             -- no-op: no source files found
         {%- endcall -%}
     {%- else -%}
         {%- for _ in range(1000) -%}
-            {%- if file_batch | length == 0 -%}
+            {%- if ns.file_batch | length == 0 -%}
                 {# Break out of loop — Jinja has no while, so we use for + break guard #}
             {%- else -%}
                 {%- set ns.batch_num = ns.batch_num + 1 -%}
-                {%- set ns.total_files = ns.total_files + file_batch | length -%}
+                {%- set ns.total_files = ns.total_files + ns.file_batch | length -%}
 
                 {# Only DELETE on the first batch of a full refresh #}
                 {%- set is_first_full_refresh_batch = (full_refresh_mode and ns.batch_num == 1) -%}
@@ -79,24 +82,24 @@
                     scope_columns,
                     feature_previews,
                     sql,
-                    file_batch,
+                    ns.file_batch,
                     is_full_refresh=is_first_full_refresh_batch,
                     is_incremental=(not is_first_full_refresh_batch)
                 ) -%}
 
                 {%- set mode_label = "full-refresh" if full_refresh_mode else "incremental" -%}
-                {{ log("SCOPE: " ~ mode_label ~ " " ~ identifier ~ " batch " ~ ns.batch_num ~ " (" ~ file_batch | length ~ " files)", info=True) }}
+                {{ log("SCOPE: " ~ mode_label ~ " " ~ identifier ~ " batch " ~ ns.batch_num ~ " (" ~ ns.file_batch | length ~ " files)", info=True) }}
 
-                {%- set job_suffix = mode_label ~ "_batch" ~ ns.batch_num ~ "_" ~ file_batch | length ~ "files" -%}
+                {%- set job_suffix = mode_label ~ "_batch" ~ ns.batch_num ~ "_" ~ ns.file_batch | length ~ "files" -%}
                 {% do adapter.set_next_job_name(identifier ~ "_" ~ job_suffix) %}
                 {%- call statement('main') -%}
                     {{ scope_script }}
                 {%- endcall -%}
 
-                {% do adapter.update_checkpoint(delta_location, source_root, source_pattern, file_batch, source_compaction_interval, source_retention_files) %}
+                {% do adapter.update_checkpoint(delta_location, source_root, source_pattern, ns.file_batch, source_compaction_interval, source_retention_files) %}
 
                 {# -- Discover next batch (watermark advanced, so new files are eligible) -- #}
-                {%- set file_batch = adapter.discover_files(
+                {%- set ns.file_batch = adapter.discover_files(
                     source_root, source_pattern, max_files_per_trigger, delta_location, safety_buffer_seconds
                 ) -%}
             {%- endif -%}

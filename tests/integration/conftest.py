@@ -1,7 +1,7 @@
 """Integration test fixtures.
 
 Two-phase datagen simulates a production lifecycle:
-  Phase 1: Historical data (31 days) -> full refresh
+  Phase 1: Historical data (5 days) -> full refresh
   Phase 2: New data arrives (2 more days) -> incremental picks it up
 
 All names are descriptive so you can trace SS streams and Delta tables
@@ -15,6 +15,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from datetime import date, timedelta
 from pathlib import Path
 
 import duckdb
@@ -67,7 +68,7 @@ class ScenarioConfig:
     delta_location: str  # Where the Delta table lands
 
 
-def _build_scenario(label: str, historical_days: int = 31, new_days: int = 2) -> ScenarioConfig:
+def _build_scenario(label: str, historical_days: int = 5, new_days: int = 2) -> ScenarioConfig:
     """Build a test scenario with datagen datasets."""
     ss_root = _env("SCOPE_SS_TEST_ROOT")
     stream = f"{label}_{_PREFIX}"
@@ -79,10 +80,12 @@ def _build_scenario(label: str, historical_days: int = 31, new_days: int = 2) ->
         days=historical_days,
         files_per_day=2,
     )
+    # new_data starts right after the historical window
+    new_start = (date.fromisoformat("2026-02-01") + timedelta(days=historical_days)).isoformat()
     new_data = make_default_dataset(
         ss_root=ss_root,
         stream_name=stream,  # same stream -- new files appear in later dates
-        start_date="2026-03-04",  # starts after historical
+        start_date=new_start,
         days=new_days,
         files_per_day=2,
     )

@@ -2,7 +2,9 @@
    table.sql — Full-refresh materialization for SCOPE Delta tables
 
    File-based processing: Discovers all source files, processes
-   them in batches of maxFilesPerTrigger, and writes to Delta.
+   them in batches of max_files_per_trigger, and writes to Delta.
+   The first batch DELETEs existing data; subsequent batches INSERT
+   only (same batching loop as incremental.sql).
    ============================================================ #}
 
 {% materialization table, adapter='scope' %}
@@ -28,39 +30,59 @@
     {# -- Delete checkpoint for full refresh -- #}
     {% do adapter.delete_checkpoint(delta_location) %}
 
-    {# -- Discover ALL files (no watermark filter) -- #}
-    {%- set file_batch = adapter.discover_files(
-        source_root, source_pattern, max_files_per_trigger, delta_location, safety_buffer_seconds
+    {# -- Batching loop: discover → submit → checkpoint → repeat -- #}
+    {# NOTE: file_batch MUST live in the namespace — see incremental.sql for details. #}
+    {%- set ns = namespace(
+        batch_num=0,
+        total_files=0,
+        file_batch=adapter.discover_files(
+            source_root, source_pattern, max_files_per_trigger, delta_location, safety_buffer_seconds
+        )
     ) -%}
 
-    {%- if file_batch | length == 0 -%}
+    {%- if ns.file_batch | length == 0 -%}
         {{ log("SCOPE: No files found for full-refresh of " ~ identifier, info=True) }}
         {%- call statement('main') -%}
             -- no-op: no source files found
         {%- endcall -%}
     {%- else -%}
-        {# -- Build and submit the SCOPE script -- #}
-        {%- set scope_script = scope__build_file_based_script(
-            identifier,
-            delta_location,
-            partition_by,
-            scope_settings,
-            scope_columns,
-            feature_previews,
-            sql,
-            file_batch,
-            is_full_refresh=true
-        ) -%}
+        {%- for _ in range(1000) -%}
+            {%- if ns.file_batch | length == 0 -%}
+                {# Break out of loop #}
+            {%- else -%}
+                {%- set ns.batch_num = ns.batch_num + 1 -%}
+                {%- set ns.total_files = ns.total_files + ns.file_batch | length -%}
 
-        {{ log("SCOPE: Full refresh for " ~ identifier ~ " (" ~ file_batch | length ~ " files)", info=True) }}
+                {%- set scope_script = scope__build_file_based_script(
+                    identifier,
+                    delta_location,
+                    partition_by,
+                    scope_settings,
+                    scope_columns,
+                    feature_previews,
+                    sql,
+                    ns.file_batch,
+                    is_full_refresh=(ns.batch_num == 1)
+                ) -%}
 
-        {% do adapter.set_next_job_name(identifier ~ "_full-refresh") %}
-        {%- call statement('main') -%}
-            {{ scope_script }}
-        {%- endcall -%}
+                {{ log("SCOPE: full-refresh " ~ identifier ~ " batch " ~ ns.batch_num ~ " (" ~ ns.file_batch | length ~ " files)", info=True) }}
 
-        {# -- Update checkpoint after successful job -- #}
-        {% do adapter.update_checkpoint(delta_location, source_root, source_pattern, file_batch, source_compaction_interval, source_retention_files) %}
+                {%- set job_suffix = "full-refresh_batch" ~ ns.batch_num ~ "_" ~ ns.file_batch | length ~ "files" -%}
+                {% do adapter.set_next_job_name(identifier ~ "_" ~ job_suffix) %}
+                {%- call statement('main') -%}
+                    {{ scope_script }}
+                {%- endcall -%}
+
+                {% do adapter.update_checkpoint(delta_location, source_root, source_pattern, ns.file_batch, source_compaction_interval, source_retention_files) %}
+
+                {# -- Discover next batch (watermark advanced) -- #}
+                {%- set ns.file_batch = adapter.discover_files(
+                    source_root, source_pattern, max_files_per_trigger, delta_location, safety_buffer_seconds
+                ) -%}
+            {%- endif -%}
+        {%- endfor -%}
+
+        {{ log("SCOPE: " ~ identifier ~ " full-refresh complete — " ~ ns.batch_num ~ " batches, " ~ ns.total_files ~ " files total", info=True) }}
     {%- endif -%}
 
     {{ return({'relations': [target_relation]}) }}
