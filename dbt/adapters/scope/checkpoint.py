@@ -115,7 +115,7 @@ class CheckpointManager:
             )
             return watermark
         except Exception:
-            log.info("read_watermark: no checkpoint found for %s", delta_location, exc_info=True)
+            log.debug("No checkpoint found for %s (first run or full refresh)", delta_location)
             return None
 
     def write_watermark(self, delta_location: str, watermark: Watermark) -> None:
@@ -164,11 +164,7 @@ class CheckpointManager:
             file_client.delete_file()
             log.info("Deleted watermark for %s", delta_location)
         except Exception:
-            log.info(
-                "delete_watermark: no checkpoint to delete for %s",
-                delta_location,
-                exc_info=True,
-            )
+            log.debug("No watermark to delete for %s (already clean)", delta_location)
 
         # Also delete all sources
         self.delete_all_sources(delta_location)
@@ -472,9 +468,7 @@ class CheckpointManager:
                     pass
             log.info("delete_all_sources: deleted %d files for %s", deleted, delta_location)
         except Exception:
-            log.info(
-                "delete_all_sources: no sources to delete for %s", delta_location, exc_info=True
-            )
+            log.debug("No sources to delete for %s (already clean)", delta_location)
 
     def list_source_files(self, delta_location: str) -> list[str]:
         """List all file names in ``_checkpoint/sources/`` (for testing)."""
