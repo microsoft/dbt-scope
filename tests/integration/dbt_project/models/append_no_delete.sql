@@ -17,7 +17,7 @@
             'microsoft.scope.compression': 'vorder:zstd#11',
             'delta.checkpointInterval': 5
         },
-        scope_columns=[
+        delta_table_columns=[
             {'name': 'logical_server_name', 'type': 'string'},
             {'name': 'logical_database_name', 'type': 'string'},
             {'name': 'edition', 'type': 'string'},
@@ -28,7 +28,19 @@
             {'name': 'source_file_length', 'type': 'long'},
             {'name': 'source_file_created', 'type': 'DateTime'},
             {'name': 'source_file_modified', 'type': 'DateTime'},
-            {'name': 'event_year_date', 'type': 'string', 'extract': false}
+            {'name': 'event_year_date', 'type': 'string'}
+        ],
+        extract_columns=[
+            {'name': 'logical_server_name', 'type': 'string'},
+            {'name': 'logical_database_name', 'type': 'string'},
+            {'name': 'edition', 'type': 'string'},
+            {'name': 'state', 'type': 'string'},
+            {'name': 'region_name', 'type': 'string'},
+            {'name': 'max_size_bytes', 'type': 'long'},
+            {'name': 'source_file_uri', 'type': 'string'},
+            {'name': 'source_file_length', 'type': 'long'},
+            {'name': 'source_file_created', 'type': 'DateTime'},
+            {'name': 'source_file_modified', 'type': 'DateTime'}
         ]
     )
 }}

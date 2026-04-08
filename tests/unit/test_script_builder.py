@@ -49,7 +49,7 @@ class TestScriptBuilderFullRefresh:
         assert "20260401_020000_0.ss" in script
 
     def test_extractable_columns_in_extract(self, sample_config):
-        """Only columns with extract=True should appear in EXTRACT."""
+        """extract_columns should appear in EXTRACT, not delta_columns."""
         script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
         lines = script.split("\n")
         extract_section = False
@@ -60,14 +60,14 @@ class TestScriptBuilderFullRefresh:
             if "USING Extractors" in line:
                 extract_section = False
             if extract_section:
-                for col in sample_config.columns:
+                for col in sample_config.extract_columns:
                     if col.name in line and ":" in line:
                         found_cols.add(col.name)
-        expected = {c.name for c in sample_config.columns if c.extract}
+        expected = {c.name for c in sample_config.extract_columns}
         assert found_cols == expected, (
             f"EXTRACT columns mismatch: got {found_cols}, expected {expected}"
         )
-        # event_year_date should NOT be in EXTRACT (extract=False)
+        # event_year_date should NOT be in EXTRACT (only in delta_columns)
         assert "event_year_date" not in found_cols
 
     def test_no_virtual_columns_in_extract(self, sample_config):
@@ -164,7 +164,7 @@ class TestScriptBuilderMultiPartition:
         assert "PARTITIONED BY (event_year_date, edition)" in script
 
     def test_extractable_columns_in_extract(self, multi_partition_config):
-        """Only columns with extract=True should be in EXTRACT."""
+        """extract_columns should be in EXTRACT."""
         script = ScriptBuilder.build_full_refresh(multi_partition_config, "SELECT * FROM @data")
         lines = script.split("\n")
         extract_section = False
@@ -175,10 +175,10 @@ class TestScriptBuilderMultiPartition:
             if "USING Extractors" in line:
                 extract_section = False
             if extract_section:
-                for col in multi_partition_config.columns:
+                for col in multi_partition_config.extract_columns:
                     if col.name in line and ":" in line:
                         found.add(col.name)
-        expected = {c.name for c in multi_partition_config.columns if c.extract}
+        expected = {c.name for c in multi_partition_config.extract_columns}
         assert found == expected
 
     def test_multi_partition_incremental(self, multi_partition_config):
@@ -278,14 +278,6 @@ class TestColumnDef:
         col = ColumnDef(name="my_col", scope_type="string")
         assert col.render() == "    my_col string"
 
-    def test_extract_default_true(self):
-        col = ColumnDef(name="my_col", scope_type="string")
-        assert col.extract is True
-
-    def test_extract_false(self):
-        col = ColumnDef(name="event_year_date", scope_type="string", extract=False)
-        assert col.extract is False
-
 
 class TestVirtualColumns:
     """Tests for FILE.* virtual column support in EXTRACT."""
@@ -295,7 +287,11 @@ class TestVirtualColumns:
             delta_location="abfss://c@a.dfs.core.windows.net/d/t",
             table_name="t",
             source_files=["/shares/test/a.ss"],
-            columns=[
+            delta_columns=[
+                ColumnDef(name="col_a", scope_type="string"),
+                ColumnDef(name="source_file_uri", scope_type="string"),
+            ],
+            extract_columns=[
                 ColumnDef(name="col_a", scope_type="string"),
                 ColumnDef(name="source_file_uri", scope_type="string"),
             ],
@@ -309,7 +305,14 @@ class TestVirtualColumns:
             delta_location="abfss://c@a.dfs.core.windows.net/d/t",
             table_name="t",
             source_files=["/shares/test/a.ss"],
-            columns=[
+            delta_columns=[
+                ColumnDef(name="col_a", scope_type="string"),
+                ColumnDef(name="source_file_uri", scope_type="string"),
+                ColumnDef(name="source_file_length", scope_type="long"),
+                ColumnDef(name="source_file_created", scope_type="DateTime"),
+                ColumnDef(name="source_file_modified", scope_type="DateTime"),
+            ],
+            extract_columns=[
                 ColumnDef(name="col_a", scope_type="string"),
                 ColumnDef(name="source_file_uri", scope_type="string"),
                 ColumnDef(name="source_file_length", scope_type="long"),
@@ -332,7 +335,10 @@ class TestVirtualColumns:
             delta_location="abfss://c@a.dfs.core.windows.net/d/t",
             table_name="t",
             source_files=["/shares/test/a.ss"],
-            columns=[
+            delta_columns=[
+                ColumnDef(name="source_file_uri", scope_type="string"),
+            ],
+            extract_columns=[
                 ColumnDef(name="source_file_uri", scope_type="string"),
             ],
         )
@@ -346,10 +352,174 @@ class TestVirtualColumns:
             delta_location="abfss://c@a.dfs.core.windows.net/d/t",
             table_name="t",
             source_files=["/shares/test/a.ss"],
-            columns=[
+            delta_columns=[
+                ColumnDef(name="my_custom_col", scope_type="string"),
+            ],
+            extract_columns=[
                 ColumnDef(name="my_custom_col", scope_type="string"),
             ],
         )
         script = ScriptBuilder.build_incremental(config, "SELECT * FROM @data")
         assert "my_custom_col : string" in script
         assert "FILE." not in script
+
+
+class TestExtractColumnsSeparation:
+    """Tests for separate extract_columns vs delta_columns support."""
+
+    def test_extract_columns_used_in_extract(self):
+        """When extract_columns is provided, EXTRACT uses those — not delta_columns."""
+        config = ScriptConfig(
+            delta_location="abfss://c@a.dfs.core.windows.net/d/t",
+            table_name="t",
+            source_files=["/shares/test/a.ss"],
+            delta_columns=[
+                ColumnDef(name="cluster_region_zone", scope_type="string"),
+                ColumnDef(name="azure_resource_id", scope_type="string"),
+            ],
+            extract_columns=[
+                ColumnDef(name="ClusterName_DT_String", scope_type="string"),
+                ColumnDef(name="SubscriptionId_DT_String", scope_type="string"),
+            ],
+        )
+        script = ScriptBuilder.build_incremental(config, "SELECT * FROM @data")
+        # EXTRACT should have source column names
+        assert "ClusterName_DT_String : string" in script
+        assert "SubscriptionId_DT_String : string" in script
+        # EXTRACT should NOT have Delta column names
+        extract_start = script.index("EXTRACT")
+        extract_end = script.index("USING Extractors")
+        extract_section = script[extract_start:extract_end]
+        assert "cluster_region_zone" not in extract_section
+        assert "azure_resource_id" not in extract_section
+
+    def test_delta_columns_used_in_create_table(self):
+        """CREATE TABLE always uses delta_columns, not extract_columns."""
+        config = ScriptConfig(
+            delta_location="abfss://c@a.dfs.core.windows.net/d/t",
+            table_name="t",
+            source_files=["/shares/test/a.ss"],
+            delta_columns=[
+                ColumnDef(name="cluster_region_zone", scope_type="string"),
+                ColumnDef(name="azure_resource_id", scope_type="string"),
+            ],
+            extract_columns=[
+                ColumnDef(name="ClusterName_DT_String", scope_type="string"),
+                ColumnDef(name="SubscriptionId_DT_String", scope_type="string"),
+            ],
+        )
+        script = ScriptBuilder.build_full_refresh(config, "SELECT * FROM @data")
+        create_start = script.index("CREATE TABLE IF NOT EXISTS")
+        create_end = script.index("LOCATION")
+        create_section = script[create_start:create_end]
+        assert "cluster_region_zone string" in create_section
+        assert "azure_resource_id string" in create_section
+        # Source column names should NOT be in CREATE TABLE
+        assert "ClusterName_DT_String" not in create_section
+        assert "SubscriptionId_DT_String" not in create_section
+
+    def test_virtual_columns_in_extract_columns(self):
+        """Virtual columns in extract_columns use FILE.* syntax."""
+        config = ScriptConfig(
+            delta_location="abfss://c@a.dfs.core.windows.net/d/t",
+            table_name="t",
+            source_files=["/shares/test/a.ss"],
+            delta_columns=[
+                ColumnDef(name="cluster_region_zone", scope_type="string"),
+                ColumnDef(name="source_file_uri", scope_type="string"),
+            ],
+            extract_columns=[
+                ColumnDef(name="ClusterName_DT_String", scope_type="string"),
+                ColumnDef(name="source_file_uri", scope_type="string"),
+            ],
+        )
+        script = ScriptBuilder.build_incremental(config, "SELECT * FROM @data")
+        assert "source_file_uri = FILE.URI()" in script
+        assert "ClusterName_DT_String : string" in script
+
+    def test_real_world_scenario(self):
+        """End-to-end test matching the bug report — different source vs delta columns."""
+        delta_cols = [
+            ColumnDef(name="cluster_region_zone", scope_type="string"),
+            ColumnDef(name="azure_resource_id", scope_type="string"),
+            ColumnDef(name="original_event_timestamp", scope_type="DateTime"),
+            ColumnDef(name="query_count", scope_type="long"),
+            ColumnDef(name="source_file_uri", scope_type="string"),
+            ColumnDef(name="source_file_length", scope_type="long"),
+            ColumnDef(name="source_file_created", scope_type="DateTime"),
+            ColumnDef(name="source_file_modified", scope_type="DateTime"),
+            ColumnDef(name="event_year_date", scope_type="string"),
+        ]
+        extract_cols = [
+            ColumnDef(name="ClusterName_DT_String", scope_type="string"),
+            ColumnDef(name="SubscriptionId_DT_String", scope_type="string"),
+            ColumnDef(name="ResourceGroup_DT_String", scope_type="string"),
+            ColumnDef(name="LogicalServerName_DT_String", scope_type="string"),
+            ColumnDef(name="logical_database_name_DT_String", scope_type="string"),
+            ColumnDef(name="originalEventTimestamp_DT_DateTime", scope_type="DateTime"),
+            ColumnDef(name="query_count_DT_Int64", scope_type="long"),
+            ColumnDef(name="eventName_DT_String", scope_type="string"),
+            ColumnDef(name="source_file_uri", scope_type="string"),
+            ColumnDef(name="source_file_length", scope_type="long"),
+            ColumnDef(name="source_file_created", scope_type="DateTime"),
+            ColumnDef(name="source_file_modified", scope_type="DateTime"),
+        ]
+        config = ScriptConfig(
+            delta_location="abfss://ctr@acct.dfs.core.windows.net/delta/mon_query_store",
+            table_name="mon_query_store",
+            partition_by=["event_year_date", "cluster_region_zone"],
+            source_files=["/shares/test/a.ss", "/shares/test/b.ss"],
+            delta_columns=delta_cols,
+            extract_columns=extract_cols,
+        )
+        model_sql = (
+            "SELECT\n"
+            '    DateTime.UtcNow.ToString("yyyyMMdd") AS event_year_date,\n'
+            "    ClusterName_DT_String.Split('.')[1] AS cluster_region_zone\n"
+            "FROM @data"
+        )
+        script = ScriptBuilder.build_incremental(config, model_sql)
+
+        # CREATE TABLE has Delta column names
+        create_section = script.split("CREATE TABLE IF NOT EXISTS")[1].split("LOCATION")[0]
+        assert "cluster_region_zone string" in create_section
+        assert "azure_resource_id string" in create_section
+        assert "event_year_date string" in create_section
+
+        # EXTRACT has source column names
+        extract_start = script.index("EXTRACT")
+        extract_end = script.index("USING Extractors")
+        extract_section = script[extract_start:extract_end]
+        assert "ClusterName_DT_String : string" in extract_section
+        assert "SubscriptionId_DT_String : string" in extract_section
+        assert "eventName_DT_String : string" in extract_section
+        assert "source_file_uri = FILE.URI()" in extract_section
+
+        # EXTRACT should NOT contain Delta-only names
+        assert "cluster_region_zone" not in extract_section
+        assert "azure_resource_id" not in extract_section
+        assert "event_year_date" not in extract_section
+
+    def test_extract_columns_with_full_refresh(self):
+        """extract_columns works with full-refresh too."""
+        config = ScriptConfig(
+            delta_location="abfss://c@a.dfs.core.windows.net/d/t",
+            table_name="t",
+            source_files=["/shares/test/a.ss"],
+            delta_columns=[
+                ColumnDef(name="server_name", scope_type="string"),
+            ],
+            extract_columns=[
+                ColumnDef(name="LogicalServerName_DT_String", scope_type="string"),
+            ],
+        )
+        script = ScriptBuilder.build_full_refresh(config, "SELECT * FROM @data")
+        # CREATE TABLE uses delta name
+        create_section = script.split("CREATE TABLE IF NOT EXISTS")[1].split("LOCATION")[0]
+        assert "server_name string" in create_section
+        # EXTRACT uses source name
+        extract_start = script.index("EXTRACT")
+        extract_end = script.index("USING Extractors")
+        extract_section = script[extract_start:extract_end]
+        assert "LogicalServerName_DT_String : string" in extract_section
+        assert "server_name" not in extract_section

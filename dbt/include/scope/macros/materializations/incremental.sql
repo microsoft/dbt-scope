@@ -40,7 +40,8 @@
     {%- set starting_timestamp = config.get('starting_timestamp', none) -%}
     {%- set partition_by = config.get('partition_by', none) -%}
     {%- set scope_settings = config.get('scope_settings', {}) -%}
-    {%- set scope_columns = config.get('scope_columns', []) -%}
+    {%- set delta_table_columns = config.get('delta_table_columns', []) -%}
+    {%- set extract_columns = config.get('extract_columns', []) -%}
     {%- set feature_previews = config.get('scope_feature_previews', 'EnableDeltaTableDynamicInsert:on') -%}
 
     {# -- Determine if this is a full refresh -- #}
@@ -80,7 +81,8 @@
                     delta_location,
                     partition_by,
                     scope_settings,
-                    scope_columns,
+                    delta_table_columns,
+                    extract_columns,
                     feature_previews,
                     sql,
                     ns.file_batch,

@@ -523,15 +523,24 @@ class ScopeAdapter(BaseAdapter):
         """Build a ``ScriptConfig`` from dbt model config + credentials."""
         creds = self._credentials()
 
-        # Parse column definitions from sources.yml metadata
-        raw_columns = model_config.get("columns", [])
-        columns = [
+        # Parse Delta table column definitions
+        raw_delta_cols = model_config.get("delta_table_columns", [])
+        delta_columns = [
             ColumnDef(
                 name=c["name"],
                 scope_type=c.get("type", "string"),
-                extract=c.get("extract", True),
             )
-            for c in raw_columns
+            for c in raw_delta_cols
+        ]
+
+        # Parse extract column definitions (optional — empty means derive from delta_columns)
+        raw_extract_cols = model_config.get("extract_columns", [])
+        extract_columns = [
+            ColumnDef(
+                name=c["name"],
+                scope_type=c.get("type", "string"),
+            )
+            for c in raw_extract_cols
         ]
 
         return ScriptConfig(
@@ -550,7 +559,8 @@ class ScopeAdapter(BaseAdapter):
             feature_previews=creds.scope_feature_previews or "EnableDeltaTableDynamicInsert:on",
             au=model_config.get("au", creds.au),
             priority=model_config.get("priority", creds.priority),
-            columns=columns,
+            delta_columns=delta_columns,
+            extract_columns=extract_columns,
         )
 
     # ------------------------------------------------------------------

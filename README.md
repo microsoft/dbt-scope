@@ -180,10 +180,14 @@ my_project:
     source_patterns=['.*\\.ss$'],
     max_files_per_trigger=100,
     partition_by='event_year_date',
-    scope_columns=[
+    delta_table_columns=[
         {'name': 'server_name', 'type': 'string'},
         {'name': 'source_file_uri', 'type': 'string'},
-        {'name': 'event_year_date', 'type': 'string', 'extract': false}
+        {'name': 'event_year_date', 'type': 'string'}
+    ],
+    extract_columns=[
+        {'name': 'logical_server_name_DT_String', 'type': 'string'},
+        {'name': 'source_file_uri', 'type': 'string'}
     ],
     scope_settings={
         'microsoft.scope.compression': 'vorder:zstd#11',
@@ -210,10 +214,14 @@ FROM @data
     max_files_per_trigger=50,
     source_compaction_interval=10,
     source_retention_files=100,
-    scope_columns=[
+    delta_table_columns=[
         {'name': 'server_name', 'type': 'string'},
         {'name': 'source_file_uri', 'type': 'string'},
-        {'name': 'event_year_date', 'type': 'string', 'extract': false}
+        {'name': 'event_year_date', 'type': 'string'}
+    ],
+    extract_columns=[
+        {'name': 'logical_server_name_DT_String', 'type': 'string'},
+        {'name': 'source_file_uri', 'type': 'string'}
     ]
 ) }}
 
@@ -242,10 +250,14 @@ Models can include `WHERE` clauses — the adapter passes through your SQL as-is
     source_roots=['/my/cosmos/path/to/MyStream'],
     source_patterns=['.*\\.ss$'],
     max_files_per_trigger=50,
-    scope_columns=[
+    delta_table_columns=[
         {'name': 'server_name', 'type': 'string'},
         {'name': 'edition', 'type': 'string'},
-        {'name': 'event_year_date', 'type': 'string', 'extract': false}
+        {'name': 'event_year_date', 'type': 'string'}
+    ],
+    extract_columns=[
+        {'name': 'logical_server_name_DT_String', 'type': 'string'},
+        {'name': 'edition', 'type': 'string'}
     ]
 ) }}
 
@@ -266,7 +278,9 @@ WHERE edition == "Standard"
 | `safety_buffer_seconds`      | `30`      | Skip files modified within the last N seconds (avoids partial writes)               |
 | `source_compaction_interval` | `10`      | Every N batches, write a parquet snapshot of all source history                     |
 | `source_retention_files`     | `100`     | Max files in `_checkpoint/sources/` — oldest are deleted first                      |
-| `partition_by`               | —         | Single column name or list of columns. Columns with `'extract': false` are computed |
+| `delta_table_columns`        | `[]`      | Delta table schema (CREATE TABLE). List of `{name, type}` dicts                     |
+| `extract_columns`            | `[]`      | Source file columns (EXTRACT). List of `{name, type}` dicts                         |
+| `partition_by`               | —         | Single column name or list of columns                                               |
 
 `dbt retry` re-runs failed batches. `dbt run --full-refresh` resets the checkpoint and reprocesses all files.
 

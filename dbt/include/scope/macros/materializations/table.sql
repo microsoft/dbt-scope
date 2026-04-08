@@ -25,7 +25,8 @@
     {%- set starting_timestamp = config.get('starting_timestamp', none) -%}
     {%- set partition_by = config.get('partition_by', none) -%}
     {%- set scope_settings = config.get('scope_settings', {}) -%}
-    {%- set scope_columns = config.get('scope_columns', []) -%}
+    {%- set delta_table_columns = config.get('delta_table_columns', []) -%}
+    {%- set extract_columns = config.get('extract_columns', []) -%}
     {%- set feature_previews = config.get('scope_feature_previews', 'EnableDeltaTableDynamicInsert:on') -%}
 
     {# -- Delete checkpoint for full refresh -- #}
@@ -59,7 +60,8 @@
                     delta_location,
                     partition_by,
                     scope_settings,
-                    scope_columns,
+                    delta_table_columns,
+                    extract_columns,
                     feature_previews,
                     sql,
                     ns.file_batch,
@@ -100,7 +102,8 @@
     delta_location,
     partition_by,
     scope_settings,
-    scope_columns,
+    delta_table_columns,
+    extract_columns,
     feature_previews,
     model_sql,
     source_files,
@@ -124,9 +127,9 @@ SET @@DeltaLakeCommitCondition = "FailIfPartitionConflict";
 
 #DECLARE @deltaPath string = "{{ delta_location }}";
 
-{# -- CREATE TABLE IF NOT EXISTS -- #}
+{# -- CREATE TABLE IF NOT EXISTS (uses delta_table_columns) -- #}
 CREATE TABLE IF NOT EXISTS @target (
-{%- for col in scope_columns %}
+{%- for col in delta_table_columns %}
     {{ col.name }} {{ col.type }}{{ "," if not loop.last }}
 {%- endfor %}
 )
@@ -154,13 +157,7 @@ OPTIONS (LAYOUT = DELTA);
 DELETE FROM @target_rw WHERE true;
 {%- endif %}
 
-{# -- EXTRACT from explicit file list (exclude extract=false, use FILE.* for virtual columns) -- #}
-{%- set extract_columns = [] -%}
-{%- for col in scope_columns -%}
-    {%- if col.get('extract', true) != false -%}
-        {%- do extract_columns.append(col) -%}
-    {%- endif -%}
-{%- endfor -%}
+{# -- EXTRACT from explicit file list (uses extract_columns) -- #}
 {# Map of virtual column names to SCOPE FILE.* functions #}
 {%- set virtual_map = {
     'source_file_uri': 'FILE.URI()',
