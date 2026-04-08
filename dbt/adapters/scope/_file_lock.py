@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import random
 import sys
 import tempfile
@@ -11,7 +10,9 @@ from pathlib import Path
 from types import TracebackType
 from typing import TypeVar
 
-log = logging.getLogger(__name__)
+from dbt.adapters.events.logging import AdapterLogger
+
+log = AdapterLogger("scope")
 
 T = TypeVar("T")
 
@@ -49,14 +50,14 @@ class FileLock:
     def __enter__(self) -> FileLock:
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock_file = self.lock_path.open("w")
-        log.debug("Acquiring file lock: %s", self.lock_path)
+        log.debug(f"Acquiring file lock: {self.lock_path!s}")
         if sys.platform == "win32":
             self._lock_win32()
         else:
             import fcntl
 
             fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX)  # type: ignore[union-attr]
-        log.debug("Acquired file lock: %s", self.lock_path)
+        log.debug(f"Acquired file lock: {self.lock_path!s}")
         return self
 
     def __exit__(
@@ -75,7 +76,7 @@ class FileLock:
 
                 fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)  # type: ignore[union-attr]
             self._lock_file.close()  # type: ignore[union-attr]
-            log.debug("Released file lock: %s", self.lock_path)
+            log.debug(f"Released file lock: {self.lock_path!s}")
         return False
 
     # -- Windows retry logic --------------------------------------------------
@@ -109,7 +110,7 @@ class FileLock:
                 if attempt % 20 == 0:
                     log.debug(
                         "File lock contention on %s, attempt %d, sleeping %.2fs",
-                        self.lock_path,
+                        str(self.lock_path),
                         attempt,
                         sleep_time,
                     )

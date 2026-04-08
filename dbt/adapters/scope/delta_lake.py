@@ -11,7 +11,6 @@ integration tests share one implementation for:
 
 from __future__ import annotations
 
-import logging
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
@@ -24,11 +23,12 @@ import duckdb
 from azure.core.credentials import AccessToken, TokenCredential
 from azure.identity import AzureCliCredential
 from azure.storage.filedatalake import DataLakeServiceClient
+from dbt.adapters.events.logging import AdapterLogger
 from dbt_common.exceptions import DbtRuntimeError
 
 from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK, FileLock
 
-log = logging.getLogger(__name__)
+log = AdapterLogger("scope")
 
 _ABFSS_RE = re.compile(
     r"abfss://(?P<container>[^@]+)@(?P<account>[^.]+)\.dfs\.core\.windows\.net/(?P<path>.+)"
@@ -119,7 +119,7 @@ class DeltaLakeClient(ABC):
             self.fetchone(f"SELECT 1 FROM delta_scan('{escaped_location}') LIMIT 0")
             return True
         except Exception:
-            log.info("table_exists(%s) → False (not found or error)", delta_location, exc_info=True)
+            log.debug(f"table_exists({delta_location}) → False (not found or error)")
             return False
 
     def get_max_partition(self, delta_location: str, partition_col: str) -> str | None:
@@ -132,15 +132,14 @@ class DeltaLakeClient(ABC):
             )
             if row and row[0] is not None:
                 result = str(row[0])
-                log.info("get_max_partition(%s, %s) → %s", delta_location, partition_col, result)
+                log.debug(f"get_max_partition({delta_location}, {partition_col}) → {result}")
                 return result
             return None
         except Exception:
-            log.info(
+            log.debug(
                 "get_max_partition(%s, %s) → None (error)",
                 delta_location,
                 partition_col,
-                exc_info=True,
             )
             return None
 
@@ -153,10 +152,10 @@ class DeltaLakeClient(ABC):
                     f"SELECT * FROM delta_scan('{escaped_location}') LIMIT 0"
                 ).description
             columns = [column[0] for column in column_description]
-            log.debug("get_columns(%s) → %s", delta_location, columns)
+            log.debug(f"get_columns({delta_location}) → {columns!s}")
             return columns
         except Exception:
-            log.debug("get_columns(%s) → None (error)", delta_location, exc_info=True)
+            log.debug(f"get_columns({delta_location}) → None (error)")
             return None
 
     def validate_partition_column(self, delta_location: str, partition_col: str) -> None:
@@ -171,7 +170,7 @@ class DeltaLakeClient(ABC):
                 f"Available columns: {columns}. "
                 f"The model requires column '{partition_col}' for incremental processing."
             )
-        log.debug("validate_partition_column(%s, %s) → OK", delta_location, partition_col)
+        log.debug(f"validate_partition_column({delta_location}, {partition_col}) → OK")
 
     def get_total_row_count(self, delta_location: str) -> int:
         """Return the number of rows currently visible in the Delta table."""
@@ -194,7 +193,7 @@ class DeltaLakeClient(ABC):
         """Count JSON transaction log files under ``_delta_log/``."""
         parsed = AbfssLocation.parse(delta_location)
         if parsed is None:
-            log.warning("count_delta_log_files: bad path format: %s", delta_location)
+            log.warning(f"count_delta_log_files: bad path format: {delta_location}")
             return 0
 
         delta_log_prefix = f"{parsed.path.rstrip('/')}/_delta_log/"
@@ -204,14 +203,14 @@ class DeltaLakeClient(ABC):
             for path in table_paths
             if path.startswith(delta_log_prefix) and path.endswith(".json")
         )
-        log.info("count_delta_log_files(%s) → %d JSON files", delta_location, json_count)
+        log.debug(f"count_delta_log_files({delta_location}) → {json_count} JSON files")
         return json_count
 
     def describe_table_files(self, delta_location: str) -> dict[str, Any]:
         """Summarize parquet files and partition values from ADLS file listing."""
         parsed = AbfssLocation.parse(delta_location)
         if parsed is None:
-            log.warning("describe_table_files: bad path format: %s", delta_location)
+            log.warning(f"describe_table_files: bad path format: {delta_location}")
             return {"parquet_count": 0, "partitions": [], "error": f"Bad path: {delta_location}"}
 
         table_paths = self.list_table_paths(delta_location)
@@ -223,7 +222,7 @@ class DeltaLakeClient(ABC):
                 if (match := re.search(r"event_year_date[^=]*=(\d+)", path))
             }
         )
-        log.info(
+        log.debug(
             "describe_table_files(%s) → %d parquet files, %d partitions",
             delta_location,
             len(parquet_paths),
@@ -281,7 +280,7 @@ class DuckDbDeltaLakeClient(DeltaLakeClient):
                 if not getattr(path, "is_directory", False)
             ]
         except Exception:
-            log.warning("list_table_paths(%s) failed", delta_location, exc_info=True)
+            log.warning(f"list_table_paths({delta_location}) failed")
             return []
 
 

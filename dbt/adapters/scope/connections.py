@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import time
 import uuid
 from contextlib import contextmanager
@@ -18,6 +17,7 @@ from dbt.adapters.contracts.connection import (
     Connection,
     ConnectionState,
 )
+from dbt.adapters.events.logging import AdapterLogger
 from dbt_common.exceptions import DbtDatabaseError, DbtRuntimeError
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -25,7 +25,7 @@ from urllib3.util.retry import Retry
 from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK, FileLock
 from dbt.adapters.scope.credentials import ScopeCredentials
 
-log = logging.getLogger(__name__)
+log = AdapterLogger("scope")
 
 ADLA_TOKEN_SCOPE = "https://datalake.azure.net/.default"
 API_VERSION = "2017-09-01-preview"
@@ -86,6 +86,8 @@ class ScopeConnectionHandle:
         self._cached_token: str | None = None
         self._token_expires_at: float = 0
         self._next_job_name: str | None = None
+        self._next_job_au: int | None = None
+        self._next_job_priority: int | None = None
 
     # -- Job operations -----------------------------------------------
 
@@ -100,7 +102,8 @@ class ScopeConnectionHandle:
             "priority": priority,
             "properties": {"type": "Scope", "script": script},
         }
-        log.info("Submitting SCOPE job '%s' (AU=%d) → %s", name, au, job_id)
+        log.debug(f"Submitting SCOPE job '{name}' (AU={au}) → {job_id}")
+        log.debug(f"SCOPE script for '{name}':\n{script}")
         resp = self._request("PUT", url, json=body)
         job = ADLAJob(job_id=job_id, name=name)
         job.update_from_response(resp)
@@ -114,7 +117,7 @@ class ScopeConnectionHandle:
 
     def cancel_job(self, job_id: str) -> None:
         url = f"{self._base_url}/jobs/{job_id}/CancelJob?api-version={API_VERSION}"
-        log.info("Cancelling ADLA job %s", job_id)
+        log.debug(f"Cancelling ADLA job {job_id}")
         self._request("POST", url)
 
     def submit_and_wait(
@@ -141,13 +144,13 @@ class ScopeConnectionHandle:
             time.sleep(poll_interval)
             self.poll_job(job)
             if job.state != last_state:
-                log.info("[%s] %s → %s", name, last_state, job.state)
+                log.debug(f"[{name}] {last_state} → {job.state}")
                 last_state = job.state
 
         if not job.succeeded:
             raise DbtDatabaseError(f"SCOPE job '{name}' ({job.job_id}) failed: {job.error_message}")
 
-        log.info("[%s] Completed successfully (%s)", name, job.result)
+        log.debug(f"[{name}] Completed successfully ({job.result})")
         return job
 
     # -- Internal -----------------------------------------------------
@@ -259,12 +262,16 @@ class ScopeConnectionManager(BaseConnectionManager):
 
         with self.exception_handler(sql):
             effective_name = handle._next_job_name or job_name
+            effective_au = handle._next_job_au or credentials.au
+            effective_priority = handle._next_job_priority or credentials.priority
             handle._next_job_name = None
+            handle._next_job_au = None
+            handle._next_job_priority = None
             job = handle.submit_and_wait(
                 name=effective_name,
                 script=sql,
-                au=credentials.au,
-                priority=credentials.priority,
+                au=effective_au,
+                priority=effective_priority,
                 poll_interval=credentials.poll_interval_seconds,
                 max_wait=credentials.max_wait_seconds,
             )

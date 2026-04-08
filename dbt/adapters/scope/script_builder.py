@@ -9,14 +9,15 @@ explicitly list source files (comma-separated) in the EXTRACT FROM clause.
 
 from __future__ import annotations
 
-import logging
 import textwrap
 from dataclasses import dataclass, field
 from typing import Any
 
+from dbt.adapters.events.logging import AdapterLogger
+
 from dbt.adapters.scope.checkpoint import VIRTUAL_COLUMNS
 
-log = logging.getLogger(__name__)
+log = AdapterLogger("scope")
 
 
 @dataclass
@@ -101,7 +102,7 @@ class ScriptBuilder:
           5. EXTRACT from explicit file list
           6. INSERT INTO target from user's SELECT
         """
-        log.info(
+        log.debug(
             "Building full-refresh script for %s → %s (%d files)",
             config.table_name,
             config.resolved_delta_location,
@@ -122,7 +123,7 @@ class ScriptBuilder:
         parts.append(_model_transform_and_insert(model_sql))
 
         script = "\n".join(parts)
-        log.info("Full-refresh script length: %d chars", len(script))
+        log.debug(f"Full-refresh script length: {len(script)} chars")
         return script
 
     @staticmethod
@@ -139,7 +140,7 @@ class ScriptBuilder:
           4. EXTRACT from explicit file list
           5. INSERT INTO target from user's SELECT
         """
-        log.info(
+        log.debug(
             "Building incremental script for %s (%d files)",
             config.table_name,
             len(config.source_files),
@@ -164,13 +165,13 @@ class ScriptBuilder:
         parts.append(_model_transform_and_insert(model_sql))
 
         script = "\n".join(parts)
-        log.info("Incremental script length: %d chars", len(script))
+        log.debug(f"Incremental script length: {len(script)} chars")
         return script
 
     @staticmethod
     def build_drop(config: ScriptConfig) -> str:
         """Generate a SCOPE script to drop (delete all data from) a Delta table."""
-        log.info("Building drop script for %s", config.table_name)
+        log.debug(f"Building drop script for {config.table_name}")
         delta_loc = config.resolved_delta_location
         return textwrap.dedent(f"""\
             // Drop all data from {config.table_name}

@@ -70,6 +70,8 @@
 
                 {%- set job_suffix = "full-refresh_batch" ~ ns.batch_num ~ "_" ~ ns.file_batch | length ~ "files" -%}
                 {% do adapter.set_next_job_name(identifier ~ "_" ~ job_suffix) %}
+                {% if config.get('au') %}{% do adapter.set_next_job_au(config.get('au') | int) %}{% endif %}
+                {% if config.get('priority') %}{% do adapter.set_next_job_priority(config.get('priority') | int) %}{% endif %}
                 {%- call statement('main') -%}
                     {{ scope_script }}
                 {%- endcall -%}

@@ -20,17 +20,17 @@ Sources JSONL (one line per processed file)::
 from __future__ import annotations
 
 import json
-import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from azure.identity import AzureCliCredential
 from azure.storage.filedatalake import DataLakeServiceClient
+from dbt.adapters.events.logging import AdapterLogger
 
 from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK
 from dbt.adapters.scope.delta_lake import AbfssLocation, LockedTokenCredential
 
-log = logging.getLogger(__name__)
+log = AdapterLogger("scope")
 
 _CHECKPOINT_DIR = "_checkpoint"
 _WATERMARK_FILE = "watermark.json"
@@ -96,7 +96,7 @@ class CheckpointManager:
         """Read the watermark from ``_checkpoint/watermark.json``."""
         parsed = AbfssLocation.parse(delta_location)
         if parsed is None:
-            log.warning("read_watermark: invalid delta_location: %s", delta_location)
+            log.warning(f"read_watermark: invalid delta_location: {delta_location}")
             return None
 
         try:
@@ -107,7 +107,7 @@ class CheckpointManager:
             download = file_client.download_file()
             raw = download.readall().decode("utf-8")
             watermark = Watermark.from_json(raw)
-            log.info(
+            log.debug(
                 "Read watermark: version=%d, modified_time=%s, batch_id=%d",
                 watermark.version,
                 watermark.modified_time,
@@ -115,14 +115,14 @@ class CheckpointManager:
             )
             return watermark
         except Exception:
-            log.debug("No checkpoint found for %s (first run or full refresh)", delta_location)
+            log.debug(f"No checkpoint found for {delta_location} (first run or full refresh)")
             return None
 
     def write_watermark(self, delta_location: str, watermark: Watermark) -> None:
         """Write (create or overwrite) the watermark checkpoint."""
         parsed = AbfssLocation.parse(delta_location)
         if parsed is None:
-            log.warning("write_watermark: invalid delta_location: %s", delta_location)
+            log.warning(f"write_watermark: invalid delta_location: {delta_location}")
             return
 
         try:
@@ -138,7 +138,7 @@ class CheckpointManager:
             data = watermark.to_json().encode("utf-8")
             file_client.upload_data(data, overwrite=True)
 
-            log.info(
+            log.debug(
                 "Wrote watermark: version=%d, modified_time=%s, batch_id=%d → %s",
                 watermark.version,
                 watermark.modified_time,
@@ -146,14 +146,14 @@ class CheckpointManager:
                 delta_location,
             )
         except Exception:
-            log.error("write_watermark failed for %s", delta_location, exc_info=True)
+            log.error(f"write_watermark failed for {delta_location}")
             raise
 
     def delete_watermark(self, delta_location: str) -> None:
         """Delete the watermark checkpoint and all sources (for full refresh)."""
         parsed = AbfssLocation.parse(delta_location)
         if parsed is None:
-            log.warning("delete_watermark: invalid delta_location: %s", delta_location)
+            log.warning(f"delete_watermark: invalid delta_location: {delta_location}")
             return
 
         try:
@@ -162,9 +162,9 @@ class CheckpointManager:
             file_path = f"{parsed.path.rstrip('/')}/{_CHECKPOINT_DIR}/{_WATERMARK_FILE}"
             file_client = fs.get_file_client(file_path)
             file_client.delete_file()
-            log.info("Deleted watermark for %s", delta_location)
+            log.debug(f"Deleted watermark for {delta_location}")
         except Exception:
-            log.debug("No watermark to delete for %s (already clean)", delta_location)
+            log.debug(f"No watermark to delete for {delta_location} (already clean)")
 
         # Also delete all sources
         self.delete_all_sources(delta_location)
@@ -224,7 +224,7 @@ class CheckpointManager:
             else:
                 self._write_jsonl(fs, sources_dir, batch_id, batch_records)
 
-            log.info(
+            log.debug(
                 "Wrote sources batch %d (%d files, %s) → %s",
                 batch_id,
                 len(file_paths),
@@ -232,7 +232,7 @@ class CheckpointManager:
                 delta_location,
             )
         except Exception:
-            log.error("write_batch_sources failed for batch %d", batch_id, exc_info=True)
+            log.error(f"write_batch_sources failed for batch {batch_id}")
             raise
 
     @staticmethod
@@ -323,7 +323,7 @@ class CheckpointManager:
                     conn.close()
                     os.remove(tmp_path)
             except Exception:
-                log.warning("Failed to read snapshot %s", latest_snapshot_path, exc_info=True)
+                log.warning(f"Failed to read snapshot {latest_snapshot_path}")
 
         # Read JSONL diffs written after the latest snapshot
         for name, full_path in file_entries:
@@ -345,7 +345,7 @@ class CheckpointManager:
                     if line.strip():
                         all_records.append(json.loads(line))
             except Exception:
-                log.warning("Failed to read JSONL %s", name, exc_info=True)
+                log.warning(f"Failed to read JSONL {name}")
 
         # Add current batch records
         all_records.extend(current_batch_records)
@@ -378,7 +378,7 @@ class CheckpointManager:
         file_client.upload_data(parquet_data, overwrite=True)
         os.remove(parquet_local)
 
-        log.info(
+        log.debug(
             "Wrote snapshot %d.parquet (%d total records)",
             batch_id,
             len(all_records),
@@ -432,9 +432,9 @@ class CheckpointManager:
                     file_client.delete_file()
                     deleted += 1
                 except Exception:
-                    log.warning("Failed to delete source file: %s", full_path, exc_info=True)
+                    log.warning(f"Failed to delete source file: {full_path}")
 
-            log.info(
+            log.debug(
                 "cleanup_sources: deleted %d files (was %d, limit %d)",
                 deleted,
                 len(files),
@@ -442,7 +442,7 @@ class CheckpointManager:
             )
             return deleted
         except Exception:
-            log.warning("cleanup_sources failed for %s", delta_location, exc_info=True)
+            log.warning(f"cleanup_sources failed for {delta_location}")
             return 0
 
     def delete_all_sources(self, delta_location: str) -> None:
@@ -466,9 +466,9 @@ class CheckpointManager:
                     deleted += 1
                 except Exception:
                     pass
-            log.info("delete_all_sources: deleted %d files for %s", deleted, delta_location)
+            log.debug(f"delete_all_sources: deleted {deleted} files for {delta_location}")
         except Exception:
-            log.debug("No sources to delete for %s (already clean)", delta_location)
+            log.debug(f"No sources to delete for {delta_location} (already clean)")
 
     def list_source_files(self, delta_location: str) -> list[str]:
         """List all file names in ``_checkpoint/sources/`` (for testing)."""
