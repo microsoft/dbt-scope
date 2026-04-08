@@ -13,7 +13,7 @@
         source_retention_files=100,
         au=4,
         priority=1,
-        scope_columns=[
+        delta_table_columns=[
             {'name': 'logical_server_name', 'type': 'string'},
             {'name': 'logical_database_name', 'type': 'string'},
             {'name': 'edition', 'type': 'string'},
@@ -24,12 +24,25 @@
             {'name': 'source_file_length', 'type': 'long'},
             {'name': 'source_file_created', 'type': 'DateTime'},
             {'name': 'source_file_modified', 'type': 'DateTime'},
-            {'name': 'event_year_date', 'type': 'string', 'extract': false}
+            {'name': 'event_year_date', 'type': 'string'}
+        ],
+        extract_columns=[
+            {'name': 'logical_server_name', 'type': 'string'},
+            {'name': 'logical_database_name', 'type': 'string'},
+            {'name': 'edition', 'type': 'string'},
+            {'name': 'state', 'type': 'string'},
+            {'name': 'region_name', 'type': 'string'},
+            {'name': 'max_size_bytes', 'type': 'long'},
+            {'name': 'source_file_uri', 'type': 'string'},
+            {'name': 'source_file_length', 'type': 'long'},
+            {'name': 'source_file_created', 'type': 'DateTime'},
+            {'name': 'source_file_modified', 'type': 'DateTime'}
         ]
     )
 }}
 
 SELECT
+    DateTime.UtcNow.ToString("yyyyMMdd") AS event_year_date,
     logical_server_name,
     logical_database_name,
     edition,
@@ -39,7 +52,6 @@ SELECT
     source_file_uri,
     (long)(source_file_length ?? 0L) AS source_file_length,
     (DateTime)(source_file_created ?? DateTime.MinValue) AS source_file_created,
-    (DateTime)(source_file_modified ?? DateTime.MinValue) AS source_file_modified,
-    DateTime.UtcNow.ToString("yyyyMMdd") AS event_year_date
+    (DateTime)(source_file_modified ?? DateTime.MinValue) AS source_file_modified
 FROM @data
 WHERE edition == "Standard"

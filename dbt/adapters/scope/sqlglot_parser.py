@@ -13,15 +13,15 @@ cases where sqlglot still cannot produce a usable AST.
 
 from __future__ import annotations
 
-import logging
 import re
 
 import sqlglot
+from dbt.adapters.events.logging import AdapterLogger
 from sqlglot import exp
 
 from dbt.adapters.scope.sql_parser import SqlParser
 
-log = logging.getLogger(__name__)
+log = AdapterLogger("scope")
 
 # -- SCOPE preprocessing ----------------------------------------------------
 
@@ -109,11 +109,11 @@ class SqlglotParser(SqlParser):
             # sqlglot may have missed WHERE due to residual SCOPE syntax —
             # fall through to regex rather than returning False.
         except Exception:
-            log.debug("sqlglot parse failed, falling back to regex for: %.80s...", sql)
+            log.debug(f"sqlglot parse failed, falling back to regex for: {sql:.80s}...")
 
         # Fallback: regex-based detection on the original (un-normalized) SQL
         result = _regex_has_where(sql)
-        log.debug("has_top_level_where regex fallback → %s for: %.80s...", result, sql)
+        log.debug(f"has_top_level_where regex fallback → {result} for: {sql:.80s}...")
         return result
 
 

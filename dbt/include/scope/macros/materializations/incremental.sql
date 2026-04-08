@@ -40,7 +40,8 @@
     {%- set starting_timestamp = config.get('starting_timestamp', none) -%}
     {%- set partition_by = config.get('partition_by', none) -%}
     {%- set scope_settings = config.get('scope_settings', {}) -%}
-    {%- set scope_columns = config.get('scope_columns', []) -%}
+    {%- set delta_table_columns = config.get('delta_table_columns', []) -%}
+    {%- set extract_columns = config.get('extract_columns', []) -%}
     {%- set feature_previews = config.get('scope_feature_previews', 'EnableDeltaTableDynamicInsert:on') -%}
 
     {# -- Determine if this is a full refresh -- #}
@@ -80,7 +81,8 @@
                     delta_location,
                     partition_by,
                     scope_settings,
-                    scope_columns,
+                    delta_table_columns,
+                    extract_columns,
                     feature_previews,
                     sql,
                     ns.file_batch,
@@ -93,6 +95,9 @@
 
                 {%- set job_suffix = mode_label ~ "_batch" ~ ns.batch_num ~ "_" ~ ns.file_batch | length ~ "files" -%}
                 {% do adapter.set_next_job_name(identifier ~ "_" ~ job_suffix) %}
+                {% if config.get('au') %}{% do adapter.set_next_job_au(config.get('au') | int) %}{% endif %}
+                {% if config.get('priority') %}{% do adapter.set_next_job_priority(config.get('priority') | int) %}{% endif %}
+                {% if config.get('query_poll_timeout_seconds') %}{% do adapter.set_next_job_max_wait(config.get('query_poll_timeout_seconds') | int) %}{% endif %}
                 {%- call statement('main') -%}
                     {{ scope_script }}
                 {%- endcall -%}

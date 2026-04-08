@@ -7,17 +7,19 @@ used for watermark-based filtering.
 
 from __future__ import annotations
 
-import logging
 import re
-from dataclasses import dataclass
+import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from azure.datalake.store import core as adls_core
 from azure.identity import AzureCliCredential
+from dbt.adapters.events.logging import AdapterLogger
 
 from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK, FileLock
 
-log = logging.getLogger(__name__)
+log = AdapterLogger("scope")
 
 
 @dataclass(frozen=True)
@@ -28,6 +30,7 @@ class FileInfo:
     name: str
     length: int
     modification_time: datetime
+    raw: dict = field(default_factory=dict, repr=False, compare=False, hash=False)
 
     @classmethod
     def from_adls_entry(cls, entry: dict) -> FileInfo | None:
@@ -48,7 +51,30 @@ class FileInfo:
             name=raw_path.rsplit("/", 1)[-1],
             length=entry.get("length", 0),
             modification_time=datetime.fromtimestamp(mod_ms / 1000, tz=timezone.utc),
+            raw=entry,
         )
+
+
+def _list_one_dir(
+    fs: adls_core.AzureDLFileSystem,
+    dir_path: str,
+    depth: int,
+) -> tuple[list[dict], list[dict], str, int, float]:
+    """List a single directory. Returns (files, subdirs, path, depth, elapsed_ms)."""
+    t0 = time.monotonic()
+    try:
+        entries = fs.ls(dir_path, detail=True)
+    except FileNotFoundError:
+        log.warning(f"Path not found (skipping): {dir_path}")
+        return [], [], dir_path, depth, (time.monotonic() - t0) * 1000
+    except Exception:
+        log.warning(f"Failed to list {dir_path} (skipping)")
+        return [], [], dir_path, depth, (time.monotonic() - t0) * 1000
+
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    files = [e for e in entries if e.get("type") != "DIRECTORY"]
+    dirs = [e for e in entries if e.get("type") == "DIRECTORY"]
+    return files, dirs, dir_path, depth, elapsed_ms
 
 
 class AdlsGen1Client:
@@ -81,6 +107,7 @@ class AdlsGen1Client:
         *,
         pattern: str | None = None,
         recursive: bool = True,
+        max_workers: int = 8,
     ) -> list[FileInfo]:
         """List all files under *root*, optionally filtering by regex *pattern*.
 
@@ -88,59 +115,98 @@ class AdlsGen1Client:
             root: ADLS Gen1 path (e.g. ``/shares/SQLDB.Prod/local/...``).
             pattern: Regex pattern to match against the file name (not full path).
                      Only files whose name matches are returned.
-            recursive: If True, walk subdirectories.
+            recursive: If True, walk subdirectories in parallel.
+            max_workers: Max threads for parallel recursive listing.
 
         Returns:
             Sorted list of ``FileInfo`` objects (sorted by modification_time ASC).
         """
         fs = self._get_fs()
         compiled = re.compile(pattern) if pattern else None
-        log.info("Listing files: account=%s, root=%s, pattern=%s", self._account, root, pattern)
+        log.debug(f"Listing files: account={self._account}, root={root}, pattern={pattern}")
 
+        walk_start = time.monotonic()
         if recursive:
-            raw_entries = self._walk(fs, root)
+            raw_entries = self._walk(fs, root, max_workers)
         else:
+            t0 = time.monotonic()
             try:
                 raw_entries = fs.ls(root, detail=True)
             except FileNotFoundError:
-                log.warning("Path not found: %s", root)
+                log.warning(f"Path not found: {root}")
                 return []
             except Exception:
-                log.warning("Failed to list %s", root, exc_info=True)
+                log.warning(f"Failed to list {root}")
                 return []
+            finally:
+                elapsed_ms = (time.monotonic() - t0) * 1000
+                log.debug(f"ls {root} completed in {elapsed_ms:.1f} ms")
+        walk_elapsed_ms = (time.monotonic() - walk_start) * 1000
+        log.debug(f"Total walk of {root} completed in {walk_elapsed_ms:.1f} ms")
 
         files: list[FileInfo] = []
+        skipped_empty = 0
         for entry in raw_entries:
             info = FileInfo.from_adls_entry(entry)
             if info is None:
+                continue
+            if info.length == 0:
+                skipped_empty += 1
                 continue
             if compiled and not compiled.search(info.name):
                 continue
             files.append(info)
 
+        if skipped_empty:
+            log.debug(f"Skipped {skipped_empty} zero-length files under {root}")
         files.sort(key=lambda f: f.modification_time)
-        log.info("Found %d files matching pattern under %s", len(files), root)
+        log.debug(f"Found {len(files)} files matching pattern under {root}")
         return files
 
     @staticmethod
     def _walk(
         fs: adls_core.AzureDLFileSystem,
-        path: str,
+        root: str,
+        max_workers: int,
     ) -> list[dict]:
-        """Recursively list all file entries under *path*."""
-        try:
-            entries = fs.ls(path, detail=True)
-        except FileNotFoundError:
-            log.warning("Path not found (skipping): %s", path)
-            return []
-        except Exception:
-            log.warning("Failed to list %s (skipping)", path, exc_info=True)
-            return []
+        """Walk directories in parallel, logging per-directory progress."""
+        all_files: list[dict] = []
+        dirs_done = 0
 
-        files = [e for e in entries if e.get("type") != "DIRECTORY"]
-        dirs = [e for e in entries if e.get("type") == "DIRECTORY"]
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures: dict[Future, tuple[str, int]] = {}
 
-        for d in sorted(dirs, key=lambda e: e.get("name", "")):
-            files.extend(AdlsGen1Client._walk(fs, d["name"]))
+            f = executor.submit(_list_one_dir, fs, root, 0)
+            futures[f] = (root, 0)
 
-        return files
+            while futures:
+                done, _ = wait(futures, return_when=FIRST_COMPLETED)
+
+                for completed in done:
+                    futures.pop(completed)
+                    try:
+                        files, dirs, dir_path, depth, elapsed_ms = completed.result()
+                    except Exception:
+                        dirs_done += 1
+                        continue
+
+                    dirs_done += 1
+                    short = dir_path.rsplit("/", 1)[-1] or dir_path
+                    log.debug(
+                        f"Depth {depth} | {short} → "
+                        f"{len(dirs)} dirs, {len(files)} files "
+                        f"({elapsed_ms:.0f} ms) | "
+                        f"done: {dirs_done}, in-flight: {len(futures)}"
+                    )
+
+                    all_files.extend(files)
+
+                    for d in sorted(dirs, key=lambda e: e.get("name", "")):
+                        new_f = executor.submit(_list_one_dir, fs, d["name"], depth + 1)
+                        futures[new_f] = (d["name"], depth + 1)
+
+                if futures:
+                    log.debug(f"Queue: {len(futures)} directories pending")
+
+        log.debug(f"Walk complete: {dirs_done} directories scanned")
+        return all_files

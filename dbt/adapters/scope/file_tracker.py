@@ -12,13 +12,14 @@ the per-file processing loop:
 
 from __future__ import annotations
 
-import logging
 from datetime import datetime, timedelta, timezone
+
+from dbt.adapters.events.logging import AdapterLogger
 
 from dbt.adapters.scope.adls_gen1_client import AdlsGen1Client, FileInfo
 from dbt.adapters.scope.checkpoint import CheckpointManager, Watermark
 
-log = logging.getLogger(__name__)
+log = AdapterLogger("scope")
 
 DEFAULT_SAFETY_BUFFER_SECONDS = 30
 DEFAULT_MAX_FILES_PER_TRIGGER = 50
@@ -67,7 +68,7 @@ class FileTracker:
                 continue
             unprocessed.append(f)
 
-        log.info(
+        log.debug(
             "Discovered %d unprocessed files (total=%d, watermark=%s, cutoff=%s)",
             len(unprocessed),
             len(all_files),
@@ -83,7 +84,7 @@ class FileTracker:
     ) -> list[FileInfo]:
         """Take the first *max_files_per_trigger* files from the sorted list."""
         batch = files[:max_files_per_trigger]
-        log.info(
+        log.debug(
             "Next batch: %d files (of %d remaining)",
             len(batch),
             len(files),

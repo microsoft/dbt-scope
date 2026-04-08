@@ -9,23 +9,23 @@ explicitly list source files (comma-separated) in the EXTRACT FROM clause.
 
 from __future__ import annotations
 
-import logging
 import textwrap
 from dataclasses import dataclass, field
 from typing import Any
 
+from dbt.adapters.events.logging import AdapterLogger
+
 from dbt.adapters.scope.checkpoint import VIRTUAL_COLUMNS
 
-log = logging.getLogger(__name__)
+log = AdapterLogger("scope")
 
 
 @dataclass
 class ColumnDef:
-    """A column definition for a SCOPE Delta table."""
+    """A column definition for a SCOPE table or EXTRACT statement."""
 
     name: str
     scope_type: str
-    extract: bool = True  # False for computed columns not present in source files
 
     def render(self) -> str:
         return f"    {self.name} {self.scope_type}"
@@ -68,8 +68,11 @@ class ScriptConfig:
     au: int = 100
     priority: int = 1
 
-    # Columns
-    columns: list[ColumnDef] = field(default_factory=list)
+    # Delta table columns (CREATE TABLE schema)
+    delta_columns: list[ColumnDef] = field(default_factory=list)
+
+    # Extract columns (EXTRACT from source files) — when empty, derived from delta_columns
+    extract_columns: list[ColumnDef] = field(default_factory=list)
 
     @property
     def resolved_delta_location(self) -> str:
@@ -101,7 +104,7 @@ class ScriptBuilder:
           5. EXTRACT from explicit file list
           6. INSERT INTO target from user's SELECT
         """
-        log.info(
+        log.debug(
             "Building full-refresh script for %s → %s (%d files)",
             config.table_name,
             config.resolved_delta_location,
@@ -113,16 +116,16 @@ class ScriptBuilder:
         parts.append(_header_comment("full-refresh", config.table_name))
         parts.append(_set_feature_previews(config.feature_previews))
         parts.append(_declare_paths(delta_loc))
-        parts.append(_create_table(config.columns, config.partition_by, "@deltaPath"))
+        parts.append(_create_table(config.delta_columns, config.partition_by, "@deltaPath"))
         if config.scope_settings:
             parts.append(_alter_table_properties(config.scope_settings))
 
         parts.append(_delete_all_rows())
-        parts.append(_extract_from_files(config.columns, config.source_files))
-        parts.append(_model_transform_and_insert(model_sql))
+        parts.append(_extract_from_files(config.extract_columns, config.source_files))
+        parts.append(_model_transform_and_insert(model_sql, config.delta_columns))
 
         script = "\n".join(parts)
-        log.info("Full-refresh script length: %d chars", len(script))
+        log.debug(f"Full-refresh script length: {len(script)} chars")
         return script
 
     @staticmethod
@@ -139,7 +142,7 @@ class ScriptBuilder:
           4. EXTRACT from explicit file list
           5. INSERT INTO target from user's SELECT
         """
-        log.info(
+        log.debug(
             "Building incremental script for %s (%d files)",
             config.table_name,
             len(config.source_files),
@@ -157,20 +160,20 @@ class ScriptBuilder:
         parts.append('SET @@DeltaLakeCommitCondition = "FailIfPartitionConflict";')
         parts.append("")
         parts.append(_declare_paths(delta_loc))
-        parts.append(_create_table(config.columns, config.partition_by, "@deltaPath"))
+        parts.append(_create_table(config.delta_columns, config.partition_by, "@deltaPath"))
         if config.scope_settings:
             parts.append(_alter_table_properties(config.scope_settings))
-        parts.append(_extract_from_files(config.columns, config.source_files))
-        parts.append(_model_transform_and_insert(model_sql))
+        parts.append(_extract_from_files(config.extract_columns, config.source_files))
+        parts.append(_model_transform_and_insert(model_sql, config.delta_columns))
 
         script = "\n".join(parts)
-        log.info("Incremental script length: %d chars", len(script))
+        log.debug(f"Incremental script length: {len(script)} chars")
         return script
 
     @staticmethod
     def build_drop(config: ScriptConfig) -> str:
         """Generate a SCOPE script to drop (delete all data from) a Delta table."""
-        log.info("Building drop script for %s", config.table_name)
+        log.debug(f"Building drop script for {config.table_name}")
         delta_loc = config.resolved_delta_location
         return textwrap.dedent(f"""\
             // Drop all data from {config.table_name}
@@ -254,7 +257,7 @@ def _delete_all_rows() -> str:
 
 
 def _extract_from_files(
-    columns: list[ColumnDef],
+    extract_columns: list[ColumnDef],
     source_files: list[str],
 ) -> str:
     """Build an EXTRACT statement with an explicit comma-separated file list.
@@ -262,16 +265,15 @@ def _extract_from_files(
     Virtual columns (source_file_uri, etc.) are rendered as ``name = FILE.*()``
     instead of the normal ``name : type`` syntax.
     """
-    extract_cols: list[str] = []
-    for col in columns:
-        if not col.extract:
-            continue
+    # Choose which column list drives the EXTRACT
+    extract_col_strs: list[str] = []
+    for col in extract_columns:
         if col.name in VIRTUAL_COLUMNS:
-            extract_cols.append(f"        {col.name} = {VIRTUAL_COLUMNS[col.name]}")
+            extract_col_strs.append(f"        {col.name} = {VIRTUAL_COLUMNS[col.name]}")
         else:
-            extract_cols.append(f"        {col.name} : {col.scope_type}")
+            extract_col_strs.append(f"        {col.name} : {col.scope_type}")
 
-    col_list = ",\n".join(extract_cols)
+    col_list = ",\n".join(extract_col_strs)
 
     # Build file list (comma-separated, quoted paths)
     file_list = ",\n         ".join(f'"{f}"' for f in source_files)
@@ -285,7 +287,7 @@ def _extract_from_files(
     """)
 
 
-def _model_transform_and_insert(model_sql: str) -> str:
+def _model_transform_and_insert(model_sql: str, delta_columns: list[ColumnDef]) -> str:
     parts: list[str] = []
 
     # Strip trailing semicolons — the template adds its own
@@ -294,7 +296,8 @@ def _model_transform_and_insert(model_sql: str) -> str:
     parts.append("@batch_data =")
     parts.append(f"    {sql};")
     parts.append("")
+    col_list = ", ".join(c.name for c in delta_columns)
     parts.append("INSERT INTO @target")
-    parts.append("SELECT * FROM @batch_data;")
+    parts.append(f"SELECT {col_list} FROM @batch_data;")
 
     return "\n".join(parts)

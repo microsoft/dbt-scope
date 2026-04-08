@@ -27,16 +27,16 @@
     DateTime
 {%- endmacro %}
 
-{# -- Generate a SCOPE-compatible column list from scope_columns config -- #}
-{% macro scope__render_column_list(scope_columns) -%}
-{%- for col in scope_columns -%}
+{# -- Generate a SCOPE-compatible column list from delta_table_columns config -- #}
+{% macro scope__render_column_list(delta_table_columns) -%}
+{%- for col in delta_table_columns -%}
     {{ col.name }}{{ ", " if not loop.last }}
 {%- endfor -%}
 {%- endmacro %}
 
 {# -- Render column definitions for CREATE TABLE -- #}
-{% macro scope__render_column_defs(scope_columns) -%}
-{%- for col in scope_columns -%}
+{% macro scope__render_column_defs(delta_table_columns) -%}
+{%- for col in delta_table_columns -%}
     {{ col.name }} {{ col.type }}{{ "," if not loop.last }}
 {%- endfor -%}
 {%- endmacro %}

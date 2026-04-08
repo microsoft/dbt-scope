@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-import logging
+import time
 from datetime import datetime, timezone
 from typing import Any
 
 import agate
+import pandas as pd
 from dbt.adapters.base import BaseAdapter, available
+from dbt.adapters.events.logging import AdapterLogger
 from dbt_common.exceptions import DbtRuntimeError
 
 from dbt.adapters.scope.adls_gen1_client import AdlsGen1Client, FileInfo
@@ -19,7 +21,54 @@ from dbt.adapters.scope.file_tracker import FileTracker
 from dbt.adapters.scope.relation import ScopeRelation
 from dbt.adapters.scope.script_builder import ColumnDef, ScriptConfig
 
-log = logging.getLogger(__name__)
+log = AdapterLogger("scope")
+
+_TIMESTAMP_COLS = ("accessTime", "modificationTime", "msExpirationTime", "expiryTime")
+_SIZE_COLS = ("length", "blockSize")
+
+
+def _epoch_ms_to_iso(epoch_ms: int | float | None) -> str | None:
+    """Convert epoch-millisecond timestamp to ISO-8601 string."""
+    if epoch_ms is None or pd.isna(epoch_ms):
+        return None
+    try:
+        return datetime.fromtimestamp(int(epoch_ms) / 1000, tz=timezone.utc).isoformat()
+    except (OSError, ValueError):
+        return str(epoch_ms)
+
+
+def _format_bytes(size: int | float | None) -> str:
+    """Human-readable byte size."""
+    if size is None or pd.isna(size):
+        return "N/A"
+    s = float(size)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(s) < 1024:
+            return f"{s:.2f} {unit}"
+        s /= 1024
+    return f"{s:.2f} PB"
+
+
+def _pretty_print_file_batch(files: list[FileInfo]) -> str:
+    """Build a pretty-printed table of file metadata for debug logging."""
+    raw_entries = [f.raw for f in files if f.raw]
+    if not raw_entries:
+        return f"  ({len(files)} files — no raw metadata available)"
+
+    df = pd.DataFrame(raw_entries)
+
+    if "name" in df.columns:
+        df.insert(0, "shortName", df["name"].apply(lambda n: n.rsplit("/", 1)[-1]))
+
+    for col in _TIMESTAMP_COLS:
+        if col in df.columns:
+            df[f"{col}_utc"] = df[col].apply(_epoch_ms_to_iso)
+
+    for col in _SIZE_COLS:
+        if col in df.columns:
+            df[f"{col}_fmt"] = df[col].apply(_format_bytes)
+
+    return df.to_string(index=False)
 
 
 def _parse_starting_timestamp(value: str) -> datetime:
@@ -120,6 +169,14 @@ class ScopeAdapter(BaseAdapter):
 
             from dbt.adapters.scope.delta_lake import LockedTokenCredential
 
+            t_start = time.monotonic()
+            log.debug(
+                "list_relations: scanning %s/%s/%s for Delta tables",
+                creds.storage_account,
+                creds.container,
+                creds.delta_base_path,
+            )
+
             credential = LockedTokenCredential(AzureCliCredential())
             service = DataLakeServiceClient(
                 account_url=f"https://{creds.storage_account}.dfs.core.windows.net",
@@ -127,11 +184,23 @@ class ScopeAdapter(BaseAdapter):
             )
             fs = service.get_file_system_client(creds.container)
 
+            t0 = time.monotonic()
+            dirs = [
+                p
+                for p in fs.get_paths(path=creds.delta_base_path, recursive=False)
+                if p.is_directory
+            ]
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            log.debug(
+                "list_relations: get_paths found %d directories in %.1f ms",
+                len(dirs),
+                elapsed_ms,
+            )
+
             relations: list[ScopeRelation] = []
-            for path_info in fs.get_paths(path=creds.delta_base_path, recursive=False):
-                if not path_info.is_directory:
-                    continue
+            for i, path_info in enumerate(dirs):
                 table_name = path_info.name.split("/")[-1]
+                t0 = time.monotonic()
                 try:
                     delta_log = fs.get_directory_client(f"{path_info.name}/_delta_log")
                     delta_log.get_directory_properties()
@@ -143,12 +212,33 @@ class ScopeAdapter(BaseAdapter):
                             type="table",
                         )
                     )
+                    elapsed_ms = (time.monotonic() - t0) * 1000
+                    log.debug(
+                        "list_relations: [%d/%d] %s — Delta table found in %.1f ms",
+                        i + 1,
+                        len(dirs),
+                        table_name,
+                        elapsed_ms,
+                    )
                 except Exception:
-                    pass  # Not a Delta table — skip
-            log.info("list_relations_without_caching found %d Delta tables", len(relations))
+                    elapsed_ms = (time.monotonic() - t0) * 1000
+                    log.debug(
+                        "list_relations: [%d/%d] %s — not a Delta table (%.1f ms)",
+                        i + 1,
+                        len(dirs),
+                        table_name,
+                        elapsed_ms,
+                    )
+
+            total_ms = (time.monotonic() - t_start) * 1000
+            log.debug(
+                "list_relations: found %d Delta tables in %.1f ms",
+                len(relations),
+                total_ms,
+            )
             return relations
         except Exception:
-            log.debug("No Delta tables found at %s (path may not exist yet)", creds.delta_base_path)
+            log.debug(f"No Delta tables found at {creds.delta_base_path} (path may not exist yet)")
             return []
 
     def quote(self, identifier: str) -> str:
@@ -204,6 +294,27 @@ class ScopeAdapter(BaseAdapter):
         handle._next_job_name = name
 
     @available
+    def set_next_job_au(self, au: int) -> None:
+        """Set the AU (parallelism) for the next ``execute()`` call on this thread."""
+        connection = self.connections.get_thread_connection()
+        handle: ScopeConnectionHandle = connection.handle  # type: ignore[assignment]
+        handle._next_job_au = au
+
+    @available
+    def set_next_job_priority(self, priority: int) -> None:
+        """Set the priority for the next ``execute()`` call on this thread."""
+        connection = self.connections.get_thread_connection()
+        handle: ScopeConnectionHandle = connection.handle  # type: ignore[assignment]
+        handle._next_job_priority = priority
+
+    @available
+    def set_next_job_max_wait(self, max_wait: int) -> None:
+        """Set the poll timeout for the next ``execute()`` call on this thread."""
+        connection = self.connections.get_thread_connection()
+        handle: ScopeConnectionHandle = connection.handle  # type: ignore[assignment]
+        handle._next_job_max_wait = max_wait
+
+    @available
     def discover_files(
         self,
         source_roots: list[str],
@@ -240,7 +351,7 @@ class ScopeAdapter(BaseAdapter):
         elif starting_ts_dt is not None:
             effective_watermark = Watermark(modified_time=starting_ts_dt.isoformat())
             used_starting_timestamp = True
-            log.info(
+            log.debug(
                 "No checkpoint found — using starting_timestamp=%s as initial offset",
                 starting_timestamp,
             )
@@ -274,13 +385,12 @@ class ScopeAdapter(BaseAdapter):
         all_unprocessed.sort(key=lambda f: f.modification_time)
         batch = FileTracker.get_next_batch(all_unprocessed, max_files_per_trigger)
 
-        log.info(
-            "discover_files: roots=%s, patterns=%s, unprocessed=%d, batch=%d",
-            source_roots,
-            source_patterns,
-            len(all_unprocessed),
-            len(batch),
+        log.debug(
+            f"discover_files: roots={source_roots}, patterns={source_patterns}, "
+            f"unprocessed={len(all_unprocessed)}, batch={len(batch)}"
         )
+        if batch:
+            log.debug(f"Batch file metadata:\n{_pretty_print_file_batch(batch)}")
         return [f.path for f in batch]
 
     @staticmethod
@@ -420,15 +530,24 @@ class ScopeAdapter(BaseAdapter):
         """Build a ``ScriptConfig`` from dbt model config + credentials."""
         creds = self._credentials()
 
-        # Parse column definitions from sources.yml metadata
-        raw_columns = model_config.get("columns", [])
-        columns = [
+        # Parse Delta table column definitions
+        raw_delta_cols = model_config.get("delta_table_columns", [])
+        delta_columns = [
             ColumnDef(
                 name=c["name"],
                 scope_type=c.get("type", "string"),
-                extract=c.get("extract", True),
             )
-            for c in raw_columns
+            for c in raw_delta_cols
+        ]
+
+        # Parse extract column definitions (optional — empty means derive from delta_columns)
+        raw_extract_cols = model_config.get("extract_columns", [])
+        extract_columns = [
+            ColumnDef(
+                name=c["name"],
+                scope_type=c.get("type", "string"),
+            )
+            for c in raw_extract_cols
         ]
 
         return ScriptConfig(
@@ -447,7 +566,8 @@ class ScopeAdapter(BaseAdapter):
             feature_previews=creds.scope_feature_previews or "EnableDeltaTableDynamicInsert:on",
             au=model_config.get("au", creds.au),
             priority=model_config.get("priority", creds.priority),
-            columns=columns,
+            delta_columns=delta_columns,
+            extract_columns=extract_columns,
         )
 
     # ------------------------------------------------------------------
