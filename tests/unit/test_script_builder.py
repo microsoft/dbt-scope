@@ -83,7 +83,7 @@ class TestScriptBuilderFullRefresh:
 
     def test_generates_insert(self, sample_config):
         script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
-        assert "INSERT INTO @target" in script
+        assert "INSERT INTO @target (col_str, col_long, col_dt, event_year_date)" in script
         assert "SELECT * FROM @batch_data" in script
 
     def test_no_partitioning(self, sample_config):
@@ -152,7 +152,7 @@ class TestScriptBuilderIncremental:
 
     def test_insert_present(self, sample_config):
         script = ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
-        assert "INSERT INTO @target" in script
+        assert "INSERT INTO @target (col_str, col_long, col_dt, event_year_date)" in script
         assert "SELECT * FROM @batch_data" in script
 
 
@@ -184,7 +184,7 @@ class TestScriptBuilderMultiPartition:
     def test_multi_partition_incremental(self, multi_partition_config):
         script = ScriptBuilder.build_incremental(multi_partition_config, "SELECT * FROM @data")
         assert "PARTITIONED BY (event_year_date, edition)" in script
-        assert "INSERT INTO @target" in script
+        assert "INSERT INTO @target (col_str, col_long, edition, event_year_date)" in script
 
 
 class TestScriptBuilderDrop:
@@ -523,3 +523,57 @@ class TestExtractColumnsSeparation:
         extract_section = script[extract_start:extract_end]
         assert "LogicalServerName_DT_String : string" in extract_section
         assert "server_name" not in extract_section
+
+
+class TestInsertColumnList:
+    """Tests that INSERT INTO uses explicit column list to prevent positional mismatch."""
+
+    def test_insert_includes_column_names(self, sample_config):
+        """INSERT should list all delta column names explicitly."""
+        script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
+        assert "INSERT INTO @target (col_str, col_long, col_dt, event_year_date)" in script
+
+    def test_insert_column_order_matches_delta_columns(self, sample_config):
+        """Column list in INSERT must match delta_columns order."""
+        script = ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
+        assert "INSERT INTO @target (col_str, col_long, col_dt, event_year_date)" in script
+
+    def test_mismatched_select_order_still_correct_insert(self):
+        """Even when SELECT outputs columns in different order than table, INSERT column list is correct."""
+        delta_cols = [
+            ColumnDef(name="cluster_region_zone", scope_type="string"),
+            ColumnDef(name="azure_resource_id", scope_type="string"),
+            ColumnDef(name="original_event_timestamp", scope_type="DateTime"),
+            ColumnDef(name="query_count", scope_type="long"),
+            ColumnDef(name="event_year_date", scope_type="string"),
+        ]
+        config = ScriptConfig(
+            delta_location="abfss://c@a.dfs.core.windows.net/d/t",
+            table_name="t",
+            partition_by="event_year_date",
+            source_files=["/shares/test/a.ss"],
+            delta_columns=delta_cols,
+            extract_columns=[
+                ColumnDef(name="ClusterName_DT_String", scope_type="string"),
+                ColumnDef(name="SubscriptionId_DT_String", scope_type="string"),
+                ColumnDef(name="originalEventTimestamp_DT_DateTime", scope_type="DateTime"),
+                ColumnDef(name="query_count_DT_Int64", scope_type="long"),
+            ],
+        )
+        model_sql = (
+            "SELECT\n"
+            '    DateTime.UtcNow.ToString("yyyyMMdd") AS event_year_date,\n'
+            "    ClusterName_DT_String.Split('.')[1] AS cluster_region_zone,\n"
+            "    SubscriptionId_DT_String AS azure_resource_id,\n"
+            "    originalEventTimestamp_DT_DateTime AS original_event_timestamp,\n"
+            "    query_count_DT_Int64 AS query_count\n"
+            "FROM @data"
+        )
+        script = ScriptBuilder.build_incremental(config, model_sql)
+        # INSERT should have delta column names in table definition order
+        expected = (
+            "INSERT INTO @target"
+            " (cluster_region_zone, azure_resource_id,"
+            " original_event_timestamp, query_count, event_year_date)"
+        )
+        assert expected in script

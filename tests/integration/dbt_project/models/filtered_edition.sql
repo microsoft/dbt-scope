@@ -42,6 +42,7 @@
 }}
 
 SELECT
+    DateTime.UtcNow.ToString("yyyyMMdd") AS event_year_date,
     logical_server_name,
     logical_database_name,
     edition,
@@ -51,7 +52,6 @@ SELECT
     source_file_uri,
     (long)(source_file_length ?? 0L) AS source_file_length,
     (DateTime)(source_file_created ?? DateTime.MinValue) AS source_file_created,
-    (DateTime)(source_file_modified ?? DateTime.MinValue) AS source_file_modified,
-    DateTime.UtcNow.ToString("yyyyMMdd") AS event_year_date
+    (DateTime)(source_file_modified ?? DateTime.MinValue) AS source_file_modified
 FROM @data
 WHERE edition == "Standard"

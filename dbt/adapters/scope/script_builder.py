@@ -122,7 +122,7 @@ class ScriptBuilder:
 
         parts.append(_delete_all_rows())
         parts.append(_extract_from_files(config.extract_columns, config.source_files))
-        parts.append(_model_transform_and_insert(model_sql))
+        parts.append(_model_transform_and_insert(model_sql, config.delta_columns))
 
         script = "\n".join(parts)
         log.debug(f"Full-refresh script length: {len(script)} chars")
@@ -164,7 +164,7 @@ class ScriptBuilder:
         if config.scope_settings:
             parts.append(_alter_table_properties(config.scope_settings))
         parts.append(_extract_from_files(config.extract_columns, config.source_files))
-        parts.append(_model_transform_and_insert(model_sql))
+        parts.append(_model_transform_and_insert(model_sql, config.delta_columns))
 
         script = "\n".join(parts)
         log.debug(f"Incremental script length: {len(script)} chars")
@@ -287,7 +287,7 @@ def _extract_from_files(
     """)
 
 
-def _model_transform_and_insert(model_sql: str) -> str:
+def _model_transform_and_insert(model_sql: str, delta_columns: list[ColumnDef]) -> str:
     parts: list[str] = []
 
     # Strip trailing semicolons — the template adds its own
@@ -296,7 +296,8 @@ def _model_transform_and_insert(model_sql: str) -> str:
     parts.append("@batch_data =")
     parts.append(f"    {sql};")
     parts.append("")
-    parts.append("INSERT INTO @target")
+    col_list = ", ".join(c.name for c in delta_columns)
+    parts.append(f"INSERT INTO @target ({col_list})")
     parts.append("SELECT * FROM @batch_data;")
 
     return "\n".join(parts)
