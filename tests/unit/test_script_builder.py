@@ -83,8 +83,8 @@ class TestScriptBuilderFullRefresh:
 
     def test_generates_insert(self, sample_config):
         script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
-        assert "INSERT INTO @target (col_str, col_long, col_dt, event_year_date)" in script
-        assert "SELECT * FROM @batch_data" in script
+        assert "INSERT INTO @target" in script
+        assert "SELECT col_str, col_long, col_dt, event_year_date FROM @batch_data;" in script
 
     def test_no_partitioning(self, sample_config):
         sample_config.partition_by = None
@@ -152,8 +152,8 @@ class TestScriptBuilderIncremental:
 
     def test_insert_present(self, sample_config):
         script = ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
-        assert "INSERT INTO @target (col_str, col_long, col_dt, event_year_date)" in script
-        assert "SELECT * FROM @batch_data" in script
+        assert "INSERT INTO @target" in script
+        assert "SELECT col_str, col_long, col_dt, event_year_date FROM @batch_data;" in script
 
 
 class TestScriptBuilderMultiPartition:
@@ -184,7 +184,7 @@ class TestScriptBuilderMultiPartition:
     def test_multi_partition_incremental(self, multi_partition_config):
         script = ScriptBuilder.build_incremental(multi_partition_config, "SELECT * FROM @data")
         assert "PARTITIONED BY (event_year_date, edition)" in script
-        assert "INSERT INTO @target (col_str, col_long, edition, event_year_date)" in script
+        assert "SELECT col_str, col_long, edition, event_year_date FROM @batch_data;" in script
 
 
 class TestScriptBuilderDrop:
@@ -526,20 +526,22 @@ class TestExtractColumnsSeparation:
 
 
 class TestInsertColumnList:
-    """Tests that INSERT INTO uses explicit column list to prevent positional mismatch."""
+    """Tests that INSERT INTO uses explicit SELECT column list to prevent positional mismatch."""
 
     def test_insert_includes_column_names(self, sample_config):
-        """INSERT should list all delta column names explicitly."""
+        """SELECT should list all delta column names explicitly in table order."""
         script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
-        assert "INSERT INTO @target (col_str, col_long, col_dt, event_year_date)" in script
+        assert "INSERT INTO @target" in script
+        assert "SELECT col_str, col_long, col_dt, event_year_date FROM @batch_data;" in script
 
     def test_insert_column_order_matches_delta_columns(self, sample_config):
-        """Column list in INSERT must match delta_columns order."""
+        """Column list in SELECT must match delta_columns order."""
         script = ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
-        assert "INSERT INTO @target (col_str, col_long, col_dt, event_year_date)" in script
+        assert "INSERT INTO @target" in script
+        assert "SELECT col_str, col_long, col_dt, event_year_date FROM @batch_data;" in script
 
     def test_mismatched_select_order_still_correct_insert(self):
-        """Even when SELECT outputs columns in different order than table, INSERT column list is correct."""
+        """Even when model SELECT outputs columns in different order than table, INSERT reorders via explicit SELECT."""
         delta_cols = [
             ColumnDef(name="cluster_region_zone", scope_type="string"),
             ColumnDef(name="azure_resource_id", scope_type="string"),
@@ -570,10 +572,10 @@ class TestInsertColumnList:
             "FROM @data"
         )
         script = ScriptBuilder.build_incremental(config, model_sql)
-        # INSERT should have delta column names in table definition order
+        # SELECT should reorder columns to match table definition order
         expected = (
-            "INSERT INTO @target"
-            " (cluster_region_zone, azure_resource_id,"
-            " original_event_timestamp, query_count, event_year_date)"
+            "SELECT cluster_region_zone, azure_resource_id,"
+            " original_event_timestamp, query_count, event_year_date"
+            " FROM @batch_data;"
         )
         assert expected in script
