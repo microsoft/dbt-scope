@@ -122,3 +122,70 @@ class TestExecuteJobName:
         handle.submit_and_wait.assert_called_once()
         call_kwargs = handle.submit_and_wait.call_args
         assert call_kwargs.kwargs["name"] == "from_macro"
+
+
+class TestExecuteMaxWaitOverride:
+    """ScopeConnectionManager.execute() uses _next_job_max_wait when set."""
+
+    @pytest.fixture
+    def mock_manager(self):
+        """Create a ScopeConnectionManager with mocked internals."""
+        mgr = MagicMock(spec=ScopeConnectionManager)
+        mgr.execute = ScopeConnectionManager.execute.__get__(mgr, ScopeConnectionManager)
+
+        @contextmanager
+        def _exception_handler(sql):
+            yield
+
+        mgr.exception_handler = _exception_handler
+
+        handle = MagicMock()
+        handle._next_job_name = None
+        handle._next_job_max_wait = None
+        handle.submit_and_wait = MagicMock()
+        handle.submit_and_wait.return_value = MagicMock(job_id="test-id", result="Succeeded")
+
+        connection = MagicMock()
+        connection.handle = handle
+        connection.credentials = MagicMock(
+            au=100, priority=1, poll_interval_seconds=5, max_wait_seconds=3600
+        )
+        mgr.get_thread_connection.return_value = connection
+        return mgr, handle
+
+    def test_uses_override_when_set(self, mock_manager):
+        mgr, handle = mock_manager
+        handle._next_job_max_wait = 7200
+
+        mgr.execute(_DUMMY_SCRIPT)
+
+        handle.submit_and_wait.assert_called_once()
+        call_kwargs = handle.submit_and_wait.call_args
+        assert call_kwargs.kwargs["max_wait"] == 7200
+
+    def test_clears_override_after_use(self, mock_manager):
+        mgr, handle = mock_manager
+        handle._next_job_max_wait = 7200
+
+        mgr.execute(_DUMMY_SCRIPT)
+
+        assert handle._next_job_max_wait is None
+
+    def test_falls_back_to_profile_default(self, mock_manager):
+        mgr, handle = mock_manager
+        handle._next_job_max_wait = None
+
+        mgr.execute(_DUMMY_SCRIPT)
+
+        handle.submit_and_wait.assert_called_once()
+        call_kwargs = handle.submit_and_wait.call_args
+        assert call_kwargs.kwargs["max_wait"] == 3600
+
+    def test_not_consumed_for_skipped_scripts(self, mock_manager):
+        mgr, handle = mock_manager
+        handle._next_job_max_wait = 7200
+
+        mgr.execute("-- no-op: skipped")
+
+        handle.submit_and_wait.assert_not_called()
+        assert handle._next_job_max_wait == 7200

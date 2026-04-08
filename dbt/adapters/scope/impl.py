@@ -308,6 +308,13 @@ class ScopeAdapter(BaseAdapter):
         handle._next_job_priority = priority
 
     @available
+    def set_next_job_max_wait(self, max_wait: int) -> None:
+        """Set the poll timeout for the next ``execute()`` call on this thread."""
+        connection = self.connections.get_thread_connection()
+        handle: ScopeConnectionHandle = connection.handle  # type: ignore[assignment]
+        handle._next_job_max_wait = max_wait
+
+    @available
     def discover_files(
         self,
         source_roots: list[str],

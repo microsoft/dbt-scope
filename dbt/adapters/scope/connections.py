@@ -88,6 +88,7 @@ class ScopeConnectionHandle:
         self._next_job_name: str | None = None
         self._next_job_au: int | None = None
         self._next_job_priority: int | None = None
+        self._next_job_max_wait: int | None = None
 
     # -- Job operations -----------------------------------------------
 
@@ -264,16 +265,18 @@ class ScopeConnectionManager(BaseConnectionManager):
             effective_name = handle._next_job_name or job_name
             effective_au = handle._next_job_au or credentials.au
             effective_priority = handle._next_job_priority or credentials.priority
+            effective_max_wait = handle._next_job_max_wait or credentials.max_wait_seconds
             handle._next_job_name = None
             handle._next_job_au = None
             handle._next_job_priority = None
+            handle._next_job_max_wait = None
             job = handle.submit_and_wait(
                 name=effective_name,
                 script=sql,
                 au=effective_au,
                 priority=effective_priority,
                 poll_interval=credentials.poll_interval_seconds,
-                max_wait=credentials.max_wait_seconds,
+                max_wait=effective_max_wait,
             )
 
         response = AdapterResponse(
