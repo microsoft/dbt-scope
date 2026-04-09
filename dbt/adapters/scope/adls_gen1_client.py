@@ -7,6 +7,7 @@ used for watermark-based filtering.
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -20,6 +21,23 @@ from dbt.adapters.events.logging import AdapterLogger
 from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK, FileLock
 
 log = AdapterLogger("scope")
+
+
+class _SuppressFileNotFound(logging.Filter):
+    """Reject Azure SDK log records that report a 404 / FileNotFoundError.
+
+    The adapter already catches these exceptions and logs a concise debug
+    message, so the SDK's verbose ERROR (full HTTP headers) is redundant.
+    """
+
+    _KEYWORDS = ("FileNotFoundError", "FileNotFoundException")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(kw in msg for kw in self._KEYWORDS)
+
+
+logging.getLogger("azure.datalake.store").addFilter(_SuppressFileNotFound())
 
 
 @dataclass(frozen=True)
@@ -65,7 +83,7 @@ def _list_one_dir(
     try:
         entries = fs.ls(dir_path, detail=True)
     except FileNotFoundError:
-        log.warning(f"Path not found (skipping): {dir_path}")
+        log.debug(f"Path not found (skipping): {dir_path}")
         return [], [], dir_path, depth, (time.monotonic() - t0) * 1000
     except Exception:
         log.warning(f"Failed to list {dir_path} (skipping)")
@@ -133,7 +151,7 @@ class AdlsGen1Client:
             try:
                 raw_entries = fs.ls(root, detail=True)
             except FileNotFoundError:
-                log.warning(f"Path not found: {root}")
+                log.debug(f"Path not found: {root}")
                 return []
             except Exception:
                 log.warning(f"Failed to list {root}")
