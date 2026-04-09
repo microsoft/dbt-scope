@@ -38,6 +38,7 @@ class _SuppressFileNotFound(logging.Filter):
 
 
 logging.getLogger("azure.datalake.store").addFilter(_SuppressFileNotFound())
+logging.getLogger("azure.datalake.store.lib").addFilter(_SuppressFileNotFound())
 
 
 @dataclass(frozen=True)
