@@ -8,6 +8,7 @@ from typing import Any
 
 import agate
 import pandas as pd
+import tabulate as tabulate_lib
 from dbt.adapters.base import BaseAdapter, available
 from dbt.adapters.events.logging import AdapterLogger
 from dbt_common.exceptions import DbtRuntimeError
@@ -56,11 +57,14 @@ def _format_bytes(size: int | float | None) -> str:
     return f"{s:.2f} PB"
 
 
-def _pretty_print_file_batch(files: list[FileInfo]) -> str:
-    """Build a pretty-printed table of file metadata for debug logging."""
+def _build_file_df(files: list[FileInfo]) -> pd.DataFrame | None:
+    """Build a DataFrame of file metadata from FileInfo objects.
+
+    Returns ``None`` if no raw metadata is available.
+    """
     raw_entries = [f.raw for f in files if f.raw]
     if not raw_entries:
-        return f"  ({len(files)} files — no raw metadata available)"
+        return None
 
     df = pd.DataFrame(raw_entries)
 
@@ -75,14 +79,50 @@ def _pretty_print_file_batch(files: list[FileInfo]) -> str:
         if col in df.columns:
             df[f"{col}_fmt"] = df[col].apply(_format_bytes)
 
-    # Add byte-estimation columns from enriched FileInfo
+    # Byte-estimation columns from enriched FileInfo
+    files_with_raw = [f for f in files if f.raw]
     df["estimatedBytes"] = [
-        f.estimated_bytes if f.estimated_bytes is not None else f.length for f in files if f.raw
+        f.estimated_bytes if f.estimated_bytes is not None else f.length for f in files_with_raw
     ]
     df["estimatedBytes_fmt"] = df["estimatedBytes"].apply(_format_bytes)
-    df["contributingFiles"] = [list(f.contributing_files) for f in files if f.raw]
+    df["estimatedTerabytes"] = df["estimatedBytes"].apply(
+        lambda b: round(b / (1024**4), 6) if b else 0.0
+    )
+    df["contributingFiles"] = [list(f.contributing_files) for f in files_with_raw]
 
-    return df.to_string(index=False)
+    return df
+
+
+def _tabulate_df(df: pd.DataFrame) -> str:
+    """Render a DataFrame as a psql-formatted table via tabulate."""
+    return tabulate_lib.tabulate(df, headers="keys", tablefmt="psql", showindex=False)
+
+
+def _pretty_print_file_tables(
+    batch: list[FileInfo],
+    backlog: list[FileInfo],
+) -> str:
+    """Build pretty-printed tables for the current batch and backlog."""
+    parts: list[str] = []
+
+    batch_df = _build_file_df(batch)
+    if batch_df is not None:
+        parts.append(f"=== CURRENT BATCH ({len(batch)} files) ===")
+        parts.append(_tabulate_df(batch_df))
+    else:
+        parts.append(f"=== CURRENT BATCH ({len(batch)} files — no raw metadata) ===")
+
+    if backlog:
+        backlog_df = _build_file_df(backlog)
+        if backlog_df is not None:
+            parts.append(f"\n=== BACKLOG ({len(backlog)} files remaining) ===")
+            parts.append(_tabulate_df(backlog_df))
+        else:
+            parts.append(f"\n=== BACKLOG ({len(backlog)} files — no raw metadata) ===")
+    else:
+        parts.append("\n=== BACKLOG (0 files remaining) ===")
+
+    return "\n".join(parts)
 
 
 def _parse_starting_timestamp(value: str) -> datetime:
@@ -412,7 +452,8 @@ class ScopeAdapter(BaseAdapter):
             f"unprocessed={len(all_unprocessed)}, batch={len(batch)}"
         )
         if batch:
-            log.debug(f"Batch file metadata:\n{_pretty_print_file_batch(batch)}")
+            backlog = all_unprocessed[len(batch) :]
+            log.debug(f"File discovery results:\n{_pretty_print_file_tables(batch, backlog)}")
         return [f.path for f in batch]
 
     @staticmethod

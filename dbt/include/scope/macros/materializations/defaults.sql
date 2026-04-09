@@ -8,7 +8,7 @@
 {% macro scope__config_defaults() %}
     {% do return({
         "max_files_per_trigger": 50,
-        "max_bytes_per_trigger": 1073741824000,
+        "max_bytes_per_trigger": 10737418240000,
         "safety_buffer_seconds": 30,
         "source_compaction_interval": 10,
         "source_retention_files": 100,
