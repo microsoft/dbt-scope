@@ -30,13 +30,14 @@
     ) -%}
 
     {# -- Pull config values -- #}
+    {%- set defaults = scope__config_defaults() -%}
     {%- set delta_location = config.get('delta_location', '') -%}
     {%- set source_roots = config.get('source_roots', []) -%}
     {%- set source_patterns = config.get('source_patterns', ['.*\\.ss$']) -%}
-    {%- set max_files_per_trigger = config.get('max_files_per_trigger', 50) | int -%}
-    {%- set safety_buffer_seconds = config.get('safety_buffer_seconds', 30) | int -%}
-    {%- set source_compaction_interval = config.get('source_compaction_interval', 10) | int -%}
-    {%- set source_retention_files = config.get('source_retention_files', 100) | int -%}
+    {%- set max_files_per_trigger = config.get('max_files_per_trigger', defaults.max_files_per_trigger) | int -%}
+    {%- set safety_buffer_seconds = config.get('safety_buffer_seconds', defaults.safety_buffer_seconds) | int -%}
+    {%- set source_compaction_interval = config.get('source_compaction_interval', defaults.source_compaction_interval) | int -%}
+    {%- set source_retention_files = config.get('source_retention_files', defaults.source_retention_files) | int -%}
     {%- set starting_timestamp = config.get('starting_timestamp', none) -%}
     {%- set partition_by = config.get('partition_by', none) -%}
     {%- set scope_settings = config.get('scope_settings', {}) -%}

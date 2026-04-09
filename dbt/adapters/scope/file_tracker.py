@@ -18,11 +18,12 @@ from dbt.adapters.events.logging import AdapterLogger
 
 from dbt.adapters.scope.adls_gen1_client import AdlsGen1Client, FileInfo
 from dbt.adapters.scope.checkpoint import CheckpointManager, Watermark
+from dbt.adapters.scope.constants import (
+    DEFAULT_MAX_FILES_PER_TRIGGER,
+    DEFAULT_SAFETY_BUFFER_SECONDS,
+)
 
 log = AdapterLogger("scope")
-
-DEFAULT_SAFETY_BUFFER_SECONDS = 30
-DEFAULT_MAX_FILES_PER_TRIGGER = 50
 
 
 class FileTracker:

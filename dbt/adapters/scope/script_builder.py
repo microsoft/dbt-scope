@@ -16,6 +16,10 @@ from typing import Any
 from dbt.adapters.events.logging import AdapterLogger
 
 from dbt.adapters.scope.checkpoint import VIRTUAL_COLUMNS
+from dbt.adapters.scope.constants import (
+    DEFAULT_MAX_FILES_PER_TRIGGER,
+    DEFAULT_SAFETY_BUFFER_SECONDS,
+)
 
 log = AdapterLogger("scope")
 
@@ -51,8 +55,8 @@ class ScriptConfig:
     # File-based source configuration (cross-product of roots x patterns)
     source_roots: list[str] = field(default_factory=list)
     source_patterns: list[str] = field(default_factory=list)
-    max_files_per_trigger: int = 50
-    safety_buffer_seconds: int = 30
+    max_files_per_trigger: int = DEFAULT_MAX_FILES_PER_TRIGGER
+    safety_buffer_seconds: int = DEFAULT_SAFETY_BUFFER_SECONDS
     adls_gen1_account: str = ""
 
     # Explicit file paths for EXTRACT FROM (populated by FileTracker)

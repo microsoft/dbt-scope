@@ -16,6 +16,12 @@ from dbt.adapters.scope.adls_gen1_client import AdlsGen1Client, FileInfo
 from dbt.adapters.scope.checkpoint import CheckpointManager, Watermark
 from dbt.adapters.scope.column import ScopeColumn
 from dbt.adapters.scope.connections import ScopeConnectionHandle, ScopeConnectionManager
+from dbt.adapters.scope.constants import (
+    DEFAULT_MAX_FILES_PER_TRIGGER,
+    DEFAULT_SAFETY_BUFFER_SECONDS,
+    DEFAULT_SOURCE_COMPACTION_INTERVAL,
+    DEFAULT_SOURCE_RETENTION_FILES,
+)
 from dbt.adapters.scope.credentials import ScopeCredentials
 from dbt.adapters.scope.file_tracker import FileTracker
 from dbt.adapters.scope.relation import ScopeRelation
@@ -321,7 +327,7 @@ class ScopeAdapter(BaseAdapter):
         source_patterns: list[str],
         max_files_per_trigger: int,
         delta_location: str,
-        safety_buffer_seconds: int = 30,
+        safety_buffer_seconds: int = DEFAULT_SAFETY_BUFFER_SECONDS,
         starting_timestamp: str | None = None,
     ) -> list[str]:
         """Discover unprocessed source files and return a batch of file paths.
@@ -422,8 +428,8 @@ class ScopeAdapter(BaseAdapter):
         source_roots: list[str],
         source_patterns: list[str],
         file_paths: list[str],
-        source_compaction_interval: int = 10,
-        source_retention_files: int = 100,
+        source_compaction_interval: int = DEFAULT_SOURCE_COMPACTION_INTERVAL,
+        source_retention_files: int = DEFAULT_SOURCE_RETENTION_FILES,
     ) -> None:
         """Update the watermark checkpoint after a successful SCOPE job.
 
@@ -487,7 +493,7 @@ class ScopeAdapter(BaseAdapter):
         source_roots: list[str],
         source_patterns: list[str],
         delta_location: str,
-        safety_buffer_seconds: int = 30,
+        safety_buffer_seconds: int = DEFAULT_SAFETY_BUFFER_SECONDS,
         starting_timestamp: str | None = None,
     ) -> bool:
         """Are there unprocessed files at the source?"""
@@ -559,8 +565,12 @@ class ScopeAdapter(BaseAdapter):
             partition_by=model_config.get("partition_by"),
             source_roots=model_config.get("source_roots", []),
             source_patterns=model_config.get("source_patterns", []),
-            max_files_per_trigger=model_config.get("max_files_per_trigger", 50),
-            safety_buffer_seconds=model_config.get("safety_buffer_seconds", 30),
+            max_files_per_trigger=model_config.get(
+                "max_files_per_trigger", DEFAULT_MAX_FILES_PER_TRIGGER
+            ),
+            safety_buffer_seconds=model_config.get(
+                "safety_buffer_seconds", DEFAULT_SAFETY_BUFFER_SECONDS
+            ),
             adls_gen1_account=model_config.get("adls_gen1_account", creds.adls_gen1_account),
             scope_settings=model_config.get("scope_settings", {}),
             feature_previews=creds.scope_feature_previews or "EnableDeltaTableDynamicInsert:on",
