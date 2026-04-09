@@ -68,6 +68,7 @@
             -- no-op: no source files found
         {%- endcall -%}
     {%- else -%}
+        {%- set total_batches = adapter.get_total_batches() -%}
         {%- for _ in range(1000) -%}
             {%- if ns.file_batch | length == 0 -%}
                 {# Break out of loop — Jinja has no while, so we use for + break guard #}
@@ -93,9 +94,9 @@
                 ) -%}
 
                 {%- set mode_label = "full-refresh" if full_refresh_mode else "incremental" -%}
-                {{ log("SCOPE: " ~ mode_label ~ " " ~ identifier ~ " batch " ~ ns.batch_num ~ " (" ~ ns.file_batch | length ~ " files)", info=True) }}
+                {{ log("SCOPE: " ~ mode_label ~ " " ~ identifier ~ " batch " ~ ns.batch_num ~ " of " ~ total_batches ~ " (" ~ ns.file_batch | length ~ " files)", info=True) }}
 
-                {%- set job_suffix = mode_label ~ "_batch" ~ ns.batch_num ~ "_" ~ ns.file_batch | length ~ "files" -%}
+                {%- set job_suffix = mode_label ~ "_batch_" ~ ns.batch_num ~ "_of_" ~ total_batches ~ "_files_" ~ ns.file_batch | length -%}
                 {% do adapter.set_next_job_name(identifier ~ "_" ~ job_suffix) %}
                 {% if config.get('au') %}{% do adapter.set_next_job_au(config.get('au') | int) %}{% endif %}
                 {% if config.get('priority') %}{% do adapter.set_next_job_priority(config.get('priority') | int) %}{% endif %}

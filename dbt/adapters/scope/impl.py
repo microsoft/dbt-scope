@@ -144,6 +144,23 @@ def _parse_starting_timestamp(value: str) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+def _count_batches(
+    files: list[FileInfo],
+    max_files_per_trigger: int,
+    max_bytes_per_trigger: int,
+) -> int:
+    """Simulate batching to count total batches without consuming the file list."""
+    remaining = files
+    count = 0
+    while remaining:
+        batch = FileTracker.get_next_batch(remaining, max_files_per_trigger, max_bytes_per_trigger)
+        if not batch:
+            break
+        count += 1
+        remaining = remaining[len(batch) :]
+    return count
+
+
 class ScopeAdapter(BaseAdapter):
     """Adapter for submitting SCOPE scripts to Azure Data Lake Analytics."""
 
@@ -359,6 +376,11 @@ class ScopeAdapter(BaseAdapter):
         handle._next_job_priority = priority
 
     @available
+    def get_total_batches(self) -> int:
+        """Return the total batch count computed by the last ``discover_files`` call."""
+        return getattr(self, "_last_total_batches", 0)
+
+    @available
     def set_next_job_max_wait(self, max_wait: int) -> None:
         """Set the poll timeout for the next ``execute()`` call on this thread."""
         connection = self.connections.get_thread_connection()
@@ -440,13 +462,19 @@ class ScopeAdapter(BaseAdapter):
         # Enrich with byte estimates (SSv5/v6 sibling folder detection)
         all_unprocessed = self._get_gen1_client().enrich_with_estimates(all_unprocessed)
 
+        # Pre-compute total batch count from the full unprocessed list
+        self._last_total_batches = _count_batches(
+            all_unprocessed, max_files_per_trigger, max_bytes_per_trigger
+        )
+
         batch = FileTracker.get_next_batch(
             all_unprocessed, max_files_per_trigger, max_bytes_per_trigger
         )
 
         log.debug(
             f"discover_files: roots={source_roots}, patterns={source_patterns}, "
-            f"unprocessed={len(all_unprocessed)}, batch={len(batch)}"
+            f"unprocessed={len(all_unprocessed)}, batch={len(batch)}, "
+            f"total_batches={self._last_total_batches}"
         )
         if batch:
             backlog = all_unprocessed[len(batch) :]
