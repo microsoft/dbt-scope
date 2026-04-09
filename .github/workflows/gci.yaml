@@ -50,7 +50,7 @@ jobs:
       - name: "🔐 Az Login with Fake UAMI"
         run: |
           set -euo pipefail
-          az login --identity --client-id "$UAMI_CLIENT_ID" > /dev/null 2>&1
+          az login --identity --client-id "$UAMI_CLIENT_ID"
 
       - name: "⚙️ Bootstrap Dev Environment"
         run: |
