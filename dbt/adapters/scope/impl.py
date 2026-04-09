@@ -85,9 +85,6 @@ def _build_file_df(files: list[FileInfo]) -> pd.DataFrame | None:
         f.estimated_bytes if f.estimated_bytes is not None else f.length for f in files_with_raw
     ]
     df["estimatedBytes_fmt"] = df["estimatedBytes"].apply(_format_bytes)
-    df["estimatedTerabytes"] = df["estimatedBytes"].apply(
-        lambda b: round(b / (1024**4), 6) if b else 0.0
-    )
     df["contributingFiles"] = [list(f.contributing_files) for f in files_with_raw]
 
     return df
