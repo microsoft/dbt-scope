@@ -20,6 +20,7 @@
     {%- set source_roots = config.get('source_roots', []) -%}
     {%- set source_patterns = config.get('source_patterns', ['.*\\.ss$']) -%}
     {%- set max_files_per_trigger = config.get('max_files_per_trigger', defaults.max_files_per_trigger) | int -%}
+    {%- set max_bytes_per_trigger = config.get('max_bytes_per_trigger', defaults.max_bytes_per_trigger) | int -%}
     {%- set safety_buffer_seconds = config.get('safety_buffer_seconds', defaults.safety_buffer_seconds) | int -%}
     {%- set source_compaction_interval = config.get('source_compaction_interval', defaults.source_compaction_interval) | int -%}
     {%- set source_retention_files = config.get('source_retention_files', defaults.source_retention_files) | int -%}
@@ -39,7 +40,7 @@
         batch_num=0,
         total_files=0,
         file_batch=adapter.discover_files(
-            source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds, starting_timestamp
+            source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds, starting_timestamp, max_bytes_per_trigger
         )
     ) -%}
 
@@ -84,7 +85,7 @@
 
                 {# -- Discover next batch (watermark advanced) -- #}
                 {%- set ns.file_batch = adapter.discover_files(
-                    source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds, starting_timestamp
+                    source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds, starting_timestamp, max_bytes_per_trigger
                 ) -%}
             {%- endif -%}
         {%- endfor -%}

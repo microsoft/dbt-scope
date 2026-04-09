@@ -17,6 +17,7 @@ from dbt.adapters.scope.checkpoint import CheckpointManager, Watermark
 from dbt.adapters.scope.column import ScopeColumn
 from dbt.adapters.scope.connections import ScopeConnectionHandle, ScopeConnectionManager
 from dbt.adapters.scope.constants import (
+    DEFAULT_MAX_BYTES_PER_TRIGGER,
     DEFAULT_MAX_FILES_PER_TRIGGER,
     DEFAULT_SAFETY_BUFFER_SECONDS,
     DEFAULT_SOURCE_COMPACTION_INTERVAL,
@@ -73,6 +74,13 @@ def _pretty_print_file_batch(files: list[FileInfo]) -> str:
     for col in _SIZE_COLS:
         if col in df.columns:
             df[f"{col}_fmt"] = df[col].apply(_format_bytes)
+
+    # Add byte-estimation columns from enriched FileInfo
+    df["estimatedBytes"] = [
+        f.estimated_bytes if f.estimated_bytes is not None else f.length for f in files if f.raw
+    ]
+    df["estimatedBytes_fmt"] = df["estimatedBytes"].apply(_format_bytes)
+    df["contributingFiles"] = [list(f.contributing_files) for f in files if f.raw]
 
     return df.to_string(index=False)
 
@@ -329,6 +337,7 @@ class ScopeAdapter(BaseAdapter):
         delta_location: str,
         safety_buffer_seconds: int = DEFAULT_SAFETY_BUFFER_SECONDS,
         starting_timestamp: str | None = None,
+        max_bytes_per_trigger: int = DEFAULT_MAX_BYTES_PER_TRIGGER,
     ) -> list[str]:
         """Discover unprocessed source files and return a batch of file paths.
 
@@ -336,7 +345,8 @@ class ScopeAdapter(BaseAdapter):
         of *source_roots* x *source_patterns*:
           1. For each (root, pattern): read watermark, LIST + filter files
           2. Union results and deduplicate by file path
-          3. Return up to *max_files_per_trigger* file paths
+          3. Enrich with byte estimates (SSv5/v6 sibling folder detection)
+          4. Return files bounded by *max_files_per_trigger* and *max_bytes_per_trigger*
 
         If *starting_timestamp* is provided (ISO-8601 UTC) and no checkpoint
         exists, only files modified after that timestamp are considered.  When
@@ -389,7 +399,13 @@ class ScopeAdapter(BaseAdapter):
 
         # Sort by modification_time to maintain deterministic ordering
         all_unprocessed.sort(key=lambda f: f.modification_time)
-        batch = FileTracker.get_next_batch(all_unprocessed, max_files_per_trigger)
+
+        # Enrich with byte estimates (SSv5/v6 sibling folder detection)
+        all_unprocessed = self._get_gen1_client().enrich_with_estimates(all_unprocessed)
+
+        batch = FileTracker.get_next_batch(
+            all_unprocessed, max_files_per_trigger, max_bytes_per_trigger
+        )
 
         log.debug(
             f"discover_files: roots={source_roots}, patterns={source_patterns}, "
@@ -567,6 +583,9 @@ class ScopeAdapter(BaseAdapter):
             source_patterns=model_config.get("source_patterns", []),
             max_files_per_trigger=model_config.get(
                 "max_files_per_trigger", DEFAULT_MAX_FILES_PER_TRIGGER
+            ),
+            max_bytes_per_trigger=model_config.get(
+                "max_bytes_per_trigger", DEFAULT_MAX_BYTES_PER_TRIGGER
             ),
             safety_buffer_seconds=model_config.get(
                 "safety_buffer_seconds", DEFAULT_SAFETY_BUFFER_SECONDS

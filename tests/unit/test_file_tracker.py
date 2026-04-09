@@ -19,6 +19,21 @@ def _make_file(name: str, mod_time: datetime, length: int = 1000) -> FileInfo:
     )
 
 
+def _make_file_enriched(
+    name: str,
+    mod_time: datetime,
+    length: int = 1000,
+    estimated_bytes: int | None = None,
+) -> FileInfo:
+    return FileInfo(
+        path=f"/shares/test/{name}",
+        name=name,
+        length=length,
+        modification_time=mod_time,
+        estimated_bytes=estimated_bytes,
+    )
+
+
 NOW = datetime(2026, 4, 1, 12, 0, 0, tzinfo=timezone.utc)
 
 
@@ -147,3 +162,77 @@ class TestComputeNewWatermark:
         wm = FileTracker.compute_new_watermark([], None)
         assert wm.version == 0
         assert wm.batch_id == 0
+
+
+class TestGetNextBatchWithBytesLimit:
+    """Tests for get_next_batch with max_bytes_per_trigger."""
+
+    def test_byte_limit_stops_before_file_limit(self):
+        """Byte limit is hit before file limit → smaller batch."""
+        files = [
+            _make_file_enriched(f"{i}.ss", NOW - timedelta(hours=i), estimated_bytes=500)
+            for i in range(10)
+        ]
+        # max_files=50, max_bytes=1200 → should get 2 files (500+500=1000, 3rd would be 1500>1200)
+        batch = FileTracker.get_next_batch(
+            files, max_files_per_trigger=50, max_bytes_per_trigger=1200
+        )
+        assert len(batch) == 2
+
+    def test_file_limit_stops_before_byte_limit(self):
+        """File limit is hit before byte limit → file limit wins."""
+        files = [
+            _make_file_enriched(f"{i}.ss", NOW - timedelta(hours=i), estimated_bytes=100)
+            for i in range(10)
+        ]
+        batch = FileTracker.get_next_batch(
+            files, max_files_per_trigger=3, max_bytes_per_trigger=999999
+        )
+        assert len(batch) == 3
+
+    def test_always_includes_at_least_one_file(self):
+        """Even if a single file exceeds byte limit, it must be included."""
+        files = [
+            _make_file_enriched("big.ss", NOW - timedelta(hours=1), estimated_bytes=10_000_000)
+        ]
+        batch = FileTracker.get_next_batch(
+            files, max_files_per_trigger=50, max_bytes_per_trigger=100
+        )
+        assert len(batch) == 1
+        assert batch[0].name == "big.ss"
+
+    def test_falls_back_to_length_when_estimated_bytes_is_none(self):
+        """When estimated_bytes is None, uses file length."""
+        files = [_make_file(f"{i}.ss", NOW - timedelta(hours=i), length=500) for i in range(10)]
+        batch = FileTracker.get_next_batch(
+            files, max_files_per_trigger=50, max_bytes_per_trigger=1200
+        )
+        assert len(batch) == 2
+
+    def test_exact_byte_limit_includes_file(self):
+        """File that exactly reaches the limit is included."""
+        files = [
+            _make_file_enriched("a.ss", NOW - timedelta(hours=2), estimated_bytes=500),
+            _make_file_enriched("b.ss", NOW - timedelta(hours=1), estimated_bytes=500),
+        ]
+        batch = FileTracker.get_next_batch(
+            files, max_files_per_trigger=50, max_bytes_per_trigger=1000
+        )
+        assert len(batch) == 2
+
+    def test_empty_files_with_byte_limit(self):
+        batch = FileTracker.get_next_batch([], max_files_per_trigger=50, max_bytes_per_trigger=100)
+        assert batch == []
+
+    def test_mixed_enriched_and_unenriched(self):
+        """Mix of enriched and unenriched files — uses estimated_bytes when available."""
+        files = [
+            _make_file_enriched("a.ss", NOW - timedelta(hours=3), estimated_bytes=800),
+            _make_file("b.ss", NOW - timedelta(hours=2), length=300),
+            _make_file_enriched("c.ss", NOW - timedelta(hours=1), estimated_bytes=200),
+        ]
+        # 800 + 300 = 1100 ≤ 1200; 1100 + 200 = 1300 > 1200
+        batch = FileTracker.get_next_batch(
+            files, max_files_per_trigger=50, max_bytes_per_trigger=1200
+        )
+        assert len(batch) == 2

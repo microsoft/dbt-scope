@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from dbt.adapters.scope.adls_gen1_client import AdlsGen1Client, FileInfo
 
@@ -359,3 +362,181 @@ class TestWalkProgressLogging:
 
         debug_msgs = [c.args[0] if c.args else "" for c in mock_log.debug.call_args_list]
         assert any("Walk complete:" in m for m in debug_msgs)
+
+
+class TestEstimateBytes:
+    """Tests for estimate_bytes — SSv3/v4 vs SSv5/v6 detection."""
+
+    @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
+    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
+    def test_ssv3_no_sibling_folder(self, mock_cred, mock_adls):
+        """SSv3/v4: no sibling folder → returns (file_length, [])."""
+        mock_fs = MagicMock()
+        mock_fs.info.side_effect = FileNotFoundError("not found")
+        mock_adls.AzureDLFileSystem.return_value = mock_fs
+
+        client = AdlsGen1Client("test-account")
+        est_bytes, contrib = client.estimate_bytes("/shares/test/data.ss", 727393)
+
+        assert est_bytes == 727393
+        assert contrib == []
+
+    @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
+    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
+    def test_ssv5_with_du_files(self, mock_cred, mock_adls):
+        """SSv5/v6: sibling folder with .du files → returns sum."""
+        mock_fs = MagicMock()
+        mock_fs.info.return_value = {"type": "DIRECTORY"}
+        mock_fs.ls.return_value = [
+            {"name": "/shares/test/data/part-00000.du", "type": "FILE", "length": 50_000_000},
+            {"name": "/shares/test/data/part-00001.du", "type": "FILE", "length": 48_000_000},
+        ]
+        mock_adls.AzureDLFileSystem.return_value = mock_fs
+
+        client = AdlsGen1Client("test-account")
+        est_bytes, contrib = client.estimate_bytes("/shares/test/data.ss", 4096)
+
+        assert est_bytes == 4096 + 50_000_000 + 48_000_000
+        assert len(contrib) == 2
+        assert "/shares/test/data/part-00000.du" in contrib
+        assert "/shares/test/data/part-00001.du" in contrib
+
+    @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
+    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
+    def test_ssv5_with_delta_subfolder(self, mock_cred, mock_adls):
+        """SSv5 with delta updates — recursive listing includes subdirs."""
+        mock_fs = MagicMock()
+        mock_fs.info.return_value = {"type": "DIRECTORY"}
+
+        def mock_ls(path, detail=True):
+            return {
+                "/shares/test/data": [
+                    {
+                        "name": "/shares/test/data/part-00000.du",
+                        "type": "FILE",
+                        "length": 50_000_000,
+                    },
+                    {"name": "/shares/test/data/delta-0", "type": "DIRECTORY"},
+                ],
+                "/shares/test/data/delta-0": [
+                    {
+                        "name": "/shares/test/data/delta-0/part-00000.du",
+                        "type": "FILE",
+                        "length": 1_000_000,
+                    },
+                ],
+            }[path]
+
+        mock_fs.ls.side_effect = mock_ls
+        mock_adls.AzureDLFileSystem.return_value = mock_fs
+
+        client = AdlsGen1Client("test-account")
+        est_bytes, contrib = client.estimate_bytes("/shares/test/data.ss", 4096)
+
+        assert est_bytes == 4096 + 50_000_000 + 1_000_000
+        assert len(contrib) == 2
+
+    @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
+    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
+    def test_empty_sibling_folder(self, mock_cred, mock_adls):
+        """Empty sibling folder → returns (manifest_size, [])."""
+        mock_fs = MagicMock()
+        mock_fs.info.return_value = {"type": "DIRECTORY"}
+        mock_fs.ls.return_value = []
+        mock_adls.AzureDLFileSystem.return_value = mock_fs
+
+        client = AdlsGen1Client("test-account")
+        est_bytes, contrib = client.estimate_bytes("/shares/test/data.ss", 2048)
+
+        assert est_bytes == 2048
+        assert contrib == []
+
+    def test_invalid_extension_raises_valueerror(self):
+        client = AdlsGen1Client.__new__(AdlsGen1Client)
+        with pytest.raises(ValueError, match=r"must end with '\.ss'"):
+            client.estimate_bytes("/shares/test/data.parquet", 100)
+
+
+class TestEnrichWithEstimates:
+    """Tests for enrich_with_estimates — bulk enrichment of FileInfo lists."""
+
+    @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
+    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
+    def test_enriches_all_files(self, mock_cred, mock_adls):
+        mock_fs = MagicMock()
+        # No sibling folders (SSv3/v4 for both)
+        mock_fs.info.side_effect = FileNotFoundError("not found")
+        mock_adls.AzureDLFileSystem.return_value = mock_fs
+
+        client = AdlsGen1Client("test-account")
+        files = [
+            FileInfo(
+                path="/shares/test/a.ss",
+                name="a.ss",
+                length=1000,
+                modification_time=datetime(2026, 4, 1, tzinfo=timezone.utc),
+            ),
+            FileInfo(
+                path="/shares/test/b.ss",
+                name="b.ss",
+                length=2000,
+                modification_time=datetime(2026, 4, 2, tzinfo=timezone.utc),
+            ),
+        ]
+
+        enriched = client.enrich_with_estimates(files)
+        assert len(enriched) == 2
+        assert enriched[0].estimated_bytes == 1000
+        assert enriched[0].contributing_files == ()
+        assert enriched[1].estimated_bytes == 2000
+        assert enriched[1].contributing_files == ()
+
+    @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
+    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
+    def test_enriches_ssv5_files(self, mock_cred, mock_adls):
+        mock_fs = MagicMock()
+        mock_fs.info.return_value = {"type": "DIRECTORY"}
+        mock_fs.ls.return_value = [
+            {"name": "/shares/test/a/part-00000.du", "type": "FILE", "length": 5_000_000},
+        ]
+        mock_adls.AzureDLFileSystem.return_value = mock_fs
+
+        client = AdlsGen1Client("test-account")
+        files = [
+            FileInfo(
+                path="/shares/test/a.ss",
+                name="a.ss",
+                length=4096,
+                modification_time=datetime(2026, 4, 1, tzinfo=timezone.utc),
+            ),
+        ]
+
+        enriched = client.enrich_with_estimates(files)
+        assert enriched[0].estimated_bytes == 4096 + 5_000_000
+        assert enriched[0].contributing_files == ("/shares/test/a/part-00000.du",)
+
+    def test_empty_list_returns_empty(self):
+        client = AdlsGen1Client.__new__(AdlsGen1Client)
+        assert client.enrich_with_estimates([]) == []
+
+    @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
+    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
+    def test_fallback_on_error(self, mock_cred, mock_adls):
+        """If estimate_bytes fails for a file, fall back to file length."""
+        mock_fs = MagicMock()
+        mock_fs.info.side_effect = Exception("network error")
+        mock_adls.AzureDLFileSystem.return_value = mock_fs
+
+        client = AdlsGen1Client("test-account")
+        files = [
+            FileInfo(
+                path="/shares/test/bad.ss",
+                name="bad.ss",
+                length=999,
+                modification_time=datetime(2026, 4, 1, tzinfo=timezone.utc),
+            ),
+        ]
+
+        enriched = client.enrich_with_estimates(files)
+        assert enriched[0].estimated_bytes == 999
+        assert enriched[0].contributing_files == ()

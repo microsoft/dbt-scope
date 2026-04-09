@@ -17,6 +17,7 @@ from dbt.adapters.events.logging import AdapterLogger
 
 from dbt.adapters.scope.checkpoint import VIRTUAL_COLUMNS
 from dbt.adapters.scope.constants import (
+    DEFAULT_MAX_BYTES_PER_TRIGGER,
     DEFAULT_MAX_FILES_PER_TRIGGER,
     DEFAULT_SAFETY_BUFFER_SECONDS,
 )
@@ -56,6 +57,7 @@ class ScriptConfig:
     source_roots: list[str] = field(default_factory=list)
     source_patterns: list[str] = field(default_factory=list)
     max_files_per_trigger: int = DEFAULT_MAX_FILES_PER_TRIGGER
+    max_bytes_per_trigger: int = DEFAULT_MAX_BYTES_PER_TRIGGER
     safety_buffer_seconds: int = DEFAULT_SAFETY_BUFFER_SECONDS
     adls_gen1_account: str = ""
 
