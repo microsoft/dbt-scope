@@ -109,10 +109,8 @@ class FileLock:
                 sleep_time = min(delay * (1 + random.random()), 2.0)
                 if attempt % 20 == 0:
                     log.debug(
-                        "File lock contention on %s, attempt %d, sleeping %.2fs",
-                        str(self.lock_path),
-                        attempt,
-                        sleep_time,
+                        f"File lock contention on {self.lock_path!s}, "
+                        f"attempt {attempt}, sleeping {sleep_time:.2f}s"
                     )
                 time.sleep(sleep_time)
                 delay = min(delay * 1.5, 2.0)

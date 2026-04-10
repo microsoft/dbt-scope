@@ -19,7 +19,6 @@ from dbt.adapters.scope.column import ScopeColumn
 from dbt.adapters.scope.connections import ScopeConnectionHandle, ScopeConnectionManager
 from dbt.adapters.scope.constants import (
     DEFAULT_MAX_BYTES_PER_TRIGGER,
-    DEFAULT_MAX_FILES_PER_TRIGGER,
     DEFAULT_SAFETY_BUFFER_SECONDS,
     DEFAULT_SOURCE_COMPACTION_INTERVAL,
     DEFAULT_SOURCE_RETENTION_FILES,
@@ -239,10 +238,8 @@ class ScopeAdapter(BaseAdapter):
 
             t_start = time.monotonic()
             log.debug(
-                "list_relations: scanning %s/%s/%s for Delta tables",
-                creds.storage_account,
-                creds.container,
-                creds.delta_base_path,
+                f"list_relations: scanning {creds.storage_account}/{creds.container}/"
+                f"{creds.delta_base_path} for Delta tables"
             )
 
             credential = LockedTokenCredential(AzureCliCredential())
@@ -260,9 +257,7 @@ class ScopeAdapter(BaseAdapter):
             ]
             elapsed_ms = (time.monotonic() - t0) * 1000
             log.debug(
-                "list_relations: get_paths found %d directories in %.1f ms",
-                len(dirs),
-                elapsed_ms,
+                f"list_relations: get_paths found {len(dirs)} directories in {elapsed_ms:.1f} ms"
             )
 
             relations: list[ScopeRelation] = []
@@ -282,28 +277,18 @@ class ScopeAdapter(BaseAdapter):
                     )
                     elapsed_ms = (time.monotonic() - t0) * 1000
                     log.debug(
-                        "list_relations: [%d/%d] %s — Delta table found in %.1f ms",
-                        i + 1,
-                        len(dirs),
-                        table_name,
-                        elapsed_ms,
+                        f"list_relations: [{i + 1}/{len(dirs)}] {table_name} — "
+                        f"Delta table found in {elapsed_ms:.1f} ms"
                     )
                 except Exception:
                     elapsed_ms = (time.monotonic() - t0) * 1000
                     log.debug(
-                        "list_relations: [%d/%d] %s — not a Delta table (%.1f ms)",
-                        i + 1,
-                        len(dirs),
-                        table_name,
-                        elapsed_ms,
+                        f"list_relations: [{i + 1}/{len(dirs)}] {table_name} — "
+                        f"not a Delta table ({elapsed_ms:.1f} ms)"
                     )
 
             total_ms = (time.monotonic() - t_start) * 1000
-            log.debug(
-                "list_relations: found %d Delta tables in %.1f ms",
-                len(relations),
-                total_ms,
-            )
+            log.debug(f"list_relations: found {len(relations)} Delta tables in {total_ms:.1f} ms")
             return relations
         except Exception:
             log.debug(f"No Delta tables found at {creds.delta_base_path} (path may not exist yet)")
@@ -427,8 +412,8 @@ class ScopeAdapter(BaseAdapter):
             effective_watermark = Watermark(modified_time=starting_ts_dt.isoformat())
             used_starting_timestamp = True
             log.debug(
-                "No checkpoint found — using starting_timestamp=%s as initial offset",
-                starting_timestamp,
+                f"No checkpoint found — using starting_timestamp={starting_timestamp} "
+                f"as initial offset"
             )
         else:
             effective_watermark = None
@@ -458,6 +443,13 @@ class ScopeAdapter(BaseAdapter):
 
         # Sort by modification_time to maintain deterministic ordering
         all_unprocessed.sort(key=lambda f: f.modification_time)
+
+        log.debug(
+            f"discover_files: {len(all_unprocessed)} unprocessed files, "
+            f"limits: max_files_per_trigger={max_files_per_trigger}, "
+            f"max_bytes_per_trigger={_format_bytes(max_bytes_per_trigger)} "
+            f"({max_bytes_per_trigger:,} bytes)"
+        )
 
         # Enrich with byte estimates (SSv5/v6 sibling folder detection)
         all_unprocessed = self._get_gen1_client().enrich_with_estimates(all_unprocessed)
@@ -648,10 +640,10 @@ class ScopeAdapter(BaseAdapter):
             source_roots=model_config.get("source_roots", []),
             source_patterns=model_config.get("source_patterns", []),
             max_files_per_trigger=model_config.get(
-                "max_files_per_trigger", DEFAULT_MAX_FILES_PER_TRIGGER
+                "max_files_per_trigger", creds.max_files_per_trigger
             ),
             max_bytes_per_trigger=model_config.get(
-                "max_bytes_per_trigger", DEFAULT_MAX_BYTES_PER_TRIGGER
+                "max_bytes_per_trigger", creds.max_bytes_per_trigger
             ),
             safety_buffer_seconds=model_config.get(
                 "safety_buffer_seconds", DEFAULT_SAFETY_BUFFER_SECONDS

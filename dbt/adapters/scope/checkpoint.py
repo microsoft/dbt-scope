@@ -108,10 +108,9 @@ class CheckpointManager:
             raw = download.readall().decode("utf-8")
             watermark = Watermark.from_json(raw)
             log.debug(
-                "Read watermark: version=%d, modified_time=%s, batch_id=%d",
-                watermark.version,
-                watermark.modified_time,
-                watermark.batch_id,
+                f"Read watermark: version={watermark.version}, "
+                f"modified_time={watermark.modified_time}, "
+                f"batch_id={watermark.batch_id}"
             )
             return watermark
         except Exception:
@@ -139,11 +138,9 @@ class CheckpointManager:
             file_client.upload_data(data, overwrite=True)
 
             log.debug(
-                "Wrote watermark: version=%d, modified_time=%s, batch_id=%d → %s",
-                watermark.version,
-                watermark.modified_time,
-                watermark.batch_id,
-                delta_location,
+                f"Wrote watermark: version={watermark.version}, "
+                f"modified_time={watermark.modified_time}, "
+                f"batch_id={watermark.batch_id} → {delta_location}"
             )
         except Exception:
             log.error(f"write_watermark failed for {delta_location}")
@@ -225,11 +222,9 @@ class CheckpointManager:
                 self._write_jsonl(fs, sources_dir, batch_id, batch_records)
 
             log.debug(
-                "Wrote sources batch %d (%d files, %s) → %s",
-                batch_id,
-                len(file_paths),
-                "parquet snapshot" if is_compaction else "jsonl diff",
-                delta_location,
+                f"Wrote sources batch {batch_id} ({len(file_paths)} files, "
+                f"{'parquet snapshot' if is_compaction else 'jsonl diff'}) → "
+                f"{delta_location}"
             )
         except Exception:
             log.error(f"write_batch_sources failed for batch {batch_id}")
@@ -378,11 +373,7 @@ class CheckpointManager:
         file_client.upload_data(parquet_data, overwrite=True)
         os.remove(parquet_local)
 
-        log.debug(
-            "Wrote snapshot %d.parquet (%d total records)",
-            batch_id,
-            len(all_records),
-        )
+        log.debug(f"Wrote snapshot {batch_id}.parquet ({len(all_records)} total records)")
 
     def cleanup_sources(
         self,
@@ -435,10 +426,7 @@ class CheckpointManager:
                     log.warning(f"Failed to delete source file: {full_path}")
 
             log.debug(
-                "cleanup_sources: deleted %d files (was %d, limit %d)",
-                deleted,
-                len(files),
-                max_files,
+                f"cleanup_sources: deleted {deleted} files (was {len(files)}, limit {max_files})"
             )
             return deleted
         except Exception:

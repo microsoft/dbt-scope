@@ -27,6 +27,16 @@ from dbt.adapters.scope.constants import (
 log = AdapterLogger("scope")
 
 
+def _format_bytes(size: int | float) -> str:
+    """Compact human-readable byte size for log messages."""
+    s = float(size)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(s) < 1024:
+            return f"{s:.1f} {unit}"
+        s /= 1024
+    return f"{s:.1f} PB"
+
+
 class FileTracker:
     """Discover and batch unprocessed source files for SCOPE ingestion."""
 
@@ -71,11 +81,10 @@ class FileTracker:
             unprocessed.append(f)
 
         log.debug(
-            "Discovered %d unprocessed files (total=%d, watermark=%s, cutoff=%s)",
-            len(unprocessed),
-            len(all_files),
-            watermark.modified_time if watermark else "none",
-            cutoff.isoformat(),
+            f"Discovered {len(unprocessed)} unprocessed files "
+            f"(total={len(all_files)}, "
+            f"watermark={watermark.modified_time if watermark else 'none'}, "
+            f"cutoff={cutoff.isoformat()})"
         )
         return unprocessed
 
@@ -110,10 +119,11 @@ class FileTracker:
             cumulative_bytes += file_bytes
 
         log.debug(
-            "Next batch: %d files, %d estimated bytes (of %d remaining)",
-            len(batch),
-            cumulative_bytes,
-            len(files),
+            f"Next batch: {len(batch)} files, "
+            f"{_format_bytes(cumulative_bytes)} estimated "
+            f"(of {len(files)} remaining, "
+            f"limits: {max_files_per_trigger} files / "
+            f"{_format_bytes(max_bytes_per_trigger)})"
         )
         return batch
 

@@ -265,11 +265,10 @@ class AdlsGen1Client:
         contributing_paths = [f["name"] for f in files_in_folder]
 
         log.debug(
-            "estimate_bytes: %s → SSv5/v6 (%d contributing files, %s folder + %s manifest)",
-            ss_path.rsplit("/", 1)[-1],
-            len(contributing_paths),
-            _format_bytes_simple(folder_total),
-            _format_bytes_simple(ss_length),
+            f"estimate_bytes: {ss_path.rsplit('/', 1)[-1]} → SSv5/v6 "
+            f"({len(contributing_paths)} contributing files, "
+            f"{_format_bytes_simple(folder_total)} folder + "
+            f"{_format_bytes_simple(ss_length)} manifest)"
         )
         return ss_length + folder_total, contributing_paths
 
@@ -296,15 +295,11 @@ class AdlsGen1Client:
                     )
                 )
             except Exception:
-                log.warning("Failed to estimate bytes for %s — using file length", f.path)
+                log.warning(f"Failed to estimate bytes for {f.path} — using file length")
                 enriched.append(replace(f, estimated_bytes=f.length))
 
         elapsed_ms = (time.monotonic() - t0) * 1000
-        log.debug(
-            "enrich_with_estimates: %d files enriched in %.1f ms",
-            len(enriched),
-            elapsed_ms,
-        )
+        log.debug(f"enrich_with_estimates: {len(enriched)} files enriched in {elapsed_ms:.1f} ms")
         return enriched
 
     @staticmethod
@@ -316,7 +311,7 @@ class AdlsGen1Client:
         except FileNotFoundError:
             return False
         except Exception:
-            log.debug("_directory_exists: error checking %s — assuming not exists", path)
+            log.debug(f"_directory_exists: error checking {path} — assuming not exists")
             return False
 
     @staticmethod
@@ -335,7 +330,7 @@ class AdlsGen1Client:
             except FileNotFoundError:
                 continue
             except Exception:
-                log.debug("_list_directory_files: failed to list %s — skipping", current)
+                log.debug(f"_list_directory_files: failed to list {current} — skipping")
                 continue
 
             for entry in entries:

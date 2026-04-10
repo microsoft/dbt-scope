@@ -111,10 +111,8 @@ class ScriptBuilder:
           6. INSERT INTO target from user's SELECT
         """
         log.debug(
-            "Building full-refresh script for %s → %s (%d files)",
-            config.table_name,
-            config.resolved_delta_location,
-            len(config.source_files),
+            f"Building full-refresh script for {config.table_name} → "
+            f"{config.resolved_delta_location} ({len(config.source_files)} files)"
         )
         parts: list[str] = []
         delta_loc = config.resolved_delta_location
@@ -149,9 +147,8 @@ class ScriptBuilder:
           5. INSERT INTO target from user's SELECT
         """
         log.debug(
-            "Building incremental script for %s (%d files)",
-            config.table_name,
-            len(config.source_files),
+            f"Building incremental script for {config.table_name} "
+            f"({len(config.source_files)} files)"
         )
         parts: list[str] = []
         delta_loc = config.resolved_delta_location

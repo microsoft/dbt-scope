@@ -24,6 +24,8 @@ class ScopeCredentials(Credentials):
               delta_base_path: delta
               au: 100
               priority: 1
+              max_files_per_trigger: 50
+              max_bytes_per_trigger: 10737418240000  # ~10 TB
     """
 
     adla_account: str = ""
@@ -35,6 +37,8 @@ class ScopeCredentials(Credentials):
     priority: int = 1
     poll_interval_seconds: int = 5
     max_wait_seconds: int = 3600
+    max_files_per_trigger: int = 50
+    max_bytes_per_trigger: int = 10_737_418_240_000  # ~10 TB
     http_timeout_seconds: int = 30
     http_retries: int = 3
     scope_feature_previews: str | None = "EnableDeltaTableDynamicInsert:on"
@@ -56,4 +60,6 @@ class ScopeCredentials(Credentials):
             "adls_gen1_account",
             "au",
             "priority",
+            "max_files_per_trigger",
+            "max_bytes_per_trigger",
         )
