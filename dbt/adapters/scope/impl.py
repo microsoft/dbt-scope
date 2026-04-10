@@ -8,6 +8,7 @@ from typing import Any
 
 import agate
 import pandas as pd
+import tabulate as tabulate_lib
 from dbt.adapters.base import BaseAdapter, available
 from dbt.adapters.events.logging import AdapterLogger
 from dbt_common.exceptions import DbtRuntimeError
@@ -16,6 +17,12 @@ from dbt.adapters.scope.adls_gen1_client import AdlsGen1Client, FileInfo
 from dbt.adapters.scope.checkpoint import CheckpointManager, Watermark
 from dbt.adapters.scope.column import ScopeColumn
 from dbt.adapters.scope.connections import ScopeConnectionHandle, ScopeConnectionManager
+from dbt.adapters.scope.constants import (
+    DEFAULT_MAX_BYTES_PER_TRIGGER,
+    DEFAULT_SAFETY_BUFFER_SECONDS,
+    DEFAULT_SOURCE_COMPACTION_INTERVAL,
+    DEFAULT_SOURCE_RETENTION_FILES,
+)
 from dbt.adapters.scope.credentials import ScopeCredentials
 from dbt.adapters.scope.file_tracker import FileTracker
 from dbt.adapters.scope.relation import ScopeRelation
@@ -49,11 +56,14 @@ def _format_bytes(size: int | float | None) -> str:
     return f"{s:.2f} PB"
 
 
-def _pretty_print_file_batch(files: list[FileInfo]) -> str:
-    """Build a pretty-printed table of file metadata for debug logging."""
+def _build_file_df(files: list[FileInfo]) -> pd.DataFrame | None:
+    """Build a DataFrame of file metadata from FileInfo objects.
+
+    Returns ``None`` if no raw metadata is available.
+    """
     raw_entries = [f.raw for f in files if f.raw]
     if not raw_entries:
-        return f"  ({len(files)} files — no raw metadata available)"
+        return None
 
     df = pd.DataFrame(raw_entries)
 
@@ -68,7 +78,47 @@ def _pretty_print_file_batch(files: list[FileInfo]) -> str:
         if col in df.columns:
             df[f"{col}_fmt"] = df[col].apply(_format_bytes)
 
-    return df.to_string(index=False)
+    # Byte-estimation columns from enriched FileInfo
+    files_with_raw = [f for f in files if f.raw]
+    df["estimatedBytes"] = [
+        f.estimated_bytes if f.estimated_bytes is not None else f.length for f in files_with_raw
+    ]
+    df["estimatedBytes_fmt"] = df["estimatedBytes"].apply(_format_bytes)
+    df["contributingFiles"] = [list(f.contributing_files) for f in files_with_raw]
+
+    return df
+
+
+def _tabulate_df(df: pd.DataFrame) -> str:
+    """Render a DataFrame as a psql-formatted table via tabulate."""
+    return tabulate_lib.tabulate(df, headers="keys", tablefmt="psql", showindex=False)
+
+
+def _pretty_print_file_tables(
+    batch: list[FileInfo],
+    backlog: list[FileInfo],
+) -> str:
+    """Build pretty-printed tables for the current batch and backlog."""
+    parts: list[str] = []
+
+    batch_df = _build_file_df(batch)
+    if batch_df is not None:
+        parts.append(f"=== CURRENT BATCH ({len(batch)} files) ===")
+        parts.append(_tabulate_df(batch_df))
+    else:
+        parts.append(f"=== CURRENT BATCH ({len(batch)} files — no raw metadata) ===")
+
+    if backlog:
+        backlog_df = _build_file_df(backlog)
+        if backlog_df is not None:
+            parts.append(f"\n=== BACKLOG ({len(backlog)} files remaining) ===")
+            parts.append(_tabulate_df(backlog_df))
+        else:
+            parts.append(f"\n=== BACKLOG ({len(backlog)} files — no raw metadata) ===")
+    else:
+        parts.append("\n=== BACKLOG (0 files remaining) ===")
+
+    return "\n".join(parts)
 
 
 def _parse_starting_timestamp(value: str) -> datetime:
@@ -91,6 +141,23 @@ def _parse_starting_timestamp(value: str) -> datetime:
         )
 
     return dt.astimezone(timezone.utc)
+
+
+def _count_batches(
+    files: list[FileInfo],
+    max_files_per_trigger: int,
+    max_bytes_per_trigger: int,
+) -> int:
+    """Simulate batching to count total batches without consuming the file list."""
+    remaining = files
+    count = 0
+    while remaining:
+        batch = FileTracker.get_next_batch(remaining, max_files_per_trigger, max_bytes_per_trigger)
+        if not batch:
+            break
+        count += 1
+        remaining = remaining[len(batch) :]
+    return count
 
 
 class ScopeAdapter(BaseAdapter):
@@ -171,10 +238,8 @@ class ScopeAdapter(BaseAdapter):
 
             t_start = time.monotonic()
             log.debug(
-                "list_relations: scanning %s/%s/%s for Delta tables",
-                creds.storage_account,
-                creds.container,
-                creds.delta_base_path,
+                f"list_relations: scanning {creds.storage_account}/{creds.container}/"
+                f"{creds.delta_base_path} for Delta tables"
             )
 
             credential = LockedTokenCredential(AzureCliCredential())
@@ -192,9 +257,7 @@ class ScopeAdapter(BaseAdapter):
             ]
             elapsed_ms = (time.monotonic() - t0) * 1000
             log.debug(
-                "list_relations: get_paths found %d directories in %.1f ms",
-                len(dirs),
-                elapsed_ms,
+                f"list_relations: get_paths found {len(dirs)} directories in {elapsed_ms:.1f} ms"
             )
 
             relations: list[ScopeRelation] = []
@@ -214,28 +277,18 @@ class ScopeAdapter(BaseAdapter):
                     )
                     elapsed_ms = (time.monotonic() - t0) * 1000
                     log.debug(
-                        "list_relations: [%d/%d] %s — Delta table found in %.1f ms",
-                        i + 1,
-                        len(dirs),
-                        table_name,
-                        elapsed_ms,
+                        f"list_relations: [{i + 1}/{len(dirs)}] {table_name} — "
+                        f"Delta table found in {elapsed_ms:.1f} ms"
                     )
                 except Exception:
                     elapsed_ms = (time.monotonic() - t0) * 1000
                     log.debug(
-                        "list_relations: [%d/%d] %s — not a Delta table (%.1f ms)",
-                        i + 1,
-                        len(dirs),
-                        table_name,
-                        elapsed_ms,
+                        f"list_relations: [{i + 1}/{len(dirs)}] {table_name} — "
+                        f"not a Delta table ({elapsed_ms:.1f} ms)"
                     )
 
             total_ms = (time.monotonic() - t_start) * 1000
-            log.debug(
-                "list_relations: found %d Delta tables in %.1f ms",
-                len(relations),
-                total_ms,
-            )
+            log.debug(f"list_relations: found {len(relations)} Delta tables in {total_ms:.1f} ms")
             return relations
         except Exception:
             log.debug(f"No Delta tables found at {creds.delta_base_path} (path may not exist yet)")
@@ -308,6 +361,11 @@ class ScopeAdapter(BaseAdapter):
         handle._next_job_priority = priority
 
     @available
+    def get_total_batches(self) -> int:
+        """Return the total batch count computed by the last ``discover_files`` call."""
+        return getattr(self, "_last_total_batches", 0)
+
+    @available
     def set_next_job_max_wait(self, max_wait: int) -> None:
         """Set the poll timeout for the next ``execute()`` call on this thread."""
         connection = self.connections.get_thread_connection()
@@ -321,8 +379,9 @@ class ScopeAdapter(BaseAdapter):
         source_patterns: list[str],
         max_files_per_trigger: int,
         delta_location: str,
-        safety_buffer_seconds: int = 30,
+        safety_buffer_seconds: int = DEFAULT_SAFETY_BUFFER_SECONDS,
         starting_timestamp: str | None = None,
+        max_bytes_per_trigger: int = DEFAULT_MAX_BYTES_PER_TRIGGER,
     ) -> list[str]:
         """Discover unprocessed source files and return a batch of file paths.
 
@@ -330,7 +389,8 @@ class ScopeAdapter(BaseAdapter):
         of *source_roots* x *source_patterns*:
           1. For each (root, pattern): read watermark, LIST + filter files
           2. Union results and deduplicate by file path
-          3. Return up to *max_files_per_trigger* file paths
+          3. Enrich with byte estimates (SSv5/v6 sibling folder detection)
+          4. Return files bounded by *max_files_per_trigger* and *max_bytes_per_trigger*
 
         If *starting_timestamp* is provided (ISO-8601 UTC) and no checkpoint
         exists, only files modified after that timestamp are considered.  When
@@ -352,8 +412,8 @@ class ScopeAdapter(BaseAdapter):
             effective_watermark = Watermark(modified_time=starting_ts_dt.isoformat())
             used_starting_timestamp = True
             log.debug(
-                "No checkpoint found — using starting_timestamp=%s as initial offset",
-                starting_timestamp,
+                f"No checkpoint found — using starting_timestamp={starting_timestamp} "
+                f"as initial offset"
             )
         else:
             effective_watermark = None
@@ -383,14 +443,34 @@ class ScopeAdapter(BaseAdapter):
 
         # Sort by modification_time to maintain deterministic ordering
         all_unprocessed.sort(key=lambda f: f.modification_time)
-        batch = FileTracker.get_next_batch(all_unprocessed, max_files_per_trigger)
+
+        log.debug(
+            f"discover_files: {len(all_unprocessed)} unprocessed files, "
+            f"limits: max_files_per_trigger={max_files_per_trigger}, "
+            f"max_bytes_per_trigger={_format_bytes(max_bytes_per_trigger)} "
+            f"({max_bytes_per_trigger:,} bytes)"
+        )
+
+        # Enrich with byte estimates (SSv5/v6 sibling folder detection)
+        all_unprocessed = self._get_gen1_client().enrich_with_estimates(all_unprocessed)
+
+        # Pre-compute total batch count from the full unprocessed list
+        self._last_total_batches = _count_batches(
+            all_unprocessed, max_files_per_trigger, max_bytes_per_trigger
+        )
+
+        batch = FileTracker.get_next_batch(
+            all_unprocessed, max_files_per_trigger, max_bytes_per_trigger
+        )
 
         log.debug(
             f"discover_files: roots={source_roots}, patterns={source_patterns}, "
-            f"unprocessed={len(all_unprocessed)}, batch={len(batch)}"
+            f"unprocessed={len(all_unprocessed)}, batch={len(batch)}, "
+            f"total_batches={self._last_total_batches}"
         )
         if batch:
-            log.debug(f"Batch file metadata:\n{_pretty_print_file_batch(batch)}")
+            backlog = all_unprocessed[len(batch) :]
+            log.debug(f"File discovery results:\n{_pretty_print_file_tables(batch, backlog)}")
         return [f.path for f in batch]
 
     @staticmethod
@@ -422,8 +502,8 @@ class ScopeAdapter(BaseAdapter):
         source_roots: list[str],
         source_patterns: list[str],
         file_paths: list[str],
-        source_compaction_interval: int = 10,
-        source_retention_files: int = 100,
+        source_compaction_interval: int = DEFAULT_SOURCE_COMPACTION_INTERVAL,
+        source_retention_files: int = DEFAULT_SOURCE_RETENTION_FILES,
     ) -> None:
         """Update the watermark checkpoint after a successful SCOPE job.
 
@@ -487,7 +567,7 @@ class ScopeAdapter(BaseAdapter):
         source_roots: list[str],
         source_patterns: list[str],
         delta_location: str,
-        safety_buffer_seconds: int = 30,
+        safety_buffer_seconds: int = DEFAULT_SAFETY_BUFFER_SECONDS,
         starting_timestamp: str | None = None,
     ) -> bool:
         """Are there unprocessed files at the source?"""
@@ -559,8 +639,15 @@ class ScopeAdapter(BaseAdapter):
             partition_by=model_config.get("partition_by"),
             source_roots=model_config.get("source_roots", []),
             source_patterns=model_config.get("source_patterns", []),
-            max_files_per_trigger=model_config.get("max_files_per_trigger", 50),
-            safety_buffer_seconds=model_config.get("safety_buffer_seconds", 30),
+            max_files_per_trigger=model_config.get(
+                "max_files_per_trigger", creds.max_files_per_trigger
+            ),
+            max_bytes_per_trigger=model_config.get(
+                "max_bytes_per_trigger", creds.max_bytes_per_trigger
+            ),
+            safety_buffer_seconds=model_config.get(
+                "safety_buffer_seconds", DEFAULT_SAFETY_BUFFER_SECONDS
+            ),
             adls_gen1_account=model_config.get("adls_gen1_account", creds.adls_gen1_account),
             scope_settings=model_config.get("scope_settings", {}),
             feature_previews=creds.scope_feature_previews or "EnableDeltaTableDynamicInsert:on",

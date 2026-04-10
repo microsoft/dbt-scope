@@ -7,7 +7,7 @@ the per-file processing loop:
 1. LIST all files matching the regex pattern on ADLS Gen1
 2. Filter out already-processed files (modificationTime <= watermark)
 3. Apply safety buffer (skip files modified within last N seconds)
-4. Return batches of up to ``max_files_per_trigger`` files
+4. Return batches bounded by ``max_files_per_trigger`` and ``max_bytes_per_trigger``
 """
 
 from __future__ import annotations
@@ -18,11 +18,23 @@ from dbt.adapters.events.logging import AdapterLogger
 
 from dbt.adapters.scope.adls_gen1_client import AdlsGen1Client, FileInfo
 from dbt.adapters.scope.checkpoint import CheckpointManager, Watermark
+from dbt.adapters.scope.constants import (
+    DEFAULT_MAX_BYTES_PER_TRIGGER,
+    DEFAULT_MAX_FILES_PER_TRIGGER,
+    DEFAULT_SAFETY_BUFFER_SECONDS,
+)
 
 log = AdapterLogger("scope")
 
-DEFAULT_SAFETY_BUFFER_SECONDS = 30
-DEFAULT_MAX_FILES_PER_TRIGGER = 50
+
+def _format_bytes(size: int | float) -> str:
+    """Compact human-readable byte size for log messages."""
+    s = float(size)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(s) < 1024:
+            return f"{s:.1f} {unit}"
+        s /= 1024
+    return f"{s:.1f} PB"
 
 
 class FileTracker:
@@ -69,11 +81,10 @@ class FileTracker:
             unprocessed.append(f)
 
         log.debug(
-            "Discovered %d unprocessed files (total=%d, watermark=%s, cutoff=%s)",
-            len(unprocessed),
-            len(all_files),
-            watermark.modified_time if watermark else "none",
-            cutoff.isoformat(),
+            f"Discovered {len(unprocessed)} unprocessed files "
+            f"(total={len(all_files)}, "
+            f"watermark={watermark.modified_time if watermark else 'none'}, "
+            f"cutoff={cutoff.isoformat()})"
         )
         return unprocessed
 
@@ -81,13 +92,38 @@ class FileTracker:
     def get_next_batch(
         files: list[FileInfo],
         max_files_per_trigger: int = DEFAULT_MAX_FILES_PER_TRIGGER,
+        max_bytes_per_trigger: int = DEFAULT_MAX_BYTES_PER_TRIGGER,
     ) -> list[FileInfo]:
-        """Take the first *max_files_per_trigger* files from the sorted list."""
-        batch = files[:max_files_per_trigger]
+        """Take files from the sorted list until a limit is reached.
+
+        Both ``max_files_per_trigger`` and ``max_bytes_per_trigger`` apply
+        (whichever is hit first).  At least one file is always included to
+        prevent infinite stalls when a single file exceeds the byte limit.
+
+        Uses ``estimated_bytes`` when available, falling back to ``length``.
+        """
+        batch: list[FileInfo] = []
+        cumulative_bytes = 0
+
+        for f in files:
+            file_bytes = f.estimated_bytes if f.estimated_bytes is not None else f.length
+
+            # Always include the first file regardless of byte limit
+            if batch:
+                if len(batch) >= max_files_per_trigger:
+                    break
+                if cumulative_bytes + file_bytes > max_bytes_per_trigger:
+                    break
+
+            batch.append(f)
+            cumulative_bytes += file_bytes
+
         log.debug(
-            "Next batch: %d files (of %d remaining)",
-            len(batch),
-            len(files),
+            f"Next batch: {len(batch)} files, "
+            f"{_format_bytes(cumulative_bytes)} estimated "
+            f"(of {len(files)} remaining, "
+            f"limits: {max_files_per_trigger} files / "
+            f"{_format_bytes(max_bytes_per_trigger)})"
         )
         return batch
 

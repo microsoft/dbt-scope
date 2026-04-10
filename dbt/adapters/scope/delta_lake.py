@@ -136,11 +136,7 @@ class DeltaLakeClient(ABC):
                 return result
             return None
         except Exception:
-            log.debug(
-                "get_max_partition(%s, %s) → None (error)",
-                delta_location,
-                partition_col,
-            )
+            log.debug(f"get_max_partition({delta_location}, {partition_col}) → None (error)")
             return None
 
     def get_columns(self, delta_location: str) -> list[str] | None:
@@ -223,10 +219,8 @@ class DeltaLakeClient(ABC):
             }
         )
         log.debug(
-            "describe_table_files(%s) → %d parquet files, %d partitions",
-            delta_location,
-            len(parquet_paths),
-            len(partitions),
+            f"describe_table_files({delta_location}) → "
+            f"{len(parquet_paths)} parquet files, {len(partitions)} partitions"
         )
         return {"parquet_count": len(parquet_paths), "partitions": partitions}
 

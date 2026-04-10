@@ -7,10 +7,11 @@ used for watermark-based filtering.
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
 from azure.datalake.store import core as adls_core
@@ -22,6 +23,24 @@ from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK, FileLock
 log = AdapterLogger("scope")
 
 
+class _SuppressFileNotFound(logging.Filter):
+    """Reject Azure SDK log records that report a 404 / FileNotFoundError.
+
+    The adapter already catches these exceptions and logs a concise debug
+    message, so the SDK's verbose ERROR (full HTTP headers) is redundant.
+    """
+
+    _KEYWORDS = ("FileNotFoundError", "FileNotFoundException")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(kw in msg for kw in self._KEYWORDS)
+
+
+logging.getLogger("azure.datalake.store").addFilter(_SuppressFileNotFound())
+logging.getLogger("azure.datalake.store.lib").addFilter(_SuppressFileNotFound())
+
+
 @dataclass(frozen=True)
 class FileInfo:
     """Metadata for a single file on ADLS Gen1."""
@@ -31,6 +50,8 @@ class FileInfo:
     length: int
     modification_time: datetime
     raw: dict = field(default_factory=dict, repr=False, compare=False, hash=False)
+    estimated_bytes: int | None = field(default=None, repr=False, compare=False, hash=False)
+    contributing_files: tuple[str, ...] = field(default=(), repr=False, compare=False, hash=False)
 
     @classmethod
     def from_adls_entry(cls, entry: dict) -> FileInfo | None:
@@ -65,7 +86,7 @@ def _list_one_dir(
     try:
         entries = fs.ls(dir_path, detail=True)
     except FileNotFoundError:
-        log.warning(f"Path not found (skipping): {dir_path}")
+        log.debug(f"Path not found (skipping): {dir_path}")
         return [], [], dir_path, depth, (time.monotonic() - t0) * 1000
     except Exception:
         log.warning(f"Failed to list {dir_path} (skipping)")
@@ -133,7 +154,7 @@ class AdlsGen1Client:
             try:
                 raw_entries = fs.ls(root, detail=True)
             except FileNotFoundError:
-                log.warning(f"Path not found: {root}")
+                log.debug(f"Path not found: {root}")
                 return []
             except Exception:
                 log.warning(f"Failed to list {root}")
@@ -210,3 +231,122 @@ class AdlsGen1Client:
 
         log.debug(f"Walk complete: {dirs_done} directories scanned")
         return all_files
+
+    # ------------------------------------------------------------------
+    # Byte estimation for SSv5/v6 structured streams
+    # ------------------------------------------------------------------
+
+    def estimate_bytes(self, ss_path: str, ss_length: int) -> tuple[int, list[str]]:
+        """Estimate total data size of a structured stream file.
+
+        For SSv3/v4 (no sibling folder), the file size IS the data size.
+        For SSv5/v6, a sibling folder contains ``.du`` data files whose
+        sizes must be summed with the manifest.
+
+        Args:
+            ss_path: Full ADLS Gen1 path to a ``.ss`` file.
+            ss_length: Known file size of the ``.ss`` file (avoids re-fetch).
+
+        Returns:
+            Tuple of ``(estimated_total_bytes, contributing_file_paths)``.
+            ``contributing_file_paths`` is empty for SSv3/v4.
+        """
+        if not ss_path.endswith(".ss"):
+            raise ValueError(f"Path must end with '.ss', got: {ss_path}")
+
+        sibling_folder = ss_path[:-3]  # strip ".ss"
+        fs = self._get_fs()
+
+        if not self._directory_exists(sibling_folder, fs):
+            return ss_length, []
+
+        files_in_folder = self._list_directory_files(sibling_folder, fs)
+        folder_total = sum(f["length"] for f in files_in_folder)
+        contributing_paths = [f["name"] for f in files_in_folder]
+
+        log.debug(
+            f"estimate_bytes: {ss_path.rsplit('/', 1)[-1]} → SSv5/v6 "
+            f"({len(contributing_paths)} contributing files, "
+            f"{_format_bytes_simple(folder_total)} folder + "
+            f"{_format_bytes_simple(ss_length)} manifest)"
+        )
+        return ss_length + folder_total, contributing_paths
+
+    def enrich_with_estimates(self, files: list[FileInfo]) -> list[FileInfo]:
+        """Enrich a list of ``FileInfo`` objects with byte estimates.
+
+        Calls :meth:`estimate_bytes` for each file and returns new
+        ``FileInfo`` instances with ``estimated_bytes`` and
+        ``contributing_files`` populated.
+        """
+        if not files:
+            return files
+
+        t0 = time.monotonic()
+        enriched: list[FileInfo] = []
+        for f in files:
+            try:
+                est_bytes, contrib_paths = self.estimate_bytes(f.path, f.length)
+                enriched.append(
+                    replace(
+                        f,
+                        estimated_bytes=est_bytes,
+                        contributing_files=tuple(contrib_paths),
+                    )
+                )
+            except Exception:
+                log.warning(f"Failed to estimate bytes for {f.path} — using file length")
+                enriched.append(replace(f, estimated_bytes=f.length))
+
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        log.debug(f"enrich_with_estimates: {len(enriched)} files enriched in {elapsed_ms:.1f} ms")
+        return enriched
+
+    @staticmethod
+    def _directory_exists(path: str, fs: adls_core.AzureDLFileSystem) -> bool:
+        """Check if a directory exists on ADLS Gen1."""
+        try:
+            info = fs.info(path)
+            return info.get("type") == "DIRECTORY"
+        except FileNotFoundError:
+            return False
+        except Exception:
+            log.debug(f"_directory_exists: error checking {path} — assuming not exists")
+            return False
+
+    @staticmethod
+    def _list_directory_files(
+        dir_path: str,
+        fs: adls_core.AzureDLFileSystem,
+    ) -> list[dict]:
+        """Recursively list all files in a directory, returning raw entries."""
+        all_files: list[dict] = []
+        dirs_to_visit = [dir_path]
+
+        while dirs_to_visit:
+            current = dirs_to_visit.pop()
+            try:
+                entries = fs.ls(current, detail=True)
+            except FileNotFoundError:
+                continue
+            except Exception:
+                log.debug(f"_list_directory_files: failed to list {current} — skipping")
+                continue
+
+            for entry in entries:
+                if entry.get("type") == "DIRECTORY":
+                    dirs_to_visit.append(entry["name"])
+                else:
+                    all_files.append(entry)
+
+        return all_files
+
+
+def _format_bytes_simple(size: int) -> str:
+    """Compact human-readable byte size (used in log messages)."""
+    s = float(size)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(s) < 1024:
+            return f"{s:.1f} {unit}"
+        s /= 1024
+    return f"{s:.1f} PB"

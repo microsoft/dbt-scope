@@ -16,6 +16,11 @@ from typing import Any
 from dbt.adapters.events.logging import AdapterLogger
 
 from dbt.adapters.scope.checkpoint import VIRTUAL_COLUMNS
+from dbt.adapters.scope.constants import (
+    DEFAULT_MAX_BYTES_PER_TRIGGER,
+    DEFAULT_MAX_FILES_PER_TRIGGER,
+    DEFAULT_SAFETY_BUFFER_SECONDS,
+)
 
 log = AdapterLogger("scope")
 
@@ -51,8 +56,9 @@ class ScriptConfig:
     # File-based source configuration (cross-product of roots x patterns)
     source_roots: list[str] = field(default_factory=list)
     source_patterns: list[str] = field(default_factory=list)
-    max_files_per_trigger: int = 50
-    safety_buffer_seconds: int = 30
+    max_files_per_trigger: int = DEFAULT_MAX_FILES_PER_TRIGGER
+    max_bytes_per_trigger: int = DEFAULT_MAX_BYTES_PER_TRIGGER
+    safety_buffer_seconds: int = DEFAULT_SAFETY_BUFFER_SECONDS
     adls_gen1_account: str = ""
 
     # Explicit file paths for EXTRACT FROM (populated by FileTracker)
@@ -105,10 +111,8 @@ class ScriptBuilder:
           6. INSERT INTO target from user's SELECT
         """
         log.debug(
-            "Building full-refresh script for %s → %s (%d files)",
-            config.table_name,
-            config.resolved_delta_location,
-            len(config.source_files),
+            f"Building full-refresh script for {config.table_name} → "
+            f"{config.resolved_delta_location} ({len(config.source_files)} files)"
         )
         parts: list[str] = []
         delta_loc = config.resolved_delta_location
@@ -143,9 +147,8 @@ class ScriptBuilder:
           5. INSERT INTO target from user's SELECT
         """
         log.debug(
-            "Building incremental script for %s (%d files)",
-            config.table_name,
-            len(config.source_files),
+            f"Building incremental script for {config.table_name} "
+            f"({len(config.source_files)} files)"
         )
         parts: list[str] = []
         delta_loc = config.resolved_delta_location

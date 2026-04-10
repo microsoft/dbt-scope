@@ -29,7 +29,7 @@ As a result of this conscious design decision, the adapter **does not** encourag
 ## Key features
 
 - **Clean SQL models** — write `SELECT ... FROM @data`; macros generate `EXTRACT`, `INSERT INTO`
-- **File-based incremental** — the adapter lists source files on ADLS Gen1, filters by watermark, and processes up to `max_files_per_trigger` per SCOPE job. Uses `append` strategy — dbt calls the macro once per `dbt run`, no date-range orchestration needed - this is very similar to Apache Spark [Microbatch based structured streaming](https://spark.apache.org/docs/latest/streaming/getting-started.html)
+- **File-based incremental** — the adapter lists source files on ADLS Gen1, filters by watermark, and processes batches bounded by `max_files_per_trigger` and `max_bytes_per_trigger` per SCOPE job. Uses `append` strategy — dbt calls the macro once per `dbt run`, no date-range orchestration needed - this is very similar to Apache Spark [Microbatch based structured streaming](https://spark.apache.org/docs/latest/streaming/getting-started.html)
 - **Watermark checkpoint** — progress is tracked in `_checkpoint/watermark.json` alongside `_delta_log/`. Re-runs automatically skip already-processed files; full refresh resets the checkpoint
 - **Sources audit trail** — per-batch JSONL diffs record which files were processed. Configurable compaction (parquet snapshots) and retention keep the checkpoint directory bounded - similar once again to Spark structured streaming.
 - **Virtual file metadata** — `source_file_uri`, `source_file_length`, `source_file_created`, `source_file_modified` columns map to `FILE.*()` functions, giving each row lineage back to its source file
@@ -37,17 +37,17 @@ As a result of this conscious design decision, the adapter **does not** encourag
 
 ## How it works
 
-SS files live on ADLS Gen1. The adapter lists files under each `source_roots` entry, filters by each regex in `source_patterns` (cross-product), deduplicates by path, and processes them in batches of up to `max_files_per_trigger`. Each batch becomes a single SCOPE job with an explicit file list in the `EXTRACT FROM` clause. After a successful job, the watermark advances, a sources record is written to `_checkpoint/`, and the next batch is discovered — repeating until all files are processed.
+SS files live on ADLS Gen1. The adapter lists files under each `source_roots` entry, filters by each regex in `source_patterns` (cross-product), deduplicates by path, estimates total data size per file (including SSv5/v6 `.du` sibling folders), and processes them in batches bounded by `max_files_per_trigger` and `max_bytes_per_trigger` (whichever limit is hit first). Each batch becomes a single SCOPE job with an explicit file list in the `EXTRACT FROM` clause. After a successful job, the watermark advances, a sources record is written to `_checkpoint/`, and the next batch is discovered — repeating until all files are processed.
 
 ### How dbt picks which files to process
 
 The adapter discovers unprocessed files using a watermark-based checkpoint stored at `_checkpoint/watermark.json` next to the Delta table's `_delta_log/`:
 
-| Scenario                          | What runs                                                                               |
-| --------------------------------- | --------------------------------------------------------------------------------------- |
-| **First run** or `--full-refresh` | Checkpoint deleted → all matching files processed in batches of `max_files_per_trigger` |
-| **Incremental run**               | Only files with `modification_time` after the watermark are processed                   |
-| **No new files**                  | No-op — watermark stays the same                                                        |
+| Scenario                          | What runs                                                                                                                   |
+| --------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| **First run** or `--full-refresh` | Checkpoint deleted → all matching files processed in batches bounded by `max_files_per_trigger` and `max_bytes_per_trigger` |
+| **Incremental run**               | Only files with `modification_time` after the watermark are processed                                                       |
+| **No new files**                  | No-op — watermark stays the same                                                                                            |
 
 The **safety buffer** (`safety_buffer_seconds`, default 30) skips files modified within the last N seconds to avoid reading partially-written files.
 
@@ -69,7 +69,7 @@ flowchart TB
     subgraph dbt["dbt — file-based append with internal batching loop"]
         direction TB
         Discover["Adapter lists ADLS Gen1 files<br/><i>filter by regex + watermark</i>"]
-        Batch["Take up to max_files_per_trigger<br/><i>oldest-first by modification_time</i>"]
+        Batch["Take batch bounded by<br/>max_files + max_bytes per trigger<br/><i>oldest-first by modification_time</i>"]
         More{"More<br/>files?"}
         Discover --> Batch
     end
@@ -160,13 +160,13 @@ my_project:
       priority: 1
 ```
 
-| dbt concept   | SCOPE concept                                             |
-| ------------- | --------------------------------------------------------- |
-| `database`    | Storage account name                                      |
-| `schema`      | ADLS container                                            |
-| `table`       | Full-refresh: `CREATE TABLE` + `INSERT INTO`              |
+| dbt concept   | SCOPE concept                                                                   |
+| ------------- | ------------------------------------------------------------------------------- |
+| `database`    | Storage account name                                                            |
+| `schema`      | ADLS container                                                                  |
+| `table`       | Full-refresh: `CREATE TABLE` + `INSERT INTO`                                    |
 | `incremental` | File-based append: discover → process → checkpoint, looped until all files done |
-| model SQL     | `SELECT` from `@data` (extracted SS rowset)               |
+| model SQL     | `SELECT` from `@data` (extracted SS rowset)                                     |
 
 ## Usage
 
@@ -179,6 +179,7 @@ my_project:
     source_roots=['/my/cosmos/path/to/MyStream'],
     source_patterns=['.*\\.ss$'],
     max_files_per_trigger=100,
+    max_bytes_per_trigger=10737418240000,  -- 10 TB
     partition_by='event_year_date',
     delta_table_columns=[
         {'name': 'server_name', 'type': 'string'},
@@ -270,19 +271,33 @@ WHERE edition == "Standard"
 
 ### Incremental config reference
 
-| Config                       | Default   | Description                                                                         |
-| ---------------------------- | --------- | ----------------------------------------------------------------------------------- |
-| `source_roots`               | `[]`      | List of ADLS Gen1 root paths to list source files from                              |
-| `source_patterns`            | `[]`      | List of regexes; the adapter discovers files for each root × pattern combo          |
-| `max_files_per_trigger`      | `50`      | Max files per SCOPE job. Larger = fewer jobs; smaller = faster feedback             |
-| `safety_buffer_seconds`      | `30`      | Skip files modified within the last N seconds (avoids partial writes)               |
-| `source_compaction_interval` | `10`      | Every N batches, write a parquet snapshot of all source history                     |
-| `source_retention_files`     | `100`     | Max files in `_checkpoint/sources/` — oldest are deleted first                      |
-| `delta_table_columns`        | `[]`      | Delta table schema (CREATE TABLE). List of `{name, type}` dicts                     |
-| `extract_columns`            | `[]`      | Source file columns (EXTRACT). List of `{name, type}` dicts                         |
-| `partition_by`               | —         | Single column name or list of columns                                               |
+| Config                       | Default                  | Description                                                                                                                                                                            |
+| ---------------------------- | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `source_roots`               | `[]`                     | List of ADLS Gen1 root paths to list source files from                                                                                                                                 |
+| `source_patterns`            | `[]`                     | List of regexes; the adapter discovers files for each root × pattern combo                                                                                                             |
+| `max_files_per_trigger`      | `50`                     | Max files per SCOPE job. Larger = fewer jobs; smaller = faster feedback                                                                                                                |
+| `max_bytes_per_trigger`      | `10737418240000` (10 TB) | Max estimated bytes per batch. Works alongside `max_files_per_trigger` — whichever limit is hit first stops the batch. Estimates account for SSv5/v6 `.du` sibling folders (see below) |
+| `safety_buffer_seconds`      | `30`                     | Skip files modified within the last N seconds (avoids partial writes)                                                                                                                  |
+| `source_compaction_interval` | `10`                     | Every N batches, write a parquet snapshot of all source history                                                                                                                        |
+| `source_retention_files`     | `100`                    | Max files in `_checkpoint/sources/` — oldest are deleted first                                                                                                                         |
+| `delta_table_columns`        | `[]`                     | Delta table schema (CREATE TABLE). List of `{name, type}` dicts                                                                                                                        |
+| `extract_columns`            | `[]`                     | Source file columns (EXTRACT). List of `{name, type}` dicts                                                                                                                            |
+| `partition_by`               | —                        | Single column name or list of columns                                                                                                                                                  |
 
 `dbt retry` re-runs failed batches. `dbt run --full-refresh` resets the checkpoint and reprocesses all files.
+
+### Byte estimation for SSv5/v6 structured streams
+
+When `max_bytes_per_trigger` is in effect, the adapter estimates the true data size of each `.ss` file before batching. This matters because Structured Stream versions differ in storage layout:
+
+| Version     | Layout                                                   | Size estimation                             |
+| ----------- | -------------------------------------------------------- | ------------------------------------------- |
+| **SSv3/v4** | Single `.ss` file — all data inline                      | File size = data size                       |
+| **SSv5/v6** | `.ss` manifest (small) + sibling folder with `.du` files | Manifest size + sum of all `.du` file sizes |
+
+The adapter detects the version by checking if a sibling folder exists (e.g., `MyData.ss` → `MyData/`). For SSv5/v6, it recursively lists the sibling folder — including delta update subdirectories — and sums all file sizes. No binary parsing is involved; detection is purely filesystem-based.
+
+The debug log includes `estimatedBytes` and `contributingFiles` columns in the batch metadata table so you can see the estimated size and which `.du` files contribute to each `.ss` file.
 
 ## Contributing
 

@@ -15,13 +15,15 @@
     ) -%}
 
     {# -- Pull config values -- #}
+    {%- set defaults = scope__config_defaults() -%}
     {%- set delta_location = config.get('delta_location', '') -%}
     {%- set source_roots = config.get('source_roots', []) -%}
     {%- set source_patterns = config.get('source_patterns', ['.*\\.ss$']) -%}
-    {%- set max_files_per_trigger = config.get('max_files_per_trigger', 50) | int -%}
-    {%- set safety_buffer_seconds = config.get('safety_buffer_seconds', 30) | int -%}
-    {%- set source_compaction_interval = config.get('source_compaction_interval', 10) | int -%}
-    {%- set source_retention_files = config.get('source_retention_files', 100) | int -%}
+    {%- set max_files_per_trigger = config.get('max_files_per_trigger', target.max_files_per_trigger) | int -%}
+    {%- set max_bytes_per_trigger = config.get('max_bytes_per_trigger', target.max_bytes_per_trigger) | int -%}
+    {%- set safety_buffer_seconds = config.get('safety_buffer_seconds', defaults.safety_buffer_seconds) | int -%}
+    {%- set source_compaction_interval = config.get('source_compaction_interval', defaults.source_compaction_interval) | int -%}
+    {%- set source_retention_files = config.get('source_retention_files', defaults.source_retention_files) | int -%}
     {%- set starting_timestamp = config.get('starting_timestamp', none) -%}
     {%- set partition_by = config.get('partition_by', none) -%}
     {%- set scope_settings = config.get('scope_settings', {}) -%}
@@ -38,7 +40,7 @@
         batch_num=0,
         total_files=0,
         file_batch=adapter.discover_files(
-            source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds, starting_timestamp
+            source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds, starting_timestamp, max_bytes_per_trigger
         )
     ) -%}
 
@@ -48,6 +50,7 @@
             -- no-op: no source files found
         {%- endcall -%}
     {%- else -%}
+        {%- set total_batches = adapter.get_total_batches() -%}
         {%- for _ in range(1000) -%}
             {%- if ns.file_batch | length == 0 -%}
                 {# Break out of loop #}
@@ -68,9 +71,9 @@
                     is_full_refresh=(ns.batch_num == 1)
                 ) -%}
 
-                {{ log("SCOPE: full-refresh " ~ identifier ~ " batch " ~ ns.batch_num ~ " (" ~ ns.file_batch | length ~ " files)", info=True) }}
+                {{ log("SCOPE: full-refresh " ~ identifier ~ " batch " ~ ns.batch_num ~ " of " ~ total_batches ~ " (" ~ ns.file_batch | length ~ " files)", info=True) }}
 
-                {%- set job_suffix = "full-refresh_batch" ~ ns.batch_num ~ "_" ~ ns.file_batch | length ~ "files" -%}
+                {%- set job_suffix = "full-refresh_batch_" ~ ns.batch_num ~ "_of_" ~ total_batches ~ "_files_" ~ ns.file_batch | length -%}
                 {% do adapter.set_next_job_name(identifier ~ "_" ~ job_suffix) %}
                 {% if config.get('au') %}{% do adapter.set_next_job_au(config.get('au') | int) %}{% endif %}
                 {% if config.get('priority') %}{% do adapter.set_next_job_priority(config.get('priority') | int) %}{% endif %}
@@ -83,7 +86,7 @@
 
                 {# -- Discover next batch (watermark advanced) -- #}
                 {%- set ns.file_batch = adapter.discover_files(
-                    source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds, starting_timestamp
+                    source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds, starting_timestamp, max_bytes_per_trigger
                 ) -%}
             {%- endif -%}
         {%- endfor -%}
