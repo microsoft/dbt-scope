@@ -34,6 +34,9 @@
     {# -- Delete checkpoint for full refresh -- #}
     {% do adapter.delete_checkpoint(delta_location) %}
 
+    {# -- Register model name for orphan cancellation + related metadata -- #}
+    {% do adapter.set_next_job_model_name(identifier) %}
+
     {# -- Batching loop: discover → submit → checkpoint → repeat -- #}
     {# NOTE: file_batch MUST live in the namespace — see incremental.sql for details. #}
     {%- set ns = namespace(

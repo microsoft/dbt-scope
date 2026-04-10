@@ -53,6 +53,9 @@
         {% do adapter.delete_checkpoint(delta_location) %}
     {%- endif -%}
 
+    {# -- Register model name for orphan cancellation + related metadata -- #}
+    {% do adapter.set_next_job_model_name(identifier) %}
+
     {# -- Batching loop: discover → submit → checkpoint → repeat -- #}
     {%- set ns = namespace(
         batch_num=0,

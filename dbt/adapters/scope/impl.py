@@ -347,6 +347,20 @@ class ScopeAdapter(BaseAdapter):
         handle._next_job_name = name
 
     @available
+    def set_next_job_model_name(self, model_name: str) -> None:
+        """Set the dbt model name for the next ``execute()`` call on this thread.
+
+        Used for two purposes:
+        1. Orphan cancellation — active ADLA jobs matching this model are cancelled
+           before the first job submission (best-effort, once per model per run).
+        2. ``related`` metadata — every submitted job carries ``recurrenceId`` and
+           ``recurrenceName`` derived from this model name.
+        """
+        connection = self.connections.get_thread_connection()
+        handle: ScopeConnectionHandle = connection.handle  # type: ignore[assignment]
+        handle._next_job_model_name = model_name
+
+    @available
     def set_next_job_au(self, au: int) -> None:
         """Set the AU (parallelism) for the next ``execute()`` call on this thread."""
         connection = self.connections.get_thread_connection()
