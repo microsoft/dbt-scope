@@ -103,7 +103,7 @@
                 {% do adapter.set_next_job_name(identifier ~ "_" ~ job_suffix) %}
                 {% if config.get('au') %}{% do adapter.set_next_job_au(config.get('au') | int) %}{% endif %}
                 {% if config.get('priority') %}{% do adapter.set_next_job_priority(config.get('priority') | int) %}{% endif %}
-                {% if config.get('query_poll_timeout_seconds') %}{% do adapter.set_next_job_max_wait(config.get('query_poll_timeout_seconds') | int) %}{% endif %}
+                {% if config.get('job_timeout_seconds') %}{% do adapter.set_next_job_timeout_seconds(config.get('job_timeout_seconds') | int) %}{% endif %}
                 {%- call statement('main') -%}
                     {{ scope_script }}
                 {%- endcall -%}

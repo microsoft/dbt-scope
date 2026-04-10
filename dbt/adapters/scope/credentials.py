@@ -36,7 +36,7 @@ class ScopeCredentials(Credentials):
     au: int = 100
     priority: int = 1
     poll_interval_seconds: int = 5
-    max_wait_seconds: int = 3600
+    job_timeout_seconds: int = 36_000
     max_files_per_trigger: int = 50
     max_bytes_per_trigger: int = 10_737_418_240_000  # ~10 TB
     http_timeout_seconds: int = 30

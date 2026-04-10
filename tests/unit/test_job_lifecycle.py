@@ -369,7 +369,7 @@ class TestExecuteOrphanCancellation:
         handle._next_job_name = None
         handle._next_job_au = None
         handle._next_job_priority = None
-        handle._next_job_max_wait = None
+        handle._next_job_timeout_seconds = None
         handle._next_job_model_name = None
         handle.submit_and_wait = MagicMock()
         handle.submit_and_wait.return_value = MagicMock(job_id="test-id", result="Succeeded")
@@ -378,7 +378,7 @@ class TestExecuteOrphanCancellation:
         connection = MagicMock()
         connection.handle = handle
         connection.credentials = MagicMock(
-            au=100, priority=1, poll_interval_seconds=5, max_wait_seconds=60
+            au=100, priority=1, poll_interval_seconds=5, job_timeout_seconds=60
         )
         mgr.get_thread_connection.return_value = connection
         return mgr, handle

@@ -27,7 +27,7 @@ class TestScopeCredentials:
         assert creds.au == 100
         assert creds.priority == 1
         assert creds.poll_interval_seconds == 5
-        assert creds.max_wait_seconds == 3600
+        assert creds.job_timeout_seconds == 36_000
         assert creds.delta_base_path == "delta"
 
     def test_custom_values(self):

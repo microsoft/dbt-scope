@@ -16,6 +16,6 @@ dbt_scope_test:
       au: "{{ env_var('SCOPE_AU', '5') | int }}"
       priority: "{{ env_var('SCOPE_PRIORITY', '1') | int }}"
       poll_interval_seconds: 5
-      max_wait_seconds: 3600
+      job_timeout_seconds: 36000
       http_timeout_seconds: 30
       http_retries: 3

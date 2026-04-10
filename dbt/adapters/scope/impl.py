@@ -380,11 +380,11 @@ class ScopeAdapter(BaseAdapter):
         return getattr(self, "_last_total_batches", 0)
 
     @available
-    def set_next_job_max_wait(self, max_wait: int) -> None:
-        """Set the poll timeout for the next ``execute()`` call on this thread."""
+    def set_next_job_timeout_seconds(self, timeout: int) -> None:
+        """Set the job timeout for the next ``execute()`` call on this thread."""
         connection = self.connections.get_thread_connection()
         handle: ScopeConnectionHandle = connection.handle  # type: ignore[assignment]
-        handle._next_job_max_wait = max_wait
+        handle._next_job_timeout_seconds = timeout
 
     @available
     def discover_files(
@@ -594,31 +594,6 @@ class ScopeAdapter(BaseAdapter):
             starting_timestamp=starting_timestamp,
         )
         return len(files) > 0
-
-    def submit_scope_script(
-        self,
-        script: str,
-        job_name: str = "dbt-scope",
-        au: int | None = None,
-        priority: int | None = None,
-    ) -> str:
-        """Submit a SCOPE script to ADLA and wait for completion.
-
-        Returns the job ID on success.
-        """
-        connection = self.connections.get_thread_connection()
-        handle: ScopeConnectionHandle = connection.handle  # type: ignore[assignment]
-        creds = self._credentials()
-
-        job = handle.submit_and_wait(
-            name=job_name,
-            script=script,
-            au=au or creds.au,
-            priority=priority or creds.priority,
-            poll_interval=creds.poll_interval_seconds,
-            max_wait=creds.max_wait_seconds,
-        )
-        return job.job_id
 
     def build_script_config(self, model_config: dict[str, Any], table_name: str) -> ScriptConfig:
         """Build a ``ScriptConfig`` from dbt model config + credentials."""
