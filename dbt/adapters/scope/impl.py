@@ -347,6 +347,20 @@ class ScopeAdapter(BaseAdapter):
         handle._next_job_name = name
 
     @available
+    def set_next_job_model_name(self, model_name: str) -> None:
+        """Set the dbt model name for the next ``execute()`` call on this thread.
+
+        Used for two purposes:
+        1. Orphan cancellation — active ADLA jobs matching this model are cancelled
+           before the first job submission (best-effort, once per model per run).
+        2. ``related`` metadata — every submitted job carries ``recurrenceId`` and
+           ``recurrenceName`` derived from this model name.
+        """
+        connection = self.connections.get_thread_connection()
+        handle: ScopeConnectionHandle = connection.handle  # type: ignore[assignment]
+        handle._next_job_model_name = model_name
+
+    @available
     def set_next_job_au(self, au: int) -> None:
         """Set the AU (parallelism) for the next ``execute()`` call on this thread."""
         connection = self.connections.get_thread_connection()
@@ -366,11 +380,11 @@ class ScopeAdapter(BaseAdapter):
         return getattr(self, "_last_total_batches", 0)
 
     @available
-    def set_next_job_max_wait(self, max_wait: int) -> None:
-        """Set the poll timeout for the next ``execute()`` call on this thread."""
+    def set_next_job_timeout_seconds(self, timeout: int) -> None:
+        """Set the job timeout for the next ``execute()`` call on this thread."""
         connection = self.connections.get_thread_connection()
         handle: ScopeConnectionHandle = connection.handle  # type: ignore[assignment]
-        handle._next_job_max_wait = max_wait
+        handle._next_job_timeout_seconds = timeout
 
     @available
     def discover_files(
@@ -454,6 +468,13 @@ class ScopeAdapter(BaseAdapter):
         # Enrich with byte estimates (SSv5/v6 sibling folder detection)
         all_unprocessed = self._get_gen1_client().enrich_with_estimates(all_unprocessed)
 
+        # Cache enriched FileInfo objects for use by update_checkpoint()
+        # (cumulative across batch iterations — new files are added, not replaced)
+        if not hasattr(self, "_discovered_file_infos"):
+            self._discovered_file_infos: dict[str, FileInfo] = {}
+        for f in all_unprocessed:
+            self._discovered_file_infos[f.path] = f
+
         # Pre-compute total batch count from the full unprocessed list
         self._last_total_batches = _count_batches(
             all_unprocessed, max_files_per_trigger, max_bytes_per_trigger
@@ -507,11 +528,10 @@ class ScopeAdapter(BaseAdapter):
     ) -> None:
         """Update the watermark checkpoint after a successful SCOPE job.
 
-        Iterates the cross-product of *source_roots* x *source_patterns* to
-        reconstruct ``FileInfo`` objects for the processed files, then writes
-        the checkpoint.  Also writes per-batch JSONL to
-        ``_checkpoint/sources/{batch_id}``, triggers compaction at interval
-        boundaries, and enforces retention.
+        Uses cached ``FileInfo`` objects from :meth:`discover_files` when
+        available, falling back to ADLS listing only for paths not in cache.
+        Also writes per-batch JSONL to ``_checkpoint/sources/{batch_id}``,
+        triggers compaction at interval boundaries, and enforces retention.
         """
         gen1 = self._get_gen1_client()
         checkpoint = self._get_checkpoint_manager()
@@ -519,18 +539,32 @@ class ScopeAdapter(BaseAdapter):
         # Get current watermark
         current = checkpoint.read_watermark(delta_location)
 
-        # Reconstruct FileInfo objects across all rootxpattern combos
-        target_paths = set(file_paths)
-        seen_paths: set[str] = set()
+        # Look up FileInfo from the discovery cache first
+        cache = getattr(self, "_discovered_file_infos", {})
         processed: list[FileInfo] = []
+        uncached_paths: set[str] = set()
 
-        for root in source_roots:
-            for pattern in source_patterns:
-                all_files = gen1.list_files(root, pattern=pattern)
-                for f in all_files:
-                    if f.path in target_paths and f.path not in seen_paths:
-                        seen_paths.add(f.path)
-                        processed.append(f)
+        for path in file_paths:
+            cached_info = cache.get(path)
+            if cached_info is not None:
+                processed.append(cached_info)
+            else:
+                uncached_paths.add(path)
+
+        # Fallback: list files from ADLS for any paths not in cache
+        if uncached_paths:
+            log.debug(
+                f"update_checkpoint: {len(uncached_paths)} paths not in cache, "
+                f"falling back to ADLS listing"
+            )
+            seen_paths: set[str] = set()
+            for root in source_roots:
+                for pattern in source_patterns:
+                    all_files = gen1.list_files(root, pattern=pattern)
+                    for f in all_files:
+                        if f.path in uncached_paths and f.path not in seen_paths:
+                            seen_paths.add(f.path)
+                            processed.append(f)
 
         if not processed:
             log.warning("update_checkpoint: no matching files found for paths")
@@ -562,6 +596,17 @@ class ScopeAdapter(BaseAdapter):
         self._get_checkpoint_manager().delete_watermark(delta_location)
 
     @available
+    def clear_file_discovery_cache(self) -> None:
+        """Clear all file listing and enrichment caches.
+
+        Call between models to force a fresh ADLS listing on the next
+        :meth:`discover_files` invocation.
+        """
+        self._get_gen1_client().clear_file_cache()
+        if hasattr(self, "_discovered_file_infos"):
+            self._discovered_file_infos.clear()
+
+    @available
     def has_unprocessed_files(
         self,
         source_roots: list[str],
@@ -580,31 +625,6 @@ class ScopeAdapter(BaseAdapter):
             starting_timestamp=starting_timestamp,
         )
         return len(files) > 0
-
-    def submit_scope_script(
-        self,
-        script: str,
-        job_name: str = "dbt-scope",
-        au: int | None = None,
-        priority: int | None = None,
-    ) -> str:
-        """Submit a SCOPE script to ADLA and wait for completion.
-
-        Returns the job ID on success.
-        """
-        connection = self.connections.get_thread_connection()
-        handle: ScopeConnectionHandle = connection.handle  # type: ignore[assignment]
-        creds = self._credentials()
-
-        job = handle.submit_and_wait(
-            name=job_name,
-            script=script,
-            au=au or creds.au,
-            priority=priority or creds.priority,
-            poll_interval=creds.poll_interval_seconds,
-            max_wait=creds.max_wait_seconds,
-        )
-        return job.job_id
 
     def build_script_config(self, model_config: dict[str, Any], table_name: str) -> ScriptConfig:
         """Build a ``ScriptConfig`` from dbt model config + credentials."""

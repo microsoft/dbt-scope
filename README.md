@@ -160,6 +160,25 @@ my_project:
       priority: 1
 ```
 
+### Profile reference
+
+| Field                     | Default                                    | Description                                                        |
+| ------------------------- | ------------------------------------------ | ------------------------------------------------------------------ |
+| `adla_account`            | —                                          | ADLA account name                                                  |
+| `storage_account`         | —                                          | ADLS Gen2 storage account name (also used as dbt `database`)       |
+| `container`               | —                                          | ADLS Gen2 container (also used as dbt `schema`)                    |
+| `delta_base_path`         | `"delta"`                                  | Base path under the container for Delta tables                     |
+| `adls_gen1_account`       | `""`                                       | ADLS Gen1 account for source file listing                          |
+| `au`                      | `100`                                      | Default ADLA Analytics Units (parallelism) per job                 |
+| `priority`                | `1`                                        | Default ADLA job priority                                          |
+| `poll_interval_seconds`   | `5`                                        | How often (seconds) to poll ADLA for job status                    |
+| `job_timeout_seconds`     | `36000`                                    | Max seconds to wait for a SCOPE job before timing out              |
+| `max_files_per_trigger`   | `50`                                       | Default max files per SCOPE job (overridable per-model)            |
+| `max_bytes_per_trigger`   | `10737418240000` (10 TB)                   | Default max estimated bytes per batch (overridable per-model)      |
+| `http_timeout_seconds`    | `30`                                       | HTTP request timeout for ADLA REST API calls                       |
+| `http_retries`            | `3`                                        | Number of HTTP retries for transient errors (429, 5xx)             |
+| `scope_feature_previews`  | `"EnableDeltaTableDynamicInsert:on"`       | SCOPE feature preview flags (overridable per-model)                |
+
 | dbt concept   | SCOPE concept                                                                   |
 | ------------- | ------------------------------------------------------------------------------- |
 | `database`    | Storage account name                                                            |
@@ -269,20 +288,27 @@ FROM @data
 WHERE edition == "Standard"
 ```
 
-### Incremental config reference
+### Model config reference
 
-| Config                       | Default                  | Description                                                                                                                                                                            |
-| ---------------------------- | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `source_roots`               | `[]`                     | List of ADLS Gen1 root paths to list source files from                                                                                                                                 |
-| `source_patterns`            | `[]`                     | List of regexes; the adapter discovers files for each root × pattern combo                                                                                                             |
-| `max_files_per_trigger`      | `50`                     | Max files per SCOPE job. Larger = fewer jobs; smaller = faster feedback                                                                                                                |
-| `max_bytes_per_trigger`      | `10737418240000` (10 TB) | Max estimated bytes per batch. Works alongside `max_files_per_trigger` — whichever limit is hit first stops the batch. Estimates account for SSv5/v6 `.du` sibling folders (see below) |
-| `safety_buffer_seconds`      | `30`                     | Skip files modified within the last N seconds (avoids partial writes)                                                                                                                  |
-| `source_compaction_interval` | `10`                     | Every N batches, write a parquet snapshot of all source history                                                                                                                        |
-| `source_retention_files`     | `100`                    | Max files in `_checkpoint/sources/` — oldest are deleted first                                                                                                                         |
-| `delta_table_columns`        | `[]`                     | Delta table schema (CREATE TABLE). List of `{name, type}` dicts                                                                                                                        |
-| `extract_columns`            | `[]`                     | Source file columns (EXTRACT). List of `{name, type}` dicts                                                                                                                            |
-| `partition_by`               | —                        | Single column name or list of columns                                                                                                                                                  |
+| Config                       | Default                                | Description                                                                                                                                                                            |
+| ---------------------------- | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `delta_location`             | `""`                                   | ABFSS path to the Delta table (e.g. `abfss://ctr@acct.dfs.core.windows.net/delta/my_table`)                                                                                           |
+| `source_roots`               | `[]`                                   | List of ADLS Gen1 root paths to list source files from                                                                                                                                 |
+| `source_patterns`            | `['.*\\.ss$']`                         | List of regexes; the adapter discovers files for each root × pattern combo                                                                                                             |
+| `max_files_per_trigger`      | from profile (`50`)                    | Max files per SCOPE job. Larger = fewer jobs; smaller = faster feedback                                                                                                                |
+| `max_bytes_per_trigger`      | from profile (`10737418240000`, 10 TB) | Max estimated bytes per batch. Works alongside `max_files_per_trigger` — whichever limit is hit first stops the batch. Estimates account for SSv5/v6 `.du` sibling folders (see below) |
+| `safety_buffer_seconds`      | `30`                                   | Skip files modified within the last N seconds (avoids partial writes)                                                                                                                  |
+| `source_compaction_interval` | `10`                                   | Every N batches, write a parquet snapshot of all source history                                                                                                                        |
+| `source_retention_files`     | `100`                                  | Max files in `_checkpoint/sources/` — oldest are deleted first                                                                                                                         |
+| `starting_timestamp`         | —                                      | ISO 8601 timestamp (e.g. `2026-01-01T00:00:00+00:00`); only process files modified after this time when no watermark exists                                                            |
+| `delta_table_columns`        | `[]`                                   | Delta table schema (CREATE TABLE). List of `{name, type}` dicts                                                                                                                        |
+| `extract_columns`            | `[]`                                   | Source file columns (EXTRACT). List of `{name, type}` dicts                                                                                                                            |
+| `partition_by`               | —                                      | Single column name or list of columns for Delta table partitioning                                                                                                                     |
+| `scope_settings`             | `{}`                                   | Delta table properties passed to `ALTER TABLE SET TBLPROPERTIES` (e.g. compression, checkpoint intervals)                                                                              |
+| `au`                         | from profile                           | Per-model ADLA Analytics Units (parallelism) override                                                                                                                                  |
+| `priority`                   | from profile                           | Per-model ADLA job priority override                                                                                                                                                   |
+| `job_timeout_seconds`        | from profile                           | Per-model job timeout override (seconds)                                                                                                                                               |
+| `scope_feature_previews`     | `"EnableDeltaTableDynamicInsert:on"`   | Per-model SCOPE feature preview flags override                                                                                                                                         |
 
 `dbt retry` re-runs failed batches. `dbt run --full-refresh` resets the checkpoint and reprocesses all files.
 

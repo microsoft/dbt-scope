@@ -34,6 +34,9 @@
     {# -- Delete checkpoint for full refresh -- #}
     {% do adapter.delete_checkpoint(delta_location) %}
 
+    {# -- Register model name for orphan cancellation + related metadata -- #}
+    {% do adapter.set_next_job_model_name(identifier) %}
+
     {# -- Batching loop: discover → submit → checkpoint → repeat -- #}
     {# NOTE: file_batch MUST live in the namespace — see incremental.sql for details. #}
     {%- set ns = namespace(
@@ -77,7 +80,7 @@
                 {% do adapter.set_next_job_name(identifier ~ "_" ~ job_suffix) %}
                 {% if config.get('au') %}{% do adapter.set_next_job_au(config.get('au') | int) %}{% endif %}
                 {% if config.get('priority') %}{% do adapter.set_next_job_priority(config.get('priority') | int) %}{% endif %}
-                {% if config.get('query_poll_timeout_seconds') %}{% do adapter.set_next_job_max_wait(config.get('query_poll_timeout_seconds') | int) %}{% endif %}
+                {% if config.get('job_timeout_seconds') %}{% do adapter.set_next_job_timeout_seconds(config.get('job_timeout_seconds') | int) %}{% endif %}
                 {%- call statement('main') -%}
                     {{ scope_script }}
                 {%- endcall -%}
