@@ -468,6 +468,13 @@ class ScopeAdapter(BaseAdapter):
         # Enrich with byte estimates (SSv5/v6 sibling folder detection)
         all_unprocessed = self._get_gen1_client().enrich_with_estimates(all_unprocessed)
 
+        # Cache enriched FileInfo objects for use by update_checkpoint()
+        # (cumulative across batch iterations — new files are added, not replaced)
+        if not hasattr(self, "_discovered_file_infos"):
+            self._discovered_file_infos: dict[str, FileInfo] = {}
+        for f in all_unprocessed:
+            self._discovered_file_infos[f.path] = f
+
         # Pre-compute total batch count from the full unprocessed list
         self._last_total_batches = _count_batches(
             all_unprocessed, max_files_per_trigger, max_bytes_per_trigger
@@ -521,11 +528,10 @@ class ScopeAdapter(BaseAdapter):
     ) -> None:
         """Update the watermark checkpoint after a successful SCOPE job.
 
-        Iterates the cross-product of *source_roots* x *source_patterns* to
-        reconstruct ``FileInfo`` objects for the processed files, then writes
-        the checkpoint.  Also writes per-batch JSONL to
-        ``_checkpoint/sources/{batch_id}``, triggers compaction at interval
-        boundaries, and enforces retention.
+        Uses cached ``FileInfo`` objects from :meth:`discover_files` when
+        available, falling back to ADLS listing only for paths not in cache.
+        Also writes per-batch JSONL to ``_checkpoint/sources/{batch_id}``,
+        triggers compaction at interval boundaries, and enforces retention.
         """
         gen1 = self._get_gen1_client()
         checkpoint = self._get_checkpoint_manager()
@@ -533,18 +539,32 @@ class ScopeAdapter(BaseAdapter):
         # Get current watermark
         current = checkpoint.read_watermark(delta_location)
 
-        # Reconstruct FileInfo objects across all rootxpattern combos
-        target_paths = set(file_paths)
-        seen_paths: set[str] = set()
+        # Look up FileInfo from the discovery cache first
+        cache = getattr(self, "_discovered_file_infos", {})
         processed: list[FileInfo] = []
+        uncached_paths: set[str] = set()
 
-        for root in source_roots:
-            for pattern in source_patterns:
-                all_files = gen1.list_files(root, pattern=pattern)
-                for f in all_files:
-                    if f.path in target_paths and f.path not in seen_paths:
-                        seen_paths.add(f.path)
-                        processed.append(f)
+        for path in file_paths:
+            cached_info = cache.get(path)
+            if cached_info is not None:
+                processed.append(cached_info)
+            else:
+                uncached_paths.add(path)
+
+        # Fallback: list files from ADLS for any paths not in cache
+        if uncached_paths:
+            log.debug(
+                f"update_checkpoint: {len(uncached_paths)} paths not in cache, "
+                f"falling back to ADLS listing"
+            )
+            seen_paths: set[str] = set()
+            for root in source_roots:
+                for pattern in source_patterns:
+                    all_files = gen1.list_files(root, pattern=pattern)
+                    for f in all_files:
+                        if f.path in uncached_paths and f.path not in seen_paths:
+                            seen_paths.add(f.path)
+                            processed.append(f)
 
         if not processed:
             log.warning("update_checkpoint: no matching files found for paths")
@@ -574,6 +594,17 @@ class ScopeAdapter(BaseAdapter):
     def delete_checkpoint(self, delta_location: str) -> None:
         """Delete the watermark checkpoint (for full refresh)."""
         self._get_checkpoint_manager().delete_watermark(delta_location)
+
+    @available
+    def clear_file_discovery_cache(self) -> None:
+        """Clear all file listing and enrichment caches.
+
+        Call between models to force a fresh ADLS listing on the next
+        :meth:`discover_files` invocation.
+        """
+        self._get_gen1_client().clear_file_cache()
+        if hasattr(self, "_discovered_file_infos"):
+            self._discovered_file_infos.clear()
 
     @available
     def has_unprocessed_files(

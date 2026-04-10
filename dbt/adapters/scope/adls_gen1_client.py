@@ -110,6 +110,8 @@ class AdlsGen1Client:
         self._account = account
         self._lock_file = lock_file
         self._fs: adls_core.AzureDLFileSystem | None = None
+        self._file_cache: dict[tuple[str, str | None], list[FileInfo]] = {}
+        self._enrichment_cache: dict[str, tuple[int, tuple[str, ...]]] = {}
 
     def _get_fs(self) -> adls_core.AzureDLFileSystem:
         """Lazily initialize the ADLS Gen1 filesystem client."""
@@ -132,6 +134,10 @@ class AdlsGen1Client:
     ) -> list[FileInfo]:
         """List all files under *root*, optionally filtering by regex *pattern*.
 
+        Results are cached by ``(root, pattern)`` — repeated calls with the
+        same arguments return the cached list without hitting ADLS.  Call
+        :meth:`clear_file_cache` to invalidate.
+
         Args:
             root: ADLS Gen1 path (e.g. ``/shares/SQLDB.Prod/local/...``).
             pattern: Regex pattern to match against the file name (not full path).
@@ -142,6 +148,14 @@ class AdlsGen1Client:
         Returns:
             Sorted list of ``FileInfo`` objects (sorted by modification_time ASC).
         """
+        cache_key = (root, pattern)
+        if cache_key in self._file_cache:
+            cached = self._file_cache[cache_key]
+            log.debug(
+                f"list_files cache hit: {len(cached)} files for root={root}, pattern={pattern}"
+            )
+            return cached
+
         fs = self._get_fs()
         compiled = re.compile(pattern) if pattern else None
         log.debug(f"Listing files: account={self._account}, root={root}, pattern={pattern}")
@@ -182,7 +196,25 @@ class AdlsGen1Client:
             log.debug(f"Skipped {skipped_empty} zero-length files under {root}")
         files.sort(key=lambda f: f.modification_time)
         log.debug(f"Found {len(files)} files matching pattern under {root}")
+
+        self._file_cache[cache_key] = files
         return files
+
+    def clear_file_cache(self) -> None:
+        """Clear the file listing and enrichment caches.
+
+        Call this between models or when the underlying source files may have
+        changed and a fresh ADLS listing is needed.
+        """
+        count = len(self._file_cache)
+        enrichment_count = len(self._enrichment_cache)
+        self._file_cache.clear()
+        self._enrichment_cache.clear()
+        if count or enrichment_count:
+            log.debug(
+                f"Cleared file cache ({count} listing entries, "
+                f"{enrichment_count} enrichment entries)"
+            )
 
     @staticmethod
     def _walk(
@@ -277,29 +309,51 @@ class AdlsGen1Client:
 
         Calls :meth:`estimate_bytes` for each file and returns new
         ``FileInfo`` instances with ``estimated_bytes`` and
-        ``contributing_files`` populated.
+        ``contributing_files`` populated.  Results are cached in
+        ``_enrichment_cache`` so repeated calls for the same file skip
+        the ADLS lookups.
         """
         if not files:
             return files
 
         t0 = time.monotonic()
         enriched: list[FileInfo] = []
+        cache_hits = 0
         for f in files:
-            try:
-                est_bytes, contrib_paths = self.estimate_bytes(f.path, f.length)
+            cached = self._enrichment_cache.get(f.path)
+            if cached is not None:
+                est_bytes, contrib_paths = cached
                 enriched.append(
                     replace(
                         f,
                         estimated_bytes=est_bytes,
-                        contributing_files=tuple(contrib_paths),
+                        contributing_files=contrib_paths,
+                    )
+                )
+                cache_hits += 1
+                continue
+
+            try:
+                est_bytes, contrib_paths_list = self.estimate_bytes(f.path, f.length)
+                contrib_tuple = tuple(contrib_paths_list)
+                self._enrichment_cache[f.path] = (est_bytes, contrib_tuple)
+                enriched.append(
+                    replace(
+                        f,
+                        estimated_bytes=est_bytes,
+                        contributing_files=contrib_tuple,
                     )
                 )
             except Exception:
                 log.warning(f"Failed to estimate bytes for {f.path} — using file length")
+                self._enrichment_cache[f.path] = (f.length, ())
                 enriched.append(replace(f, estimated_bytes=f.length))
 
         elapsed_ms = (time.monotonic() - t0) * 1000
-        log.debug(f"enrich_with_estimates: {len(enriched)} files enriched in {elapsed_ms:.1f} ms")
+        log.debug(
+            f"enrich_with_estimates: {len(enriched)} files enriched in {elapsed_ms:.1f} ms "
+            f"({cache_hits} cache hits, {len(enriched) - cache_hits} ADLS lookups)"
+        )
         return enriched
 
     @staticmethod
