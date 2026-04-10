@@ -194,7 +194,12 @@ class ScopeConnectionHandle:
         return resp.get("value", [])
 
     def cancel_orphaned_jobs(self, model_name: str) -> list[str]:
-        """Cancel all active ADLA jobs whose name starts with ``{model_name}_``.
+        """Cancel active ADLA jobs for *previous* runs of ``model_name``.
+
+        Jobs are considered orphaned if their name starts with
+        ``{model_name}_`` **and** they were not submitted by the current
+        dbt invocation (identified by ``_run_id`` in the ``related``
+        metadata).
 
         Best-effort: individual cancellation failures are logged but do not
         propagate.  Returns a list of cancelled job IDs.
@@ -213,8 +218,14 @@ class ScopeConnectionHandle:
             ScopeConnectionHandle._cancelled_models.add(model_name)
             return []
 
+        # Exclude jobs from the current run — they are siblings, not orphans
+        current_run_id = ScopeConnectionHandle._run_id
+        orphaned_jobs = [
+            j for j in active_jobs if j.get("related", {}).get("runId") != current_run_id
+        ]
+
         cancelled: list[str] = []
-        for job in active_jobs:
+        for job in orphaned_jobs:
             job_id = job.get("jobId", "")
             job_name = job.get("name", "")
             try:
@@ -234,6 +245,9 @@ class ScopeConnectionHandle:
         ScopeConnectionHandle._cancelled_models.add(model_name)
         return cancelled
 
+    # Maximum consecutive poll failures before giving up
+    _MAX_CONSECUTIVE_POLL_FAILURES = 5
+
     def submit_and_wait(
         self,
         name: str,
@@ -248,6 +262,7 @@ class ScopeConnectionHandle:
         job = self.submit_job(name, script, au, priority, model_name=model_name)
         start = time.monotonic()
         last_state = job.state
+        consecutive_failures = 0
 
         while not job.is_terminal:
             elapsed = time.monotonic() - start
@@ -257,7 +272,21 @@ class ScopeConnectionHandle:
                     f"{elapsed:.0f}s in state {job.state}"
                 )
             time.sleep(poll_interval)
-            self.poll_job(job)
+            try:
+                self.poll_job(job)
+                consecutive_failures = 0
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+                consecutive_failures += 1
+                if consecutive_failures >= self._MAX_CONSECUTIVE_POLL_FAILURES:
+                    raise DbtDatabaseError(
+                        f"SCOPE job '{name}' ({job.job_id}) poll failed "
+                        f"{consecutive_failures} consecutive times: {exc}"
+                    ) from exc
+                log.warning(
+                    f"Transient poll error for '{name}' ({job.job_id}), "
+                    f"attempt {consecutive_failures}/{self._MAX_CONSECUTIVE_POLL_FAILURES}: {exc}"
+                )
+                continue
             if job.state != last_state:
                 log.debug(f"[{name}] {last_state} → {job.state}")
                 last_state = job.state
@@ -300,6 +329,8 @@ class ScopeConnectionHandle:
         session = requests.Session()
         retry = Retry(
             total=retries,
+            connect=retries,
+            read=retries,
             backoff_factor=1,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["GET", "PUT", "POST"],

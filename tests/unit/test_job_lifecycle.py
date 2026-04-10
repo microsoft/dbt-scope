@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, call, patch
 from urllib.parse import quote as url_quote
 
 import pytest
+import requests.exceptions
 
 from dbt.adapters.scope.connections import (
     _UUID_NAMESPACE,
@@ -344,6 +345,45 @@ class TestCancelOrphanedJobs:
         assert cancelled == ["job-1", "job-3"]
         assert handle.cancel_job.call_count == 3
 
+    def test_skips_jobs_from_current_run(self):
+        """Jobs with the current _run_id are siblings, not orphans — skip them."""
+        handle = _make_handle()
+        current_run = ScopeConnectionHandle._run_id
+        active_jobs = [
+            # Orphan from a previous run
+            {
+                "jobId": "job-old",
+                "name": "events_daily_batch_1",
+                "related": {"runId": "previous-run-id"},
+            },
+            # Sibling from the current run — must NOT be cancelled
+            {
+                "jobId": "job-sibling",
+                "name": "events_daily_batch_2",
+                "related": {"runId": current_run},
+            },
+        ]
+        handle.list_jobs = MagicMock(return_value=active_jobs)
+        handle.cancel_job = MagicMock()
+
+        cancelled = handle.cancel_orphaned_jobs("events_daily")
+
+        assert cancelled == ["job-old"]
+        handle.cancel_job.assert_called_once_with("job-old")
+
+    def test_cancels_jobs_without_related_metadata(self):
+        """Jobs without related metadata are treated as orphans (legacy jobs)."""
+        handle = _make_handle()
+        active_jobs = [
+            {"jobId": "job-legacy", "name": "events_daily_batch_1"},
+        ]
+        handle.list_jobs = MagicMock(return_value=active_jobs)
+        handle.cancel_job = MagicMock()
+
+        cancelled = handle.cancel_orphaned_jobs("events_daily")
+
+        assert cancelled == ["job-legacy"]
+
 
 # =====================================================================
 # Integration: execute() triggers orphan cancellation
@@ -452,3 +492,110 @@ class TestNextJobModelNameOnHandle:
         handle = _make_handle()
         handle._next_job_model_name = "my_model"
         assert handle._next_job_model_name == "my_model"
+
+
+# =====================================================================
+# Part D: Transient poll error resilience in submit_and_wait
+# =====================================================================
+
+
+class TestSubmitAndWaitTransientErrors:
+    """submit_and_wait tolerates transient poll failures up to a threshold."""
+
+    def _make_handle_with_submit(self):
+        handle = _make_handle()
+        handle._get_token = MagicMock(return_value="fake-token")
+        handle._request = MagicMock(return_value={"state": "Preparing"})
+        return handle
+
+    def test_recovers_from_transient_timeout(self):
+        """A single ReadTimeout during polling should not crash the run."""
+        handle = self._make_handle_with_submit()
+        call_count = 0
+
+        def fake_request(method, url, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if method == "PUT":
+                return {"state": "Running"}
+            # First poll: timeout, second poll: success
+            if call_count == 3:
+                raise requests.exceptions.ReadTimeout("Read timed out")
+            return {"state": "Ended", "result": "Succeeded"}
+
+        handle._request = MagicMock(side_effect=fake_request)
+
+        job = handle.submit_and_wait(
+            name="test-job", script="// script", au=10, priority=1, poll_interval=0
+        )
+        assert job.succeeded
+
+    def test_recovers_from_transient_connection_error(self):
+        """A ConnectionError during polling should not crash the run."""
+        handle = self._make_handle_with_submit()
+        call_count = 0
+
+        def fake_request(method, url, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if method == "PUT":
+                return {"state": "Running"}
+            if call_count == 3:
+                raise requests.exceptions.ConnectionError("Connection reset")
+            return {"state": "Ended", "result": "Succeeded"}
+
+        handle._request = MagicMock(side_effect=fake_request)
+
+        job = handle.submit_and_wait(
+            name="test-job", script="// script", au=10, priority=1, poll_interval=0
+        )
+        assert job.succeeded
+
+    def test_consecutive_failures_exceed_threshold_raises(self):
+        """Exceeding _MAX_CONSECUTIVE_POLL_FAILURES consecutive errors raises."""
+        handle = self._make_handle_with_submit()
+        call_count = 0
+
+        def fake_request(method, url, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if method == "PUT":
+                return {"state": "Running"}
+            raise requests.exceptions.ReadTimeout("Read timed out")
+
+        handle._request = MagicMock(side_effect=fake_request)
+
+        from dbt_common.exceptions import DbtDatabaseError
+
+        with pytest.raises(DbtDatabaseError, match="poll failed"):
+            handle.submit_and_wait(
+                name="test-job", script="// script", au=10, priority=1, poll_interval=0
+            )
+
+    def test_counter_resets_on_successful_poll(self):
+        """Consecutive failure counter resets after a successful poll."""
+        handle = self._make_handle_with_submit()
+        call_count = 0
+
+        def fake_request(method, url, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if method == "PUT":
+                return {"state": "Running"}
+            # Pattern: 4 failures, 1 success, 4 failures, 1 success (terminal)
+            poll_num = call_count - 1  # subtract the PUT
+            if poll_num <= 4:
+                raise requests.exceptions.ReadTimeout("Read timed out")
+            if poll_num == 5:
+                return {"state": "Running"}
+            if poll_num <= 9:
+                raise requests.exceptions.ReadTimeout("Read timed out")
+            return {"state": "Ended", "result": "Succeeded"}
+
+        handle._request = MagicMock(side_effect=fake_request)
+
+        # Should succeed — never hits 5 consecutive failures
+        job = handle.submit_and_wait(
+            name="test-job", script="// script", au=10, priority=1, poll_interval=0
+        )
+        assert job.succeeded
