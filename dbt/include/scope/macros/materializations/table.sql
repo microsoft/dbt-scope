@@ -9,6 +9,7 @@
 
 {% materialization table, adapter='scope' %}
     {%- set identifier = model['alias'] -%}
+    {%- set job_identifier = config.get('job_tag') or identifier -%}
     {%- set old_relation = adapter.get_relation(database=database, schema=schema, identifier=identifier) -%}
     {%- set target_relation = api.Relation.create(
         database=database, schema=schema, identifier=identifier, type='table'
@@ -35,7 +36,7 @@
     {% do adapter.delete_checkpoint(delta_location) %}
 
     {# -- Register model name for orphan cancellation + related metadata -- #}
-    {% do adapter.set_next_job_model_name(identifier) %}
+    {% do adapter.set_next_job_model_name(job_identifier) %}
 
     {# -- Batching loop: discover → submit → checkpoint → repeat -- #}
     {# NOTE: file_batch MUST live in the namespace — see incremental.sql for details. #}
@@ -77,7 +78,7 @@
                 {{ log("SCOPE: full-refresh " ~ identifier ~ " batch " ~ ns.batch_num ~ " of " ~ total_batches ~ " (" ~ ns.file_batch | length ~ " files)", info=True) }}
 
                 {%- set job_suffix = "full-refresh_batch_" ~ ns.batch_num ~ "_of_" ~ total_batches ~ "_files_" ~ ns.file_batch | length -%}
-                {% do adapter.set_next_job_name(identifier ~ "_" ~ job_suffix) %}
+                {% do adapter.set_next_job_name(job_identifier ~ "_" ~ job_suffix) %}
                 {% if config.get('au') %}{% do adapter.set_next_job_au(config.get('au') | int) %}{% endif %}
                 {% if config.get('priority') %}{% do adapter.set_next_job_priority(config.get('priority') | int) %}{% endif %}
                 {% if config.get('job_timeout_seconds') %}{% do adapter.set_next_job_timeout_seconds(config.get('job_timeout_seconds') | int) %}{% endif %}

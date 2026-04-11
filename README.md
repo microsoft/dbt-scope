@@ -308,6 +308,7 @@ WHERE edition == "Standard"
 | `au`                         | from profile                           | Per-model ADLA Analytics Units (parallelism) override                                                                                                                                  |
 | `priority`                   | from profile                           | Per-model ADLA job priority override                                                                                                                                                   |
 | `job_timeout_seconds`        | from profile                           | Per-model job timeout override (seconds)                                                                                                                                               |
+| `job_tag`                    | model alias                            | Custom identifier for ADLA job naming and orphan cancellation scoping. Use to isolate parallel runs of the same model (e.g. in CI)                                                     |
 | `scope_feature_previews`     | `"EnableDeltaTableDynamicInsert:on"`   | Per-model SCOPE feature preview flags override                                                                                                                                         |
 
 `dbt retry` re-runs failed batches. `dbt run --full-refresh` resets the checkpoint and reprocesses all files.
