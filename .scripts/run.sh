@@ -23,6 +23,7 @@ declare -A TARGETS=(
     ["venv"]="Create a fresh uv-managed .venv"
     ["install"]="uv sync --extra dev"
     ["build"]="Build wheel to dist/"
+    ["upload"]="Build wheel and azcopy to static site"
     ["lint"]="ruff check + format --check (auto-fixes first)"
     ["fix"]="ruff auto-fix + format"
     ["unit-test"]="pytest tests/unit/ (fast, no credentials)"
@@ -30,7 +31,7 @@ declare -A TARGETS=(
     ["integration-test"]="pytest tests/integration/ (ADLA + az login)"
     ["all"]="Run all targets in sequence"
 )
-TARGET_ORDER=("venv" "install" "build" "lint" "unit-test" "debug" "integration-test")
+TARGET_ORDER=("venv" "install" "build" "upload" "lint" "unit-test" "debug" "integration-test")
 
 # ── Usage ────────────────────────────────────────────────────────────────────
 
@@ -159,6 +160,29 @@ run_build() {
     local size
     size=$(du -k "$whl" | cut -f1)
     echo "  Built: $(basename "$whl") (${size} KB)"
+}
+
+run_upload() {
+    write_step "upload: Building wheel and uploading to static site"
+    run_build
+    local dist_dir="${PROJECT_DIR}/dist"
+    local whl
+    whl=$(ls "$dist_dir"/*.whl 2>/dev/null | head -1)
+    if [[ -z "$whl" ]]; then
+        echo -e "\033[31mERROR: No .whl found in $dist_dir after build.\033[0m"
+        exit 1
+    fi
+    local whl_name
+    whl_name=$(basename "$whl")
+    echo "  Uploading ${whl_name} → arcdataciadomisc/\$web/whls/${whl_name}"
+    az storage blob upload \
+        --account-name arcdataciadomisc \
+        --container-name '$web' \
+        --name "whls/${whl_name}" \
+        --file "$whl" \
+        --overwrite \
+        --auth-mode login
+    echo "  Uploaded: https://arcdataciadomisc.z13.web.core.windows.net/whls/${whl_name}"
 }
 
 run_lint() {

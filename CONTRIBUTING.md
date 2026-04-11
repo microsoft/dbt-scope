@@ -81,6 +81,7 @@ Each target is idempotent — auto-creates the uv-managed `.venv` and syncs deps
 ```bash
 .scripts/run.sh unit-test          # fast, no credentials
 .scripts/run.sh integration-test   # generates SS data via datagen, runs dbt, verifies Delta
+.scripts/run.sh upload             # build and publish wheel
 ```
 
 Integration tests are self-contained — they generate their own SS test data on Cosmos via ADLA, run dbt models against it, and verify the resulting Delta tables. The only prerequisites are ADLA + ADLS + `az login`.
