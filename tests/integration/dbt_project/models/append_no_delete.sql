@@ -4,6 +4,7 @@
         incremental_strategy='append',
         partition_by='event_year_date',
         delta_location=var('delta_location'),
+        job_tag=var('job_tag', none),
         source_roots=var('source_roots'),
         source_patterns=var('source_patterns', ['.*\\.ss$']),
         max_files_per_trigger=var('max_files_per_trigger', 50),

@@ -16,6 +16,7 @@ import os
 
 import pytest
 from conftest import (
+    _PREFIX,
     ScenarioConfig,
     list_source_files,
     query_delta_with_duckdb,
@@ -36,6 +37,7 @@ def _dbt_vars(scenario: ScenarioConfig) -> dict:
         "source_roots": [scenario.historical.ss_base_path],
         "source_patterns": [r".*\.ss$"],
         "max_files_per_trigger": 500,
+        "job_tag": f"{scenario.name}_{_PREFIX}",
     }
 
 

@@ -39,9 +39,10 @@ class ScopeCredentials(Credentials):
     job_timeout_seconds: int = 36_000
     max_files_per_trigger: int = 50
     max_bytes_per_trigger: int = 10_737_418_240_000  # ~10 TB
-    http_timeout_seconds: int = 30
+    http_timeout_seconds: int = 120
     http_retries: int = 3
     scope_feature_previews: str | None = "EnableDeltaTableDynamicInsert:on"
+    delta_lake_commit_condition: str = "FailIfFileConflict"
 
     @property
     def type(self) -> str:
@@ -62,4 +63,5 @@ class ScopeCredentials(Credentials):
             "priority",
             "max_files_per_trigger",
             "max_bytes_per_trigger",
+            "delta_lake_commit_condition",
         )

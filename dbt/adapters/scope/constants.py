@@ -9,3 +9,13 @@ DEFAULT_MAX_BYTES_PER_TRIGGER: int = 10_737_418_240_000  # ~10 TB
 DEFAULT_SAFETY_BUFFER_SECONDS: int = 30
 DEFAULT_SOURCE_COMPACTION_INTERVAL: int = 10
 DEFAULT_SOURCE_RETENTION_FILES: int = 100
+
+# Valid values for @@DeltaLakeCommitCondition
+VALID_DELTA_LAKE_COMMIT_CONDITIONS: frozenset[str] = frozenset(
+    {
+        "FailIfConflict",
+        "FailIfPartitionConflict",
+        "FailIfFileConflict",
+    }
+)
+DEFAULT_DELTA_LAKE_COMMIT_CONDITION: str = "FailIfFileConflict"

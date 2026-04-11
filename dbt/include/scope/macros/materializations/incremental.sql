@@ -22,6 +22,7 @@
 
 {% materialization incremental, adapter='scope' %}
     {%- set identifier = model['alias'] -%}
+    {%- set job_identifier = config.get('job_tag') or identifier -%}
     {%- set existing_relation = adapter.get_relation(
         database=database, schema=schema, identifier=identifier
     ) -%}
@@ -45,6 +46,7 @@
     {%- set delta_table_columns = config.get('delta_table_columns', []) -%}
     {%- set extract_columns = config.get('extract_columns', []) -%}
     {%- set feature_previews = config.get('scope_feature_previews', 'EnableDeltaTableDynamicInsert:on') -%}
+    {%- set delta_lake_commit_condition = config.get('delta_lake_commit_condition', target.delta_lake_commit_condition | default(defaults.delta_lake_commit_condition, true)) -%}
 
     {# -- Determine if this is a full refresh -- #}
     {%- set full_refresh_mode = (should_full_refresh()) -%}
@@ -54,7 +56,7 @@
     {%- endif -%}
 
     {# -- Register model name for orphan cancellation + related metadata -- #}
-    {% do adapter.set_next_job_model_name(identifier) %}
+    {% do adapter.set_next_job_model_name(job_identifier) %}
 
     {# -- Batching loop: discover → submit → checkpoint → repeat -- #}
     {%- set ns = namespace(
@@ -93,14 +95,15 @@
                     sql,
                     ns.file_batch,
                     is_full_refresh=is_first_full_refresh_batch,
-                    is_incremental=(not is_first_full_refresh_batch)
+                    is_incremental=(not is_first_full_refresh_batch),
+                    delta_lake_commit_condition=delta_lake_commit_condition
                 ) -%}
 
                 {%- set mode_label = "full-refresh" if full_refresh_mode else "incremental" -%}
                 {{ log("SCOPE: " ~ mode_label ~ " " ~ identifier ~ " batch " ~ ns.batch_num ~ " of " ~ total_batches ~ " (" ~ ns.file_batch | length ~ " files)", info=True) }}
 
                 {%- set job_suffix = mode_label ~ "_batch_" ~ ns.batch_num ~ "_of_" ~ total_batches ~ "_files_" ~ ns.file_batch | length -%}
-                {% do adapter.set_next_job_name(identifier ~ "_" ~ job_suffix) %}
+                {% do adapter.set_next_job_name(job_identifier ~ "_" ~ job_suffix) %}
                 {% if config.get('au') %}{% do adapter.set_next_job_au(config.get('au') | int) %}{% endif %}
                 {% if config.get('priority') %}{% do adapter.set_next_job_priority(config.get('priority') | int) %}{% endif %}
                 {% if config.get('job_timeout_seconds') %}{% do adapter.set_next_job_timeout_seconds(config.get('job_timeout_seconds') | int) %}{% endif %}

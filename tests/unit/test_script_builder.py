@@ -1,5 +1,8 @@
 """Tests for ScriptBuilder — pure unit tests, no ADLA calls."""
 
+import pytest
+from dbt_common.exceptions import DbtRuntimeError
+
 from dbt.adapters.scope.script_builder import ColumnDef, ScriptBuilder, ScriptConfig
 
 
@@ -110,11 +113,35 @@ class TestScriptBuilderFullRefresh:
         assert "EXTRACT" in script
         assert "FROM " in script
 
+    def test_generates_commit_condition(self, sample_config):
+        script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
+        assert 'SET @@DeltaLakeCommitCondition = "FailIfFileConflict"' in script
+
+    def test_commit_condition_override(self, sample_config):
+        sample_config.delta_lake_commit_condition = "FailIfConflict"
+        script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
+        assert 'SET @@DeltaLakeCommitCondition = "FailIfConflict"' in script
+
+    def test_invalid_commit_condition_raises(self, sample_config):
+        sample_config.delta_lake_commit_condition = "Auto"
+        with pytest.raises(DbtRuntimeError, match="Invalid delta_lake_commit_condition"):
+            ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
+
 
 class TestScriptBuilderIncremental:
     def test_generates_commit_condition(self, sample_config):
         script = ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
-        assert "FailIfPartitionConflict" in script
+        assert 'SET @@DeltaLakeCommitCondition = "FailIfFileConflict"' in script
+
+    def test_commit_condition_override(self, sample_config):
+        sample_config.delta_lake_commit_condition = "FailIfPartitionConflict"
+        script = ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
+        assert 'SET @@DeltaLakeCommitCondition = "FailIfPartitionConflict"' in script
+
+    def test_invalid_commit_condition_raises(self, sample_config):
+        sample_config.delta_lake_commit_condition = "None"
+        with pytest.raises(DbtRuntimeError, match="Invalid delta_lake_commit_condition"):
+            ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
 
     def test_header_contains_file_count(self, sample_config):
         script = ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")

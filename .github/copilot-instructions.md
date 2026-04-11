@@ -41,7 +41,7 @@ Materializations call helper macros that delegate to `ScriptBuilder` via the ada
 - `@target` = Delta table, `@data` = extracted SS rowset, `@batch_data` = user's transformed data.
 - Virtual columns `_date`, `_serial`, `_source_file` are added during EXTRACT.
 - The partition column (e.g., `event_year_date`) is excluded from EXTRACT and derived from `_date`.
-- Incremental mode sets `@@DeltaLakeCommitCondition = "FailIfPartitionConflict"`.
+- Incremental mode sets `@@DeltaLakeCommitCondition` (configurable via `delta_lake_commit_condition`, default `FailIfFileConflict`).
 
 ## Key conventions
 
