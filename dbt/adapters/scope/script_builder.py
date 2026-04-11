@@ -14,12 +14,15 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from dbt.adapters.events.logging import AdapterLogger
+from dbt_common.exceptions import DbtRuntimeError
 
 from dbt.adapters.scope.checkpoint import VIRTUAL_COLUMNS
 from dbt.adapters.scope.constants import (
+    DEFAULT_DELTA_LAKE_COMMIT_CONDITION,
     DEFAULT_MAX_BYTES_PER_TRIGGER,
     DEFAULT_MAX_FILES_PER_TRIGGER,
     DEFAULT_SAFETY_BUFFER_SECONDS,
+    VALID_DELTA_LAKE_COMMIT_CONDITIONS,
 )
 
 log = AdapterLogger("scope")
@@ -74,6 +77,9 @@ class ScriptConfig:
     au: int = 100
     priority: int = 1
 
+    # Delta Lake commit condition
+    delta_lake_commit_condition: str = DEFAULT_DELTA_LAKE_COMMIT_CONDITION
+
     # Delta table columns (CREATE TABLE schema)
     delta_columns: list[ColumnDef] = field(default_factory=list)
 
@@ -119,6 +125,7 @@ class ScriptBuilder:
 
         parts.append(_header_comment("full-refresh", config.table_name))
         parts.append(_set_feature_previews(config.feature_previews))
+        parts.append(_set_commit_condition(config.delta_lake_commit_condition))
         parts.append(_declare_paths(delta_loc))
         parts.append(_create_table(config.delta_columns, config.partition_by, "@deltaPath"))
         if config.scope_settings:
@@ -160,8 +167,7 @@ class ScriptBuilder:
             )
         )
         parts.append(_set_feature_previews(config.feature_previews))
-        parts.append('SET @@DeltaLakeCommitCondition = "FailIfPartitionConflict";')
-        parts.append("")
+        parts.append(_set_commit_condition(config.delta_lake_commit_condition))
         parts.append(_declare_paths(delta_loc))
         parts.append(_create_table(config.delta_columns, config.partition_by, "@deltaPath"))
         if config.scope_settings:
@@ -212,6 +218,16 @@ def _header_comment(strategy: str, table_name: str) -> str:
 
 def _set_feature_previews(previews: str) -> str:
     return f'SET @@FeaturePreviews = "{previews}";\n'
+
+
+def _set_commit_condition(condition: str) -> str:
+    """Emit ``SET @@DeltaLakeCommitCondition`` after validating the value."""
+    if condition not in VALID_DELTA_LAKE_COMMIT_CONDITIONS:
+        raise DbtRuntimeError(
+            f"Invalid delta_lake_commit_condition '{condition}'. "
+            f"Valid values: {sorted(VALID_DELTA_LAKE_COMMIT_CONDITIONS)}"
+        )
+    return f'SET @@DeltaLakeCommitCondition = "{condition}";\n'
 
 
 def _declare_paths(delta_loc: str) -> str:

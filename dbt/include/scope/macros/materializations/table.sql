@@ -31,6 +31,7 @@
     {%- set delta_table_columns = config.get('delta_table_columns', []) -%}
     {%- set extract_columns = config.get('extract_columns', []) -%}
     {%- set feature_previews = config.get('scope_feature_previews', 'EnableDeltaTableDynamicInsert:on') -%}
+    {%- set delta_lake_commit_condition = config.get('delta_lake_commit_condition', target.delta_lake_commit_condition | default(defaults.delta_lake_commit_condition, true)) -%}
 
     {# -- Delete checkpoint for full refresh -- #}
     {% do adapter.delete_checkpoint(delta_location) %}
@@ -72,7 +73,8 @@
                     feature_previews,
                     sql,
                     ns.file_batch,
-                    is_full_refresh=(ns.batch_num == 1)
+                    is_full_refresh=(ns.batch_num == 1),
+                    delta_lake_commit_condition=delta_lake_commit_condition
                 ) -%}
 
                 {{ log("SCOPE: full-refresh " ~ identifier ~ " batch " ~ ns.batch_num ~ " of " ~ total_batches ~ " (" ~ ns.file_batch | length ~ " files)", info=True) }}
@@ -116,7 +118,8 @@
     model_sql,
     source_files,
     is_full_refresh=false,
-    is_incremental=false
+    is_incremental=false,
+    delta_lake_commit_condition="FailIfFileConflict"
 ) %}
 {# -- Normalize partition_by to a list -- #}
 {%- set partition_cols = partition_by if partition_by is iterable and partition_by is not string else ([partition_by] if partition_by else []) -%}
@@ -129,9 +132,7 @@
 // ============================================================
 
 SET @@FeaturePreviews = "{{ feature_previews }}";
-{% if is_incremental %}
-SET @@DeltaLakeCommitCondition = "FailIfPartitionConflict";
-{% endif %}
+SET @@DeltaLakeCommitCondition = "{{ delta_lake_commit_condition }}";
 
 #DECLARE @deltaPath string = "{{ delta_location }}";
 
