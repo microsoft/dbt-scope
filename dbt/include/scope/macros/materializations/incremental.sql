@@ -77,8 +77,8 @@
         {% do adapter.reset_cycle_count() %}
     {%- endif -%}
 
-    {# -- Loop cap: very large for processing_time, 1000 for available_now -- #}
-    {%- set loop_cap = 999999999 if is_processing_time else 1000 -%}
+    {# -- Loop cap: 99999 for processing_time (under Jinja sandbox MAX_RANGE=100000), 1000 for available_now -- #}
+    {%- set loop_cap = 99999 if is_processing_time else 1000 -%}
 
     {# -- Batching loop: discover → submit → checkpoint → repeat -- #}
     {%- set ns = namespace(
