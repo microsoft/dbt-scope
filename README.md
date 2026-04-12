@@ -326,6 +326,66 @@ The adapter detects the version by checking if a sibling folder exists (e.g., `M
 
 The debug log includes `estimatedBytes` and `contributingFiles` columns in the batch metadata table so you can see the estimated size and which `.du` files contribute to each `.ss` file.
 
+### Streaming / Continuous Processing
+
+By default, dbt-scope uses **`available_now`** semantics: each `dbt run` discovers all pending files, processes them in batches, then exits. This works well when all models process at similar speeds, but fast models are "penalized" — they can't process newly arrived files until the slowest model finishes.
+
+The **`processing_time`** trigger mode solves this by running each model in a continuous loop: discover files → process batches → sleep → repeat. Each model loops independently, so fast models aren't blocked by slow ones.
+
+#### Configuration
+
+Add the `trigger` config to your model's `config()` block:
+
+```sql
+-- Default (current behavior): process all available files, then exit
+{{ config(
+    materialized='incremental',
+    incremental_strategy='append',
+    trigger={'type': 'available_now'},
+    ...
+) }}
+
+-- Continuous processing: loop forever, sleeping 30s between cycles
+{{ config(
+    materialized='incremental',
+    incremental_strategy='append',
+    trigger={'type': 'processing_time', 'interval': '30 seconds'},
+    source_roots=['/shares/...'],
+    ...
+) }}
+
+-- With max_cycles for controlled shutdown (e.g., testing or deployments)
+{{ config(
+    materialized='incremental',
+    incremental_strategy='append',
+    trigger={'type': 'processing_time', 'interval': '10 seconds', 'max_cycles': 100},
+    ...
+) }}
+```
+
+#### Trigger options
+
+| Option       | Type   | Required                    | Description                                                     |
+| ------------ | ------ | --------------------------- | --------------------------------------------------------------- |
+| `type`       | string | No (default: `available_now`) | `available_now` or `processing_time`                           |
+| `interval`   | string | Yes (for `processing_time`)  | Sleep duration between cycles: `'10 seconds'`, `'30s'`, `'5m'` |
+| `max_cycles` | int    | No (default: infinite)       | Maximum number of cycles before exiting                         |
+
+#### Behavior
+
+- **`available_now`**: Current behavior, unchanged. Discover all files → process in batches → exit.
+- **`processing_time`**: Each cycle discovers new files, processes all batches, then sleeps for `interval`. If no files are found, the model logs a message and sleeps. The loop continues until `max_cycles` is reached or a shutdown signal is received.
+
+#### Timeout
+
+`processing_time` models automatically get a 30-day timeout (2,592,000 seconds) so `dbt run` doesn't kill them. You can override this with `job_timeout_seconds` in the model config.
+
+#### Graceful shutdown
+
+Send `SIGTERM` or `SIGINT` (Ctrl+C) to the dbt process. The adapter finishes the current SCOPE job, updates the checkpoint, then exits cleanly. All `processing_time` models respond to the same signal.
+
+> **Note:** `processing_time` is only supported for `incremental` materializations.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).

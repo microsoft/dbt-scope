@@ -19,3 +19,7 @@ VALID_DELTA_LAKE_COMMIT_CONDITIONS: frozenset[str] = frozenset(
     }
 )
 DEFAULT_DELTA_LAKE_COMMIT_CONDITION: str = "FailIfFileConflict"
+
+# Trigger mode constants
+DEFAULT_TRIGGER_TYPE: str = "available_now"
+DEFAULT_PROCESSING_TIME_TIMEOUT_SECONDS: int = 2_592_000  # 30 days
