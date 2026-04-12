@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import signal
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -19,6 +21,7 @@ from dbt.adapters.scope.column import ScopeColumn
 from dbt.adapters.scope.connections import ScopeConnectionHandle, ScopeConnectionManager
 from dbt.adapters.scope.constants import (
     DEFAULT_MAX_BYTES_PER_TRIGGER,
+    DEFAULT_PROCESSING_TIME_TIMEOUT_SECONDS,
     DEFAULT_SAFETY_BUFFER_SECONDS,
     DEFAULT_SOURCE_COMPACTION_INTERVAL,
     DEFAULT_SOURCE_RETENTION_FILES,
@@ -27,8 +30,50 @@ from dbt.adapters.scope.credentials import ScopeCredentials
 from dbt.adapters.scope.file_tracker import FileTracker
 from dbt.adapters.scope.relation import ScopeRelation
 from dbt.adapters.scope.script_builder import ColumnDef, ScriptConfig
+from dbt.adapters.scope.trigger_config import parse_trigger_config
 
 log = AdapterLogger("scope")
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown support
+# ---------------------------------------------------------------------------
+_shutdown_event = threading.Event()
+_signal_handlers_installed = False
+_signal_lock = threading.Lock()
+
+
+def _install_signal_handlers() -> None:
+    """Install SIGTERM/SIGINT handlers that set the shutdown event.
+
+    Safe to call from any thread — only installs handlers when called from
+    the main thread. Subsequent calls are no-ops.
+    """
+    global _signal_handlers_installed
+    if _signal_handlers_installed:
+        return
+    with _signal_lock:
+        if _signal_handlers_installed:
+            return
+        if threading.current_thread() is not threading.main_thread():
+            return
+        _prev_sigterm = signal.getsignal(signal.SIGTERM)
+        _prev_sigint = signal.getsignal(signal.SIGINT)
+
+        def _handler(signum: int, frame: Any) -> None:
+            sig_name = signal.Signals(signum).name
+            log.info(
+                f"Received {sig_name} — requesting graceful shutdown of processing_time models"
+            )
+            _shutdown_event.set()
+            # Chain to previous handler (e.g. dbt's own handler)
+            prev = _prev_sigterm if signum == signal.SIGTERM else _prev_sigint
+            if callable(prev) and prev not in (signal.SIG_DFL, signal.SIG_IGN):
+                prev(signum, frame)
+
+        signal.signal(signal.SIGTERM, _handler)
+        signal.signal(signal.SIGINT, _handler)
+        _signal_handlers_installed = True
+
 
 _TIMESTAMP_COLS = ("accessTime", "modificationTime", "msExpirationTime", "expiryTime")
 _SIZE_COLS = ("length", "blockSize")
@@ -605,6 +650,81 @@ class ScopeAdapter(BaseAdapter):
         self._get_gen1_client().clear_file_cache()
         if hasattr(self, "_discovered_file_infos"):
             self._discovered_file_infos.clear()
+
+    @available
+    def parse_trigger(self, raw_config: dict | None) -> dict:
+        """Parse and validate a trigger config dict from model ``config()``.
+
+        Returns a plain dict suitable for use in Jinja templates with keys:
+        ``type``, ``interval_seconds``, ``max_cycles``.
+        """
+        tc = parse_trigger_config(raw_config)
+        return {
+            "type": tc.type,
+            "interval_seconds": tc.interval.total_seconds(),
+            "max_cycles": tc.max_cycles,
+        }
+
+    @available
+    def get_processing_time_timeout(self) -> int:
+        """Return the default timeout (seconds) for processing_time models."""
+        return DEFAULT_PROCESSING_TIME_TIMEOUT_SECONDS
+
+    @available
+    def wait_for_next_cycle(
+        self,
+        interval_seconds: float,
+        max_cycles: int | None = None,
+    ) -> bool:
+        """Sleep between processing_time cycles; return ``True`` to continue.
+
+        Tracks cycle count per-thread. Returns ``False`` when:
+        - A shutdown signal has been received (``_shutdown_event`` is set)
+        - ``max_cycles`` has been reached
+
+        The sleep is interruptible — if a shutdown signal arrives during
+        ``_shutdown_event.wait()``, it returns immediately.
+        """
+        _install_signal_handlers()
+
+        thread_id = threading.get_ident()
+        if not hasattr(self, "_cycle_counts"):
+            self._cycle_counts: dict[int, int] = {}
+        self._cycle_counts[thread_id] = self._cycle_counts.get(thread_id, 0) + 1
+        cycle = self._cycle_counts[thread_id]
+
+        # Check shutdown before sleeping
+        if _shutdown_event.is_set():
+            log.info(f"Shutdown requested — exiting after cycle {cycle}")
+            self._cycle_counts.pop(thread_id, None)
+            return False
+
+        # Check max_cycles
+        if max_cycles is not None and cycle >= max_cycles:
+            log.info(f"Reached max_cycles={max_cycles} — exiting")
+            self._cycle_counts.pop(thread_id, None)
+            return False
+
+        log.info(f"Cycle {cycle} complete — sleeping for {interval_seconds}s before next cycle")
+
+        # Interruptible sleep — returns True if the event was set during wait
+        interrupted = _shutdown_event.wait(timeout=interval_seconds)
+        if interrupted:
+            log.info(f"Shutdown requested during sleep — exiting after cycle {cycle}")
+            self._cycle_counts.pop(thread_id, None)
+            return False
+
+        return True
+
+    @available
+    def reset_cycle_count(self) -> None:
+        """Reset the cycle counter for the current thread.
+
+        Called at the start of a processing_time model to ensure a fresh count.
+        """
+        thread_id = threading.get_ident()
+        if hasattr(self, "_cycle_counts"):
+            self._cycle_counts.pop(thread_id, None)
 
     @available
     def has_unprocessed_files(

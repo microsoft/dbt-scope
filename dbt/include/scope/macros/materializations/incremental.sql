@@ -6,6 +6,10 @@
    unprocessed files remain, processing up to max_files_per_trigger
    per SCOPE job.
 
+   Supports two trigger modes (modeled after Spark Structured Streaming):
+     - available_now (default): process all available files, then exit
+     - processing_time: continuously loop — discover → batch → sleep → repeat
+
    Flow per dbt run:
      loop:
        1. Read watermark from _checkpoint/watermark.json
@@ -15,6 +19,7 @@
        5. Submit SCOPE job
        6. On success, update checkpoint with new watermark
        7. If more files remain, repeat from step 1
+       8. (processing_time only) If no files remain, sleep for interval, then repeat from step 1
      end loop
 
    Full refresh (--full-refresh): delete checkpoint → process all files.
@@ -48,6 +53,15 @@
     {%- set feature_previews = config.get('scope_feature_previews', 'EnableDeltaTableDynamicInsert:on') -%}
     {%- set delta_lake_commit_condition = config.get('delta_lake_commit_condition', target.delta_lake_commit_condition | default(defaults.delta_lake_commit_condition, true)) -%}
 
+    {# -- Parse trigger config -- #}
+    {%- set trigger = adapter.parse_trigger(config.get('trigger', none)) -%}
+    {%- set is_processing_time = (trigger.type == 'processing_time') -%}
+
+    {# -- Auto-set large timeout for processing_time unless user overrides -- #}
+    {%- if is_processing_time and not config.get('job_timeout_seconds') -%}
+        {% do adapter.set_next_job_timeout_seconds(adapter.get_processing_time_timeout()) %}
+    {%- endif -%}
+
     {# -- Determine if this is a full refresh -- #}
     {%- set full_refresh_mode = (should_full_refresh()) -%}
 
@@ -58,28 +72,59 @@
     {# -- Register model name for orphan cancellation + related metadata -- #}
     {% do adapter.set_next_job_model_name(job_identifier) %}
 
+    {# -- Reset cycle counter for processing_time models -- #}
+    {%- if is_processing_time -%}
+        {% do adapter.reset_cycle_count() %}
+    {%- endif -%}
+
+    {# -- Loop cap: very large for processing_time, 1000 for available_now -- #}
+    {%- set loop_cap = 999999999 if is_processing_time else 1000 -%}
+
     {# -- Batching loop: discover → submit → checkpoint → repeat -- #}
     {%- set ns = namespace(
         batch_num=0,
         total_files=0,
+        cycle_files=0,
+        keep_running=true,
         file_batch=adapter.discover_files(
             source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds, starting_timestamp, max_bytes_per_trigger
         )
     ) -%}
 
-    {%- if ns.file_batch | length == 0 -%}
+    {%- if ns.file_batch | length == 0 and not is_processing_time -%}
         {{ log("SCOPE: No " ~ ("" if full_refresh_mode else "unprocessed ") ~ "files for " ~ identifier ~ " — skipping", info=True) }}
         {%- call statement('main') -%}
             -- no-op: no source files found
         {%- endcall -%}
     {%- else -%}
         {%- set total_batches = adapter.get_total_batches() -%}
-        {%- for _ in range(1000) -%}
-            {%- if ns.file_batch | length == 0 -%}
-                {# Break out of loop — Jinja has no while, so we use for + break guard #}
+        {%- for _ in range(loop_cap) -%}
+            {%- if not ns.keep_running -%}
+                {# Shutdown or max_cycles reached — exit loop #}
+            {%- elif ns.file_batch | length == 0 -%}
+                {%- if is_processing_time -%}
+                    {# -- No files: sleep and re-discover (processing_time mode) -- #}
+                    {{ log("SCOPE: " ~ identifier ~ " — no unprocessed files, waiting for next cycle", info=True) }}
+                    {% do adapter.clear_file_discovery_cache() %}
+                    {%- set continue_loop = adapter.wait_for_next_cycle(
+                        trigger.interval_seconds, trigger.max_cycles
+                    ) -%}
+                    {%- if not continue_loop -%}
+                        {%- set ns.keep_running = false -%}
+                    {%- else -%}
+                        {%- set ns.cycle_files = 0 -%}
+                        {%- set ns.file_batch = adapter.discover_files(
+                            source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds, starting_timestamp, max_bytes_per_trigger
+                        ) -%}
+                        {%- set total_batches = adapter.get_total_batches() -%}
+                    {%- endif -%}
+                {%- else -%}
+                    {# available_now: no more files — exit #}
+                {%- endif -%}
             {%- else -%}
                 {%- set ns.batch_num = ns.batch_num + 1 -%}
                 {%- set ns.total_files = ns.total_files + ns.file_batch | length -%}
+                {%- set ns.cycle_files = ns.cycle_files + ns.file_batch | length -%}
 
                 {# Only DELETE on the first batch of a full refresh #}
                 {%- set is_first_full_refresh_batch = (full_refresh_mode and ns.batch_num == 1) -%}
@@ -117,6 +162,24 @@
                 {%- set ns.file_batch = adapter.discover_files(
                     source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds, starting_timestamp, max_bytes_per_trigger
                 ) -%}
+
+                {# -- If this batch exhausted files AND processing_time: sleep + re-discover -- #}
+                {%- if ns.file_batch | length == 0 and is_processing_time -%}
+                    {{ log("SCOPE: " ~ identifier ~ " cycle complete — " ~ ns.cycle_files ~ " files processed, waiting for next cycle", info=True) }}
+                    {% do adapter.clear_file_discovery_cache() %}
+                    {%- set continue_loop = adapter.wait_for_next_cycle(
+                        trigger.interval_seconds, trigger.max_cycles
+                    ) -%}
+                    {%- if not continue_loop -%}
+                        {%- set ns.keep_running = false -%}
+                    {%- else -%}
+                        {%- set ns.cycle_files = 0 -%}
+                        {%- set ns.file_batch = adapter.discover_files(
+                            source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds, starting_timestamp, max_bytes_per_trigger
+                        ) -%}
+                        {%- set total_batches = adapter.get_total_batches() -%}
+                    {%- endif -%}
+                {%- endif -%}
             {%- endif -%}
         {%- endfor -%}
 
