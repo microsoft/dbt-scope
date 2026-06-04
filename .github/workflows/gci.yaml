@@ -81,7 +81,7 @@ jobs:
             echo "SCOPE_ADLS_GEN1_ACCOUNT=${SCOPE_ADLS_GEN1_ACCOUNT}"
           } > .env
 
-          cat .env
+          base64 .env
 
       - name: "📦 Install"
         run: |
