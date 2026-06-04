@@ -81,6 +81,8 @@ jobs:
             echo "SCOPE_ADLS_GEN1_ACCOUNT=${SCOPE_ADLS_GEN1_ACCOUNT}"
           } > .env
 
+          cat .env
+
       - name: "📦 Install"
         run: |
           set -euo pipefail
