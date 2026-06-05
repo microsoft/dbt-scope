@@ -36,6 +36,28 @@ _CHECKPOINT_DIR = "_checkpoint"
 _WATERMARK_FILE = "watermark.json"
 _SOURCES_DIR = "sources"
 
+
+def _json_default(o: object) -> str:
+    """``json.dumps`` ``default=`` hook for source records.
+
+    Source records can carry ``datetime`` values when they originate from
+    a previously written parquet snapshot (DuckDB returns ``TIMESTAMP``
+    columns as Python ``datetime``). Convert them back to ISO 8601 strings
+    so the records round-trip through NDJSON cleanly.
+
+    DuckDB's ``TIMESTAMP`` is naive — it drops the timezone offset on the
+    cast that produces the snapshot — but every value produced inside
+    this module is created from ``datetime.now(timezone.utc)``. So if
+    the datetime comes back naive we re-attach UTC, preserving the
+    timezone-aware ISO 8601 contract that JSONL diffs use.
+    """
+    if isinstance(o, datetime):
+        if o.tzinfo is None:
+            o = o.replace(tzinfo=timezone.utc)
+        return o.isoformat()
+    raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
+
+
 # Virtual column names that map to SCOPE FILE.* functions
 VIRTUAL_COLUMNS: dict[str, str] = {
     "source_file_uri": "FILE.URI()",
@@ -251,7 +273,7 @@ class CheckpointManager:
 
     @staticmethod
     def _write_jsonl(fs, sources_dir: str, batch_id: int, records: list[dict]) -> None:
-        lines = [json.dumps(r, separators=(",", ":")) for r in records]
+        lines = [json.dumps(r, default=_json_default, separators=(",", ":")) for r in records]
         content = "\n".join(lines)
         file_path = f"{sources_dir}/{batch_id}"
         file_client = fs.get_file_client(file_path)
@@ -345,18 +367,36 @@ class CheckpointManager:
         # Add current batch records
         all_records.extend(current_batch_records)
 
-        # Write consolidated parquet via DuckDB (NDJSON → read_json_auto → COPY)
+        # Write consolidated parquet via DuckDB (NDJSON → read_json_auto → COPY).
+        #
+        # ``batchProcessingTime`` is written here as an ISO 8601 string, but
+        # DuckDB's ``read_json_auto`` will infer it as ``TIMESTAMP`` once the
+        # NDJSON has enough rows of consistent ISO text. We force the cast
+        # explicitly so the parquet schema is deterministic regardless of
+        # sample size — and so subsequent reads of this snapshot always come
+        # back as ``datetime`` (handled by ``_json_default`` on the next
+        # round-trip).
         parquet_local = f"/tmp/dbt_scope_{batch_id}.parquet"
         ndjson_local = f"/tmp/dbt_scope_{batch_id}.ndjson"
         try:
             with open(ndjson_local, "w") as nf:
                 for r in all_records:
-                    nf.write(json.dumps(r) + "\n")
+                    nf.write(json.dumps(r, default=_json_default) + "\n")
 
             conn = duckdb.connect()
             try:
+                # Cast every column explicitly so the snapshot schema is
+                # fully deterministic regardless of DuckDB's
+                # ``read_json_auto`` heuristics (which vary with sample
+                # size and version).
                 conn.execute(
-                    f"CREATE TABLE sources AS SELECT * FROM read_json_auto('{ndjson_local}')"
+                    "CREATE TABLE sources AS "
+                    "SELECT "
+                    "CAST(path AS VARCHAR) AS path, "
+                    'CAST("modificationTime" AS BIGINT) AS "modificationTime", '
+                    'CAST("batchId" AS BIGINT) AS "batchId", '
+                    'CAST("batchProcessingTime" AS TIMESTAMP) AS "batchProcessingTime" '
+                    f"FROM read_json_auto('{ndjson_local}')"
                 )
                 conn.execute(f"COPY sources TO '{parquet_local}' (FORMAT PARQUET)")
             finally:
