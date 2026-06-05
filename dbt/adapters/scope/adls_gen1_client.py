@@ -15,10 +15,11 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
 from azure.datalake.store import core as adls_core
-from azure.identity import AzureCliCredential
+from azure.identity import AzureCliCredential, CredentialUnavailableError
 from dbt.adapters.events.logging import AdapterLogger
 
-from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK, FileLock
+from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK
+from dbt.adapters.scope.delta_lake import LockedTokenCredential, RetryPolicy
 
 log = AdapterLogger("scope")
 
@@ -88,6 +89,11 @@ def _list_one_dir(
     except FileNotFoundError:
         log.debug(f"Path not found (skipping): {dir_path}")
         return [], [], dir_path, depth, (time.monotonic() - t0) * 1000
+    except CredentialUnavailableError:
+        # Don't mask auth failures as "no files" — that would silently
+        # skip source ingestion. Surface the error so dbt fails loudly.
+        log.error(f"_list_directory: credential acquisition exhausted for {dir_path}")
+        raise
     except Exception:
         log.warning(f"Failed to list {dir_path} (skipping)")
         return [], [], dir_path, depth, (time.monotonic() - t0) * 1000
@@ -106,9 +112,11 @@ class AdlsGen1Client:
         account: str,
         *,
         lock_file: str = AZ_CLI_TOKEN_LOCK,
+        retry_policy: RetryPolicy | None = None,
     ) -> None:
         self._account = account
         self._lock_file = lock_file
+        self._retry_policy = retry_policy
         self._fs: adls_core.AzureDLFileSystem | None = None
         self._file_cache: dict[tuple[str, str | None], list[FileInfo]] = {}
         self._enrichment_cache: dict[str, tuple[int, tuple[str, ...]]] = {}
@@ -116,8 +124,14 @@ class AdlsGen1Client:
     def _get_fs(self) -> adls_core.AzureDLFileSystem:
         """Lazily initialize the ADLS Gen1 filesystem client."""
         if self._fs is None:
-            with FileLock(self._lock_file):
-                credential = AzureCliCredential()
+            # Wrap in LockedTokenCredential so the ``get_token`` calls
+            # that ``AzureDLFileSystem`` makes internally inherit both
+            # the file lock and the credential retry policy.
+            credential = LockedTokenCredential(
+                AzureCliCredential(),
+                lock_file=self._lock_file,
+                retry_policy=self._retry_policy,
+            )
             self._fs = adls_core.AzureDLFileSystem(
                 token_credential=credential,
                 store_name=self._account,
@@ -170,6 +184,9 @@ class AdlsGen1Client:
             except FileNotFoundError:
                 log.debug(f"Path not found: {root}")
                 return []
+            except CredentialUnavailableError:
+                log.error(f"list_files: credential acquisition exhausted for {root}")
+                raise
             except Exception:
                 log.warning(f"Failed to list {root}")
                 return []
@@ -239,6 +256,13 @@ class AdlsGen1Client:
                     futures.pop(completed)
                     try:
                         files, dirs, dir_path, depth, elapsed_ms = completed.result()
+                    except CredentialUnavailableError:
+                        # Don't swallow exhausted credential retries —
+                        # otherwise discovery returns a partial file list
+                        # and the watermark advances past unseen files.
+                        for pending in futures:
+                            pending.cancel()
+                        raise
                     except Exception:
                         dirs_done += 1
                         continue
@@ -344,6 +368,9 @@ class AdlsGen1Client:
                         contributing_files=contrib_tuple,
                     )
                 )
+            except CredentialUnavailableError:
+                log.error(f"enrich_with_estimates: credential acquisition exhausted for {f.path}")
+                raise
             except Exception:
                 log.warning(f"Failed to estimate bytes for {f.path} — using file length")
                 self._enrichment_cache[f.path] = (f.length, ())
@@ -364,6 +391,9 @@ class AdlsGen1Client:
             return info.get("type") == "DIRECTORY"
         except FileNotFoundError:
             return False
+        except CredentialUnavailableError:
+            log.error(f"_directory_exists: credential acquisition exhausted for {path}")
+            raise
         except Exception:
             log.debug(f"_directory_exists: error checking {path} — assuming not exists")
             return False
@@ -383,6 +413,9 @@ class AdlsGen1Client:
                 entries = fs.ls(current, detail=True)
             except FileNotFoundError:
                 continue
+            except CredentialUnavailableError:
+                log.error(f"_list_directory_files: credential acquisition exhausted for {current}")
+                raise
             except Exception:
                 log.debug(f"_list_directory_files: failed to list {current} — skipping")
                 continue

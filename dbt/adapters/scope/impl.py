@@ -27,6 +27,7 @@ from dbt.adapters.scope.constants import (
     DEFAULT_SOURCE_RETENTION_FILES,
 )
 from dbt.adapters.scope.credentials import ScopeCredentials
+from dbt.adapters.scope.delta_lake import RetryPolicy
 from dbt.adapters.scope.file_tracker import FileTracker
 from dbt.adapters.scope.relation import ScopeRelation
 from dbt.adapters.scope.script_builder import ColumnDef, ScriptConfig
@@ -276,7 +277,7 @@ class ScopeAdapter(BaseAdapter):
             return []
 
         try:
-            from azure.identity import AzureCliCredential
+            from azure.identity import AzureCliCredential, CredentialUnavailableError
             from azure.storage.filedatalake import DataLakeServiceClient
 
             from dbt.adapters.scope.delta_lake import LockedTokenCredential
@@ -287,7 +288,10 @@ class ScopeAdapter(BaseAdapter):
                 f"{creds.delta_base_path} for Delta tables"
             )
 
-            credential = LockedTokenCredential(AzureCliCredential())
+            credential = LockedTokenCredential(
+                AzureCliCredential(),
+                retry_policy=RetryPolicy.from_http_retries(creds.http_retries),
+            )
             service = DataLakeServiceClient(
                 account_url=f"https://{creds.storage_account}.dfs.core.windows.net",
                 credential=credential,
@@ -325,6 +329,8 @@ class ScopeAdapter(BaseAdapter):
                         f"list_relations: [{i + 1}/{len(dirs)}] {table_name} — "
                         f"Delta table found in {elapsed_ms:.1f} ms"
                     )
+                except CredentialUnavailableError:
+                    raise
                 except Exception:
                     elapsed_ms = (time.monotonic() - t0) * 1000
                     log.debug(
@@ -335,6 +341,11 @@ class ScopeAdapter(BaseAdapter):
             total_ms = (time.monotonic() - t_start) * 1000
             log.debug(f"list_relations: found {len(relations)} Delta tables in {total_ms:.1f} ms")
             return relations
+        except CredentialUnavailableError:
+            log.error(
+                f"list_relations: credential acquisition exhausted for {creds.delta_base_path}"
+            )
+            raise
         except Exception:
             log.debug(f"No Delta tables found at {creds.delta_base_path} (path may not exist yet)")
             return []
@@ -808,13 +819,19 @@ class ScopeAdapter(BaseAdapter):
         """Return an ADLS Gen1 client for the configured account."""
         if not hasattr(self, "_gen1_client"):
             creds = self._credentials()
-            self._gen1_client = AdlsGen1Client(account=creds.adls_gen1_account)
+            self._gen1_client = AdlsGen1Client(
+                account=creds.adls_gen1_account,
+                retry_policy=RetryPolicy.from_http_retries(creds.http_retries),
+            )
         return self._gen1_client
 
     def _get_checkpoint_manager(self) -> CheckpointManager:
         """Return the checkpoint manager singleton."""
         if not hasattr(self, "_checkpoint_manager"):
-            self._checkpoint_manager = CheckpointManager()
+            creds = self._credentials()
+            self._checkpoint_manager = CheckpointManager(
+                retry_policy=RetryPolicy.from_http_retries(creds.http_retries),
+            )
         return self._checkpoint_manager
 
     def _get_file_tracker(self) -> FileTracker:

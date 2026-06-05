@@ -23,8 +23,9 @@ from dbt_common.exceptions import DbtDatabaseError, DbtRuntimeError
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK, FileLock
+from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK
 from dbt.adapters.scope.credentials import ScopeCredentials
+from dbt.adapters.scope.delta_lake import LockedTokenCredential, RetryPolicy
 
 log = AdapterLogger("scope")
 
@@ -93,7 +94,11 @@ class ScopeConnectionHandle:
         self._account = credentials.adla_account
         self._base_url = f"https://{self._account}.azuredatalakeanalytics.net"
         self._timeout = credentials.http_timeout_seconds
-        self._credential = AzureCliCredential()
+        self._credential = LockedTokenCredential(
+            AzureCliCredential(),
+            lock_file=AZ_CLI_TOKEN_LOCK,
+            retry_policy=RetryPolicy.from_http_retries(credentials.http_retries),
+        )
         self._session = self._build_session(credentials.http_retries)
         self._cached_token: str | None = None
         self._token_expires_at: float = 0
@@ -302,8 +307,9 @@ class ScopeConnectionHandle:
     def _get_token(self) -> str:
         if self._cached_token and time.time() < self._token_expires_at - 300:
             return self._cached_token
-        with FileLock(AZ_CLI_TOKEN_LOCK):
-            token = self._credential.get_token(ADLA_TOKEN_SCOPE)
+        # ``LockedTokenCredential`` handles both the FileLock and retry on
+        # transient ``CredentialUnavailableError`` failures.
+        token = self._credential.get_token(ADLA_TOKEN_SCOPE)
         self._cached_token = token.token
         self._token_expires_at = token.expires_on
         return self._cached_token

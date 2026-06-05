@@ -12,6 +12,7 @@ integration tests share one implementation for:
 from __future__ import annotations
 
 import re
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -21,7 +22,7 @@ from typing import Any
 
 import duckdb
 from azure.core.credentials import AccessToken, TokenCredential
-from azure.identity import AzureCliCredential
+from azure.identity import AzureCliCredential, CredentialUnavailableError
 from azure.storage.filedatalake import DataLakeServiceClient
 from dbt.adapters.events.logging import AdapterLogger
 from dbt_common.exceptions import DbtRuntimeError
@@ -76,18 +77,87 @@ class AbfssLocation:
         return f"https://{self.account}.dfs.core.windows.net"
 
 
+@dataclass(frozen=True)
+class RetryPolicy:
+    """Linear-backoff retry policy for transient credential failures.
+
+    ``max_retries`` is the number of additional attempts AFTER the first
+    try — matching the semantics of urllib3's ``Retry(total=...)``.
+    Total attempts == ``max_retries + 1``.
+
+    Delay between attempts is ``min(attempt * initial_delay_seconds,
+    max_delay_seconds)`` (linear, capped). No jitter — keep it
+    deterministic for testing.
+    """
+
+    max_retries: int = 10
+    initial_delay_seconds: float = 1.0
+    max_delay_seconds: float = 10.0
+
+    @classmethod
+    def from_http_retries(cls, http_retries: int | None) -> RetryPolicy:
+        """Build a policy from the ``http_retries`` profile field.
+
+        Reuses the same field as the urllib3 HTTP retry count for
+        consistency. ``None`` (or any value below 0) returns the
+        defaults: 10 retries, 1s linear, 10s cap.
+        """
+        if http_retries is None or http_retries < 0:
+            return cls()
+        return cls(
+            max_retries=http_retries,
+            initial_delay_seconds=1.0,
+            max_delay_seconds=10.0,
+        )
+
+
 class LockedTokenCredential(TokenCredential):
     """Serialize token acquisition for credentials that share a cache on disk."""
 
-    def __init__(self, credential: TokenCredential, lock_file: str = AZ_CLI_TOKEN_LOCK) -> None:
+    def __init__(
+        self,
+        credential: TokenCredential,
+        lock_file: str = AZ_CLI_TOKEN_LOCK,
+        retry_policy: RetryPolicy | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
         self._credential = credential
         self._lock_file = lock_file
+        self._retry_policy = retry_policy or RetryPolicy()
+        self._sleep = sleep
 
     def get_token(self, *scopes: str, claims: str | None = None, **kwargs: Any) -> AccessToken:
-        with FileLock(self._lock_file):
-            if claims is None:
-                return self._credential.get_token(*scopes, **kwargs)
-            return self._credential.get_token(*scopes, claims=claims, **kwargs)
+        # ``CredentialUnavailableError`` is what ``AzureCliCredential`` raises
+        # when the underlying ``az`` subprocess times out or otherwise fails
+        # transiently (it wraps ``subprocess.TimeoutExpired`` and friends).
+        # Retry with linear backoff while releasing the file lock between
+        # attempts so other workers get a fair chance at the lock.
+        policy = self._retry_policy
+        last_exc: CredentialUnavailableError | None = None
+        for attempt in range(1, policy.max_retries + 2):  # +1 for the initial try
+            try:
+                with FileLock(self._lock_file):
+                    if claims is None:
+                        return self._credential.get_token(*scopes, **kwargs)
+                    return self._credential.get_token(*scopes, claims=claims, **kwargs)
+            except CredentialUnavailableError as exc:
+                last_exc = exc
+                if attempt > policy.max_retries:
+                    log.error(
+                        f"Azure credential acquisition failed after "
+                        f"{policy.max_retries + 1} attempts: {exc.message}"
+                    )
+                    raise
+                delay = min(policy.initial_delay_seconds * attempt, policy.max_delay_seconds)
+                log.warning(
+                    f"Azure credential acquisition failed "
+                    f"(attempt {attempt}/{policy.max_retries + 1}): "
+                    f"{exc.message}. Retrying in {delay:.1f}s"
+                )
+                self._sleep(delay)
+        # Unreachable: the loop either returns or raises. Keep mypy happy.
+        assert last_exc is not None
+        raise last_exc
 
 
 class DeltaLakeClient(ABC):
@@ -118,6 +188,9 @@ class DeltaLakeClient(ABC):
             escaped_location = _sql_literal(delta_location)
             self.fetchone(f"SELECT 1 FROM delta_scan('{escaped_location}') LIMIT 0")
             return True
+        except CredentialUnavailableError:
+            log.error(f"table_exists: credential acquisition exhausted for {delta_location}")
+            raise
         except Exception:
             log.debug(f"table_exists({delta_location}) → False (not found or error)")
             return False
@@ -135,6 +208,9 @@ class DeltaLakeClient(ABC):
                 log.debug(f"get_max_partition({delta_location}, {partition_col}) → {result}")
                 return result
             return None
+        except CredentialUnavailableError:
+            log.error(f"get_max_partition: credential acquisition exhausted for {delta_location}")
+            raise
         except Exception:
             log.debug(f"get_max_partition({delta_location}, {partition_col}) → None (error)")
             return None
@@ -150,6 +226,9 @@ class DeltaLakeClient(ABC):
             columns = [column[0] for column in column_description]
             log.debug(f"get_columns({delta_location}) → {columns!s}")
             return columns
+        except CredentialUnavailableError:
+            log.error(f"get_columns: credential acquisition exhausted for {delta_location}")
+            raise
         except Exception:
             log.debug(f"get_columns({delta_location}) → None (error)")
             return None
@@ -234,8 +313,11 @@ class DuckDbDeltaLakeClient(DeltaLakeClient):
         *,
         connection_factory: Callable[[], duckdb.DuckDBPyConnection] | None = None,
         lock_file: str = AZ_CLI_TOKEN_LOCK,
+        retry_policy: RetryPolicy | None = None,
     ) -> None:
-        self._credential = LockedTokenCredential(credential, lock_file=lock_file)
+        self._credential = LockedTokenCredential(
+            credential, lock_file=lock_file, retry_policy=retry_policy
+        )
         self._connection_factory = connection_factory or duckdb.connect
 
     @contextmanager
@@ -273,6 +355,9 @@ class DuckDbDeltaLakeClient(DeltaLakeClient):
                 for path in file_system.get_paths(path=prefix, recursive=True)
                 if not getattr(path, "is_directory", False)
             ]
+        except CredentialUnavailableError:
+            log.error(f"list_table_paths: credential acquisition exhausted for {delta_location}")
+            raise
         except Exception:
             log.warning(f"list_table_paths({delta_location}) failed")
             return []

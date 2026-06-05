@@ -257,6 +257,65 @@ class TestAdlsGen1Client:
 
     @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
     @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
+    def test_recursive_subdir_credential_exhaustion_propagates(self, mock_cred, mock_adls):
+        """If a subdirectory raises CredentialUnavailableError, ``list_files`` must
+        propagate it — otherwise the watermark advances past unseen files.
+
+        Regression for the ``CredentialUnavailableError: Failed to invoke the
+        Azure CLI`` resiliency work (PR #32).
+        """
+        from azure.identity import CredentialUnavailableError
+
+        mock_fs = MagicMock()
+
+        root_entries = [
+            {"name": "/shares/test/good_dir", "type": "DIRECTORY"},
+            {"name": "/shares/test/bad_dir", "type": "DIRECTORY"},
+        ]
+        good_dir_entries = [
+            {
+                "name": "/shares/test/good_dir/ok.ss",
+                "type": "FILE",
+                "length": 100,
+                "modificationTime": 1775018672000,
+            },
+        ]
+
+        def mock_ls(path, detail=True):
+            if path == "/shares/test/bad_dir":
+                # Simulate ``LockedTokenCredential`` retries being
+                # exhausted under the parallel walk.
+                raise CredentialUnavailableError(message="Failed to invoke the Azure CLI")
+            return {
+                "/shares/test": root_entries,
+                "/shares/test/good_dir": good_dir_entries,
+            }[path]
+
+        mock_fs.ls.side_effect = mock_ls
+        mock_adls.AzureDLFileSystem.return_value = mock_fs
+
+        client = AdlsGen1Client("test-account")
+        with pytest.raises(CredentialUnavailableError):
+            client.list_files("/shares/test", recursive=True)
+
+    @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
+    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
+    def test_non_recursive_credential_exhaustion_propagates(self, mock_cred, mock_adls):
+        """Same guarantee for the non-recursive top-level ``ls`` path."""
+        from azure.identity import CredentialUnavailableError
+
+        mock_fs = MagicMock()
+        mock_fs.ls.side_effect = CredentialUnavailableError(
+            message="Failed to invoke the Azure CLI"
+        )
+        mock_adls.AzureDLFileSystem.return_value = mock_fs
+
+        client = AdlsGen1Client("test-account")
+        with pytest.raises(CredentialUnavailableError):
+            client.list_files("/shares/test", recursive=False)
+
+    @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
+    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
     def test_recursive_deep_nesting(self, mock_cred, mock_adls):
         """Parallel walk works with nested subdirectories (depth > 1)."""
         mock_fs = MagicMock()

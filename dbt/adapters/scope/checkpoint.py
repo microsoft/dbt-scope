@@ -23,12 +23,12 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from azure.identity import AzureCliCredential
+from azure.identity import AzureCliCredential, CredentialUnavailableError
 from azure.storage.filedatalake import DataLakeServiceClient
 from dbt.adapters.events.logging import AdapterLogger
 
 from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK
-from dbt.adapters.scope.delta_lake import AbfssLocation, LockedTokenCredential
+from dbt.adapters.scope.delta_lake import AbfssLocation, LockedTokenCredential, RetryPolicy
 
 log = AdapterLogger("scope")
 
@@ -109,8 +109,15 @@ def _get_service(parsed: AbfssLocation, credential: LockedTokenCredential) -> Da
 class CheckpointManager:
     """Manage ``_checkpoint/`` on ADLS Gen2 Delta table roots."""
 
-    def __init__(self, *, lock_file: str = AZ_CLI_TOKEN_LOCK) -> None:
-        self._credential = LockedTokenCredential(AzureCliCredential(), lock_file=lock_file)
+    def __init__(
+        self,
+        *,
+        lock_file: str = AZ_CLI_TOKEN_LOCK,
+        retry_policy: RetryPolicy | None = None,
+    ) -> None:
+        self._credential = LockedTokenCredential(
+            AzureCliCredential(), lock_file=lock_file, retry_policy=retry_policy
+        )
 
     # -- Watermark ---------------------------------------------------------
 
@@ -135,6 +142,11 @@ class CheckpointManager:
                 f"batch_id={watermark.batch_id}"
             )
             return watermark
+        except CredentialUnavailableError:
+            # Don't mask auth failures as "no checkpoint" — that would
+            # silently flip an incremental run into a full refresh.
+            log.error(f"read_watermark: credential acquisition exhausted for {delta_location}")
+            raise
         except Exception:
             log.debug(f"No checkpoint found for {delta_location} (first run or full refresh)")
             return None

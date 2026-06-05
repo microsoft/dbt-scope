@@ -81,6 +81,27 @@ class TestCheckpointManagerWatermark:
         mock_service.return_value.get_file_system_client.return_value = mock_fs
         assert CheckpointManager().read_watermark("abfss://c@a.dfs.core.windows.net/d/t") is None
 
+    @patch("dbt.adapters.scope.checkpoint.DataLakeServiceClient")
+    @patch("dbt.adapters.scope.checkpoint.AzureCliCredential")
+    def test_read_watermark_propagates_credential_exhaustion(self, mock_cred, mock_service):
+        """``read_watermark`` MUST NOT swallow ``CredentialUnavailableError``.
+
+        Returning ``None`` on auth failure would silently flip an
+        incremental run into a full refresh and re-ingest the entire
+        source history. Regression for PR #32.
+        """
+        import pytest
+        from azure.identity import CredentialUnavailableError
+
+        mock_fs = MagicMock()
+        mock_fs.get_file_client.side_effect = CredentialUnavailableError(
+            message="Failed to invoke the Azure CLI"
+        )
+        mock_service.return_value.get_file_system_client.return_value = mock_fs
+
+        with pytest.raises(CredentialUnavailableError):
+            CheckpointManager().read_watermark("abfss://c@a.dfs.core.windows.net/d/t")
+
     def test_read_watermark_none_for_bad_path(self):
         assert CheckpointManager().read_watermark("https://bad") is None
 
