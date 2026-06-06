@@ -29,6 +29,7 @@ class TestScopeCredentials:
         assert creds.poll_interval_seconds == 5
         assert creds.job_timeout_seconds == 36_000
         assert creds.delta_base_path == "delta"
+        assert creds.max_file_count_per_output_file_set == 5000
 
     def test_custom_values(self):
         creds = ScopeCredentials(
@@ -37,6 +38,7 @@ class TestScopeCredentials:
             container="mycontainer",
             au=50,
             priority=2,
+            max_file_count_per_output_file_set=250000,
             **_BASE_KWARGS,
         )
         assert creds.adla_account == "my-adla"
@@ -44,3 +46,8 @@ class TestScopeCredentials:
         assert creds.container == "mycontainer"
         assert creds.au == 50
         assert creds.priority == 2
+        assert creds.max_file_count_per_output_file_set == 250000
+
+    def test_max_file_count_in_connection_keys(self):
+        creds = ScopeCredentials(adla_account="test-account", **_BASE_KWARGS)
+        assert "max_file_count_per_output_file_set" in creds._connection_keys()

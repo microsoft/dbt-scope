@@ -10,6 +10,14 @@ DEFAULT_SAFETY_BUFFER_SECONDS: int = 30
 DEFAULT_SOURCE_COMPACTION_INTERVAL: int = 10
 DEFAULT_SOURCE_RETENTION_FILES: int = 100
 
+# SCOPE @@MaxFileCountPerOutputFileSet cap. Compiler upstream allows [1, 1_000_000]
+# with a default of 100_000, but Fabric/OneLake clusters often enforce a stricter
+# 5_000 ceiling at runtime, so the adapter mirrors that as its safe default and
+# always emits the SET explicitly to make the value deterministic.
+DEFAULT_MAX_FILE_COUNT_PER_OUTPUT_FILE_SET: int = 5000
+MAX_FILE_COUNT_PER_OUTPUT_FILE_SET_MIN: int = 1
+MAX_FILE_COUNT_PER_OUTPUT_FILE_SET_MAX: int = 1_000_000
+
 # Valid values for @@DeltaLakeCommitCondition
 VALID_DELTA_LAKE_COMMIT_CONDITIONS: frozenset[str] = frozenset(
     {

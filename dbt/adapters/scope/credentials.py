@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 from dbt.adapters.contracts.connection import Credentials
 
+from dbt.adapters.scope.constants import DEFAULT_MAX_FILE_COUNT_PER_OUTPUT_FILE_SET
+
 
 @dataclass
 class ScopeCredentials(Credentials):
@@ -26,6 +28,7 @@ class ScopeCredentials(Credentials):
               priority: 1
               max_files_per_trigger: 50
               max_bytes_per_trigger: 10737418240000  # ~10 TB
+              max_file_count_per_output_file_set: 5000  # SCOPE @@MaxFileCountPerOutputFileSet
     """
 
     adla_account: str = ""
@@ -39,6 +42,7 @@ class ScopeCredentials(Credentials):
     job_timeout_seconds: int = 36_000
     max_files_per_trigger: int = 50
     max_bytes_per_trigger: int = 10_737_418_240_000  # ~10 TB
+    max_file_count_per_output_file_set: int = DEFAULT_MAX_FILE_COUNT_PER_OUTPUT_FILE_SET
     http_timeout_seconds: int = 120
     http_retries: int = 10
     scope_feature_previews: str | None = "EnableDeltaTableDynamicInsert:on"
@@ -63,5 +67,6 @@ class ScopeCredentials(Credentials):
             "priority",
             "max_files_per_trigger",
             "max_bytes_per_trigger",
+            "max_file_count_per_output_file_set",
             "delta_lake_commit_condition",
         )

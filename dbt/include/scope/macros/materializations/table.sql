@@ -22,6 +22,10 @@
     {%- set source_patterns = config.get('source_patterns', ['.*\\.ss$']) -%}
     {%- set max_files_per_trigger = config.get('max_files_per_trigger', target.max_files_per_trigger) | int -%}
     {%- set max_bytes_per_trigger = config.get('max_bytes_per_trigger', target.max_bytes_per_trigger) | int -%}
+    {%- set max_file_count_per_output_file_set = config.get(
+        'max_file_count_per_output_file_set',
+        target.max_file_count_per_output_file_set | default(defaults.max_file_count_per_output_file_set, true)
+    ) | int -%}
     {%- set safety_buffer_seconds = config.get('safety_buffer_seconds', defaults.safety_buffer_seconds) | int -%}
     {%- set source_compaction_interval = config.get('source_compaction_interval', defaults.source_compaction_interval) | int -%}
     {%- set source_retention_files = config.get('source_retention_files', defaults.source_retention_files) | int -%}
@@ -74,7 +78,8 @@
                     sql,
                     ns.file_batch,
                     is_full_refresh=(ns.batch_num == 1),
-                    delta_lake_commit_condition=delta_lake_commit_condition
+                    delta_lake_commit_condition=delta_lake_commit_condition,
+                    max_file_count_per_output_file_set=max_file_count_per_output_file_set
                 ) -%}
 
                 {{ log("SCOPE: full-refresh " ~ identifier ~ " batch " ~ ns.batch_num ~ " of " ~ total_batches ~ " (" ~ ns.file_batch | length ~ " files)", info=True) }}
@@ -119,7 +124,8 @@
     source_files,
     is_full_refresh=false,
     is_incremental=false,
-    delta_lake_commit_condition="FailIfFileConflict"
+    delta_lake_commit_condition="FailIfFileConflict",
+    max_file_count_per_output_file_set=5000
 ) %}
 {# -- Normalize partition_by to a list -- #}
 {%- set partition_cols = partition_by if partition_by is iterable and partition_by is not string else ([partition_by] if partition_by else []) -%}
@@ -133,6 +139,7 @@
 
 SET @@FeaturePreviews = "{{ feature_previews }}";
 SET @@DeltaLakeCommitCondition = "{{ delta_lake_commit_condition }}";
+SET @@MaxFileCountPerOutputFileSet = {{ max_file_count_per_output_file_set }};
 
 #DECLARE @deltaPath string = "{{ delta_location }}";
 

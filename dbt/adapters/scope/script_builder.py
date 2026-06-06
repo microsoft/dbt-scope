@@ -20,8 +20,11 @@ from dbt.adapters.scope.checkpoint import VIRTUAL_COLUMNS
 from dbt.adapters.scope.constants import (
     DEFAULT_DELTA_LAKE_COMMIT_CONDITION,
     DEFAULT_MAX_BYTES_PER_TRIGGER,
+    DEFAULT_MAX_FILE_COUNT_PER_OUTPUT_FILE_SET,
     DEFAULT_MAX_FILES_PER_TRIGGER,
     DEFAULT_SAFETY_BUFFER_SECONDS,
+    MAX_FILE_COUNT_PER_OUTPUT_FILE_SET_MAX,
+    MAX_FILE_COUNT_PER_OUTPUT_FILE_SET_MIN,
     VALID_DELTA_LAKE_COMMIT_CONDITIONS,
 )
 
@@ -80,6 +83,10 @@ class ScriptConfig:
     # Delta Lake commit condition
     delta_lake_commit_condition: str = DEFAULT_DELTA_LAKE_COMMIT_CONDITION
 
+    # SCOPE @@MaxFileCountPerOutputFileSet — caps the number of distinct output files
+    # a single OutputFileSet operator may emit. Range [1, 1_000_000].
+    max_file_count_per_output_file_set: int = DEFAULT_MAX_FILE_COUNT_PER_OUTPUT_FILE_SET
+
     # Delta table columns (CREATE TABLE schema)
     delta_columns: list[ColumnDef] = field(default_factory=list)
 
@@ -126,6 +133,9 @@ class ScriptBuilder:
         parts.append(_header_comment("full-refresh", config.table_name))
         parts.append(_set_feature_previews(config.feature_previews))
         parts.append(_set_commit_condition(config.delta_lake_commit_condition))
+        parts.append(
+            _set_max_file_count_per_output_file_set(config.max_file_count_per_output_file_set)
+        )
         parts.append(_declare_paths(delta_loc))
         parts.append(_create_table(config.delta_columns, config.partition_by, "@deltaPath"))
         if config.scope_settings:
@@ -168,6 +178,9 @@ class ScriptBuilder:
         )
         parts.append(_set_feature_previews(config.feature_previews))
         parts.append(_set_commit_condition(config.delta_lake_commit_condition))
+        parts.append(
+            _set_max_file_count_per_output_file_set(config.max_file_count_per_output_file_set)
+        )
         parts.append(_declare_paths(delta_loc))
         parts.append(_create_table(config.delta_columns, config.partition_by, "@deltaPath"))
         if config.scope_settings:
@@ -228,6 +241,29 @@ def _set_commit_condition(condition: str) -> str:
             f"Valid values: {sorted(VALID_DELTA_LAKE_COMMIT_CONDITIONS)}"
         )
     return f'SET @@DeltaLakeCommitCondition = "{condition}";\n'
+
+
+def _set_max_file_count_per_output_file_set(value: int) -> str:
+    """Emit ``SET @@MaxFileCountPerOutputFileSet`` after validating the value.
+
+    The SCOPE compiler rejects values outside [1, 1_000_000]; we surface a
+    ``DbtRuntimeError`` early so misconfiguration fails at compile time rather
+    than after a job has been submitted.
+    """
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise DbtRuntimeError(
+            f"Invalid max_file_count_per_output_file_set '{value!r}': must be an int."
+        )
+    if (
+        value < MAX_FILE_COUNT_PER_OUTPUT_FILE_SET_MIN
+        or value > MAX_FILE_COUNT_PER_OUTPUT_FILE_SET_MAX
+    ):
+        raise DbtRuntimeError(
+            f"Invalid max_file_count_per_output_file_set '{value}': must be in "
+            f"[{MAX_FILE_COUNT_PER_OUTPUT_FILE_SET_MIN}, "
+            f"{MAX_FILE_COUNT_PER_OUTPUT_FILE_SET_MAX}]."
+        )
+    return f"SET @@MaxFileCountPerOutputFileSet = {value};\n"
 
 
 def _declare_paths(delta_loc: str) -> str:
