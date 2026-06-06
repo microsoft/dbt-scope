@@ -175,6 +175,9 @@ my_project:
 | `job_timeout_seconds`     | `36000`                                    | Max seconds to wait for a SCOPE job before timing out              |
 | `max_files_per_trigger`   | `50`                                       | Default max files per SCOPE job (overridable per-model)            |
 | `max_bytes_per_trigger`   | `10737418240000` (10 TB)                   | Default max estimated bytes per batch (overridable per-model)      |
+| `max_file_count_per_output_file_set` | `5000`                          | SCOPE `@@MaxFileCountPerOutputFileSet` (overridable per-model)     |
+| `cancel_jobs_on_shutdown` | `true`                                     | Cancel in-flight ADLA jobs on SIGINT/SIGTERM                       |
+| `wait_on_cancel_seconds`  | `30`                                       | Per-job wait for ADLA terminal state when cancelling on shutdown   |
 | `http_timeout_seconds`    | `30`                                       | HTTP request timeout for ADLA REST API calls                       |
 | `http_retries`            | `3`                                        | Number of HTTP retries for transient errors (429, 5xx)             |
 | `scope_feature_previews`  | `"EnableDeltaTableDynamicInsert:on"`       | SCOPE feature preview flags (overridable per-model)                |
@@ -385,6 +388,39 @@ Add the `trigger` config to your model's `config()` block:
 Send `SIGTERM` or `SIGINT` (Ctrl+C) to the dbt process. The adapter finishes the current SCOPE job, updates the checkpoint, then exits cleanly. All `processing_time` models respond to the same signal.
 
 > **Note:** `processing_time` is only supported for `incremental` materializations.
+
+## Graceful shutdown of ADLA jobs
+
+When the dbt process receives `SIGINT` (Ctrl+C) or `SIGTERM`, the adapter:
+
+1. Sets a shared shutdown flag so every in-flight `submit_and_wait` loop self-cancels its own SCOPE job.
+2. Snapshots the process-wide registry of in-flight ADLA jobs and fans out parallel `CancelJob` REST calls — one worker per job, bounded at 32 threads.
+3. **Waits for each cancelled job to reach a terminal `Ended` state** (typically a few seconds in ADLA) up to `wait_on_cancel_seconds` per job. Since cancels run in parallel, total wall-clock is `~wait_on_cancel_seconds` regardless of job count.
+
+This is on by default. To opt out (e.g. in a CI environment where you'd rather let jobs run to completion):
+
+```yaml
+# profiles.yml
+outputs:
+  dev:
+    type: scope
+    cancel_jobs_on_shutdown: false
+```
+
+To tune how long the adapter blocks waiting for ADLA to confirm each cancel:
+
+```yaml
+outputs:
+  dev:
+    type: scope
+    wait_on_cancel_seconds: 60  # default 30
+```
+
+**Caveats:**
+
+- `SIGKILL` is uncatchable at the OS level — no Python handler can run. The existing `cancel_orphaned_jobs` cleanup (runs at the start of every new `dbt run` per model) is the safety net for that case: orphaned jobs from previous runs are cancelled before submitting a new one.
+- On Windows, `SIGTERM` is not delivered the same way as on POSIX; `SIGINT` (Ctrl+C) works.
+- Only jobs submitted by the **current** Python process are tracked — orphans from earlier `dbt run` invocations are handled by `cancel_orphaned_jobs`, not by this shutdown hook.
 
 ## Contributing
 

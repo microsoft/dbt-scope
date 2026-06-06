@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import signal
 import threading
 import time
@@ -18,13 +19,19 @@ from dbt_common.exceptions import DbtRuntimeError
 from dbt.adapters.scope.adls_gen1_client import AdlsGen1Client, FileInfo
 from dbt.adapters.scope.checkpoint import CheckpointManager, Watermark
 from dbt.adapters.scope.column import ScopeColumn
-from dbt.adapters.scope.connections import ScopeConnectionHandle, ScopeConnectionManager
+from dbt.adapters.scope.connections import (
+    ScopeConnectionHandle,
+    ScopeConnectionManager,
+    _shutdown_event,
+    cancel_all_active_jobs,
+)
 from dbt.adapters.scope.constants import (
     DEFAULT_MAX_BYTES_PER_TRIGGER,
     DEFAULT_PROCESSING_TIME_TIMEOUT_SECONDS,
     DEFAULT_SAFETY_BUFFER_SECONDS,
     DEFAULT_SOURCE_COMPACTION_INTERVAL,
     DEFAULT_SOURCE_RETENTION_FILES,
+    DEFAULT_WAIT_ON_CANCEL_SECONDS,
 )
 from dbt.adapters.scope.credentials import ScopeCredentials
 from dbt.adapters.scope.delta_lake import RetryPolicy
@@ -38,13 +45,45 @@ log = AdapterLogger("scope")
 # ---------------------------------------------------------------------------
 # Graceful shutdown support
 # ---------------------------------------------------------------------------
-_shutdown_event = threading.Event()
 _signal_handlers_installed = False
 _signal_lock = threading.Lock()
+_atexit_registered = False
+
+# Credentials observed across all ScopeConnectionManager.open() calls in this
+# process. Used by the signal handler to decide (a) whether to cancel
+# in-flight jobs, and (b) how long to wait for ADLA to confirm terminal state.
+_observed_credentials: list[ScopeCredentials] = []
+_observed_credentials_lock = threading.Lock()
+
+
+def _observe_credentials(credentials: ScopeCredentials) -> None:
+    """Record a credentials object so the signal handler can read its preferences."""
+    with _observed_credentials_lock:
+        for existing in _observed_credentials:
+            if existing is credentials:
+                return
+        _observed_credentials.append(credentials)
+
+
+def _any_observed_cancel_on_shutdown_enabled() -> bool:
+    with _observed_credentials_lock:
+        if not _observed_credentials:
+            return True
+        return any(getattr(c, "cancel_jobs_on_shutdown", True) for c in _observed_credentials)
+
+
+def _observed_max_wait_on_cancel_seconds() -> int:
+    with _observed_credentials_lock:
+        values = [
+            getattr(c, "wait_on_cancel_seconds", DEFAULT_WAIT_ON_CANCEL_SECONDS)
+            for c in _observed_credentials
+            if getattr(c, "cancel_jobs_on_shutdown", True)
+        ]
+    return max(values) if values else DEFAULT_WAIT_ON_CANCEL_SECONDS
 
 
 def _install_signal_handlers() -> None:
-    """Install SIGTERM/SIGINT handlers that set the shutdown event.
+    """Install SIGTERM/SIGINT handlers that trigger graceful shutdown.
 
     Safe to call from any thread — only installs handlers when called from
     the main thread. Subsequent calls are no-ops.
@@ -62,11 +101,16 @@ def _install_signal_handlers() -> None:
 
         def _handler(signum: int, frame: Any) -> None:
             sig_name = signal.Signals(signum).name
-            log.info(
-                f"Received {sig_name} — requesting graceful shutdown of processing_time models"
-            )
+            log.info(f"Received {sig_name} — requesting graceful shutdown")
             _shutdown_event.set()
-            # Chain to previous handler (e.g. dbt's own handler)
+            if _any_observed_cancel_on_shutdown_enabled():
+                try:
+                    cancel_all_active_jobs(
+                        f"signal:{sig_name}",
+                        wait_seconds=_observed_max_wait_on_cancel_seconds(),
+                    )
+                except Exception as exc:
+                    log.warning(f"cancel_all_active_jobs failed in signal handler: {exc}")
             prev = _prev_sigterm if signum == signal.SIGTERM else _prev_sigint
             if callable(prev) and prev not in (signal.SIG_DFL, signal.SIG_IGN):
                 prev(signum, frame)
@@ -74,6 +118,41 @@ def _install_signal_handlers() -> None:
         signal.signal(signal.SIGTERM, _handler)
         signal.signal(signal.SIGINT, _handler)
         _signal_handlers_installed = True
+
+
+def _atexit_cancel_all() -> None:
+    """Fallback cancel-all invoked on interpreter shutdown.
+
+    Covers paths where dbt unwinds via an unhandled exception that does not
+    pass through our signal handler.
+    """
+    if not _any_observed_cancel_on_shutdown_enabled():
+        return
+    try:
+        cancel_all_active_jobs(
+            "atexit",
+            wait_seconds=_observed_max_wait_on_cancel_seconds(),
+        )
+    except Exception as exc:
+        log.warning(f"cancel_all_active_jobs failed in atexit hook: {exc}")
+
+
+def _register_atexit() -> None:
+    global _atexit_registered
+    if _atexit_registered:
+        return
+    atexit.register(_atexit_cancel_all)
+    _atexit_registered = True
+
+
+def _scope_open_hook(credentials: ScopeCredentials) -> None:
+    """Invoked by ``ScopeConnectionManager.open()`` for every connection."""
+    _observe_credentials(credentials)
+    _install_signal_handlers()
+    _register_atexit()
+
+
+ScopeConnectionManager._on_open = staticmethod(_scope_open_hook)
 
 
 _TIMESTAMP_COLS = ("accessTime", "modificationTime", "msExpirationTime", "expiryTime")
@@ -223,7 +302,7 @@ class ScopeAdapter(BaseAdapter):
 
     @classmethod
     def is_cancelable(cls) -> bool:
-        return False
+        return True
 
     def list_schemas(self, database: str) -> list[str]:
         """Return the single 'schema' — the container path."""

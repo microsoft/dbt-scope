@@ -31,3 +31,9 @@ DEFAULT_DELTA_LAKE_COMMIT_CONDITION: str = "FailIfFileConflict"
 # Trigger mode constants
 DEFAULT_TRIGGER_TYPE: str = "available_now"
 DEFAULT_PROCESSING_TIME_TIMEOUT_SECONDS: int = 2_592_000  # 30 days
+
+# Graceful shutdown: on SIGINT/SIGTERM, POST CancelJob for every in-flight ADLA job
+# and block until each reaches a terminal state (or wait_on_cancel_seconds elapses
+# per job, with cancels running in parallel so the total wall-clock is bounded).
+DEFAULT_CANCEL_JOBS_ON_SHUTDOWN: bool = True
+DEFAULT_WAIT_ON_CANCEL_SECONDS: int = 30

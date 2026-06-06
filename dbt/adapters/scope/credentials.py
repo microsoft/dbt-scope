@@ -6,7 +6,11 @@ from dataclasses import dataclass
 
 from dbt.adapters.contracts.connection import Credentials
 
-from dbt.adapters.scope.constants import DEFAULT_MAX_FILE_COUNT_PER_OUTPUT_FILE_SET
+from dbt.adapters.scope.constants import (
+    DEFAULT_CANCEL_JOBS_ON_SHUTDOWN,
+    DEFAULT_MAX_FILE_COUNT_PER_OUTPUT_FILE_SET,
+    DEFAULT_WAIT_ON_CANCEL_SECONDS,
+)
 
 
 @dataclass
@@ -29,6 +33,8 @@ class ScopeCredentials(Credentials):
               max_files_per_trigger: 50
               max_bytes_per_trigger: 10737418240000  # ~10 TB
               max_file_count_per_output_file_set: 5000  # SCOPE @@MaxFileCountPerOutputFileSet
+              cancel_jobs_on_shutdown: true             # cancel in-flight ADLA jobs on SIGINT/SIGTERM
+              wait_on_cancel_seconds: 30                # wait per job for ADLA terminal state
     """
 
     adla_account: str = ""
@@ -43,6 +49,8 @@ class ScopeCredentials(Credentials):
     max_files_per_trigger: int = 50
     max_bytes_per_trigger: int = 10_737_418_240_000  # ~10 TB
     max_file_count_per_output_file_set: int = DEFAULT_MAX_FILE_COUNT_PER_OUTPUT_FILE_SET
+    cancel_jobs_on_shutdown: bool = DEFAULT_CANCEL_JOBS_ON_SHUTDOWN
+    wait_on_cancel_seconds: int = DEFAULT_WAIT_ON_CANCEL_SECONDS
     http_timeout_seconds: int = 120
     http_retries: int = 10
     scope_feature_previews: str | None = "EnableDeltaTableDynamicInsert:on"
@@ -68,5 +76,7 @@ class ScopeCredentials(Credentials):
             "max_files_per_trigger",
             "max_bytes_per_trigger",
             "max_file_count_per_output_file_set",
+            "cancel_jobs_on_shutdown",
+            "wait_on_cancel_seconds",
             "delta_lake_commit_condition",
         )
