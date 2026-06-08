@@ -163,7 +163,7 @@ run_build() {
 }
 
 run_upload() {
-    write_step "upload: Building wheel and uploading to static site"
+    write_step "upload: Building wheel and uploading to static storage"
     run_build
     local dist_dir="${PROJECT_DIR}/dist"
     local whl
