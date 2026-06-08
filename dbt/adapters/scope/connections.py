@@ -26,6 +26,7 @@ from urllib3.util.retry import Retry
 
 from dbt.adapters.scope.credentials import ScopeCredentials
 from dbt.adapters.scope.delta_lake import build_credential
+from dbt.adapters.scope.message_retry import MessageRetryPolicy, retry_on_message
 
 log = AdapterLogger("scope")
 
@@ -188,6 +189,7 @@ class ScopeConnectionHandle:
         self._timeout = credentials.http_timeout_seconds
         self._credential = build_credential(credentials)
         self._session = self._build_session(credentials.http_retries)
+        self._message_retry_policy = MessageRetryPolicy.from_credentials(credentials)
         self._cached_token: str | None = None
         self._token_expires_at: float = 0
         self._next_job_name: str | None = None
@@ -446,20 +448,29 @@ class ScopeConnectionHandle:
         return self._cached_token
 
     def _request(self, method: str, url: str, **kwargs: Any) -> dict:
-        headers = {
-            "Authorization": f"Bearer {self._get_token()}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-        resp = self._session.request(method, url, headers=headers, timeout=self._timeout, **kwargs)
-        if resp.status_code >= 400:
-            raise DbtDatabaseError(
-                f"ADLA API {method} {url} returned {resp.status_code}: {resp.text[:500]}"
+        def _send() -> dict:
+            headers = {
+                "Authorization": f"Bearer {self._get_token()}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            }
+            resp = self._session.request(
+                method, url, headers=headers, timeout=self._timeout, **kwargs
             )
-        # Some endpoints (e.g. CancelJob) return 200 with an empty body
-        if not resp.content:
-            return {}
-        return resp.json()
+            if resp.status_code >= 400:
+                raise DbtDatabaseError(
+                    f"ADLA API {method} {url} returned {resp.status_code}: {resp.text[:500]}"
+                )
+            # Some endpoints (e.g. CancelJob) return 200 with an empty body
+            if not resp.content:
+                return {}
+            return resp.json()
+
+        return retry_on_message(
+            _send,
+            policy=self._message_retry_policy,
+            label=f"ADLA {method} {url}",
+        )
 
     @staticmethod
     def _build_session(retries: int) -> requests.Session:

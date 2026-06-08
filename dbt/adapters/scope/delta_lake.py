@@ -27,6 +27,7 @@ from dbt.adapters.events.logging import AdapterLogger
 from dbt_common.exceptions import DbtRuntimeError
 
 from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK, FABRIC_TOKEN_LOCK, FileLock
+from dbt.adapters.scope.message_retry import MessageRetryPolicy, retry_on_message
 
 log = AdapterLogger("scope")
 
@@ -352,9 +353,11 @@ class DuckDbDeltaLakeClient(DeltaLakeClient):
         credential: TokenCredential,
         *,
         connection_factory: Callable[[], duckdb.DuckDBPyConnection] | None = None,
+        message_retry_policy: MessageRetryPolicy | None = None,
     ) -> None:
         self._credential = credential
         self._connection_factory = connection_factory or duckdb.connect
+        self._message_retry_policy = message_retry_policy or MessageRetryPolicy.disabled()
 
     @contextmanager
     def connect(self) -> Iterator[duckdb.DuckDBPyConnection]:
@@ -379,7 +382,7 @@ class DuckDbDeltaLakeClient(DeltaLakeClient):
         if parsed is None:
             return []
 
-        try:
+        def _list() -> list[str]:
             service = DataLakeServiceClient(
                 account_url=parsed.account_url,
                 credential=self._credential,
@@ -391,6 +394,13 @@ class DuckDbDeltaLakeClient(DeltaLakeClient):
                 for path in file_system.get_paths(path=prefix, recursive=True)
                 if not getattr(path, "is_directory", False)
             ]
+
+        try:
+            return retry_on_message(
+                _list,
+                policy=self._message_retry_policy,
+                label=f"delta_lake.list_table_paths {delta_location}",
+            )
         except CredentialUnavailableError:
             log.error(f"list_table_paths: credential acquisition exhausted for {delta_location}")
             raise

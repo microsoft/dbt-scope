@@ -73,6 +73,16 @@ class ScopeCredentials(Credentials):
     scope_feature_previews: str | None = "EnableDeltaTableDynamicInsert:on"
     delta_lake_commit_condition: str = "FailIfFileConflict"
 
+    retry_on_error_messages: list[str] = field(
+        default_factory=lambda: [
+            "Cannot exceed",
+            " queued SCOPE jobs",
+        ]
+    )
+    max_retries_on_error: int = 25
+    initial_wait_on_error_seconds: float = 1.0
+    max_wait_on_error_seconds: float = 30.0
+
     # "cli" (default — AzureCliCredential) or "token_credential" (dotted-path)
     authentication: str = "cli"
     # Dotted path to a TokenCredential implementation loaded via importlib
@@ -103,6 +113,10 @@ class ScopeCredentials(Credentials):
             "cancel_jobs_on_shutdown",
             "wait_on_cancel_seconds",
             "delta_lake_commit_condition",
+            "retry_on_error_messages",
+            "max_retries_on_error",
+            "initial_wait_on_error_seconds",
+            "max_wait_on_error_seconds",
             "authentication",
             "credential_class",
         )
@@ -122,3 +136,27 @@ class ScopeCredentials(Credentials):
                 "`credential_class` and `credential_kwargs` are only valid when "
                 "authentication='token_credential'."
             )
+
+        if self.max_retries_on_error < 0:
+            raise DbtRuntimeError(
+                f"max_retries_on_error must be >= 0; got {self.max_retries_on_error}"
+            )
+        if self.initial_wait_on_error_seconds <= 0:
+            raise DbtRuntimeError(
+                "initial_wait_on_error_seconds must be > 0; "
+                f"got {self.initial_wait_on_error_seconds}"
+            )
+        if self.max_wait_on_error_seconds <= 0:
+            raise DbtRuntimeError(
+                f"max_wait_on_error_seconds must be > 0; got {self.max_wait_on_error_seconds}"
+            )
+        if self.initial_wait_on_error_seconds > self.max_wait_on_error_seconds:
+            raise DbtRuntimeError(
+                "initial_wait_on_error_seconds must be <= max_wait_on_error_seconds; "
+                f"got {self.initial_wait_on_error_seconds} > {self.max_wait_on_error_seconds}"
+            )
+        for entry in self.retry_on_error_messages:
+            if not isinstance(entry, str) or not entry:
+                raise DbtRuntimeError(
+                    f"retry_on_error_messages entries must be non-empty strings; got {entry!r}"
+                )

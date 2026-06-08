@@ -29,6 +29,7 @@ from azure.storage.filedatalake import DataLakeServiceClient
 from dbt.adapters.events.logging import AdapterLogger
 
 from dbt.adapters.scope.delta_lake import AbfssLocation, RetryPolicy
+from dbt.adapters.scope.message_retry import MessageRetryPolicy, retry_on_message
 
 log = AdapterLogger("scope")
 
@@ -114,6 +115,7 @@ class CheckpointManager:
         *,
         credential: TokenCredential | None = None,
         retry_policy: RetryPolicy | None = None,
+        message_retry_policy: MessageRetryPolicy | None = None,
     ) -> None:
         if credential is None:
             raise RuntimeError(
@@ -122,6 +124,10 @@ class CheckpointManager:
             )
         self._credential = credential
         self._retry_policy = retry_policy
+        self._message_retry_policy = message_retry_policy or MessageRetryPolicy.disabled()
+
+    def _retry(self, op, *, label: str):
+        return retry_on_message(op, policy=self._message_retry_policy, label=label)
 
     # -- Watermark ---------------------------------------------------------
 
@@ -132,7 +138,7 @@ class CheckpointManager:
             log.warning(f"read_watermark: invalid delta_location: {delta_location}")
             return None
 
-        try:
+        def _read() -> Watermark:
             service = _get_service(parsed, self._credential)
             fs = service.get_file_system_client(parsed.container)
             file_path = f"{parsed.path.rstrip('/')}/{_CHECKPOINT_DIR}/{_WATERMARK_FILE}"
@@ -146,6 +152,9 @@ class CheckpointManager:
                 f"batch_id={watermark.batch_id}"
             )
             return watermark
+
+        try:
+            return self._retry(_read, label=f"checkpoint.read_watermark {delta_location}")
         except CredentialUnavailableError:
             # Don't mask auth failures as "no checkpoint" — that would
             # silently flip an incremental run into a full refresh.
@@ -162,7 +171,7 @@ class CheckpointManager:
             log.warning(f"write_watermark: invalid delta_location: {delta_location}")
             return
 
-        try:
+        def _write() -> None:
             service = _get_service(parsed, self._credential)
             fs = service.get_file_system_client(parsed.container)
 
@@ -180,6 +189,9 @@ class CheckpointManager:
                 f"modified_time={watermark.modified_time}, "
                 f"batch_id={watermark.batch_id} → {delta_location}"
             )
+
+        try:
+            self._retry(_write, label=f"checkpoint.write_watermark {delta_location}")
         except Exception:
             log.error(f"write_watermark failed for {delta_location}")
             raise
@@ -191,13 +203,16 @@ class CheckpointManager:
             log.warning(f"delete_watermark: invalid delta_location: {delta_location}")
             return
 
-        try:
+        def _delete() -> None:
             service = _get_service(parsed, self._credential)
             fs = service.get_file_system_client(parsed.container)
             file_path = f"{parsed.path.rstrip('/')}/{_CHECKPOINT_DIR}/{_WATERMARK_FILE}"
             file_client = fs.get_file_client(file_path)
             file_client.delete_file()
             log.debug(f"Deleted watermark for {delta_location}")
+
+        try:
+            self._retry(_delete, label=f"checkpoint.delete_watermark {delta_location}")
         except Exception:
             log.debug(f"No watermark to delete for {delta_location} (already clean)")
 
@@ -247,7 +262,7 @@ class CheckpointManager:
 
         is_compaction = batch_id > 0 and batch_id % compaction_interval == 0
 
-        try:
+        def _write() -> None:
             service = _get_service(parsed, self._credential)
             fs = service.get_file_system_client(parsed.container)
             sources_dir = f"{parsed.path.rstrip('/')}/{_CHECKPOINT_DIR}/{_SOURCES_DIR}"
@@ -264,6 +279,9 @@ class CheckpointManager:
                 f"{'parquet snapshot' if is_compaction else 'jsonl diff'}) → "
                 f"{delta_location}"
             )
+
+        try:
+            self._retry(_write, label=f"checkpoint.write_batch_sources batch={batch_id}")
         except Exception:
             log.error(f"write_batch_sources failed for batch {batch_id}")
             raise
@@ -444,12 +462,11 @@ class CheckpointManager:
         if parsed is None:
             return 0
 
-        try:
+        def _cleanup() -> int:
             service = _get_service(parsed, self._credential)
             fs = service.get_file_system_client(parsed.container)
             sources_dir = f"{parsed.path.rstrip('/')}/{_CHECKPOINT_DIR}/{_SOURCES_DIR}"
 
-            # List all files
             files: list[tuple[str, str]] = []  # (name, full_path)
             for path_info in fs.get_paths(path=sources_dir, recursive=False):
                 if getattr(path_info, "is_directory", False):
@@ -460,7 +477,6 @@ class CheckpointManager:
             if len(files) <= max_files:
                 return 0
 
-            # Sort: JSONL files (numeric names) first by batch_id, then parquet by name
             def sort_key(item: tuple[str, str]) -> tuple[int, str]:
                 name = item[0]
                 try:
@@ -470,7 +486,6 @@ class CheckpointManager:
 
             files.sort(key=sort_key)
 
-            # Delete oldest files until we're at the limit
             to_delete = len(files) - max_files
             deleted = 0
             for _name, full_path in files[:to_delete]:
@@ -485,6 +500,9 @@ class CheckpointManager:
                 f"cleanup_sources: deleted {deleted} files (was {len(files)}, limit {max_files})"
             )
             return deleted
+
+        try:
+            return self._retry(_cleanup, label=f"checkpoint.cleanup_sources {delta_location}")
         except Exception:
             log.warning(f"cleanup_sources failed for {delta_location}")
             return 0
@@ -495,7 +513,7 @@ class CheckpointManager:
         if parsed is None:
             return
 
-        try:
+        def _delete_all() -> None:
             service = _get_service(parsed, self._credential)
             fs = service.get_file_system_client(parsed.container)
             sources_dir = f"{parsed.path.rstrip('/')}/{_CHECKPOINT_DIR}/{_SOURCES_DIR}"
@@ -511,6 +529,9 @@ class CheckpointManager:
                 except Exception:
                     pass
             log.debug(f"delete_all_sources: deleted {deleted} files for {delta_location}")
+
+        try:
+            self._retry(_delete_all, label=f"checkpoint.delete_all_sources {delta_location}")
         except Exception:
             log.debug(f"No sources to delete for {delta_location} (already clean)")
 
@@ -520,7 +541,7 @@ class CheckpointManager:
         if parsed is None:
             return []
 
-        try:
+        def _list() -> list[str]:
             service = _get_service(parsed, self._credential)
             fs = service.get_file_system_client(parsed.container)
             sources_dir = f"{parsed.path.rstrip('/')}/{_CHECKPOINT_DIR}/{_SOURCES_DIR}"
@@ -531,6 +552,9 @@ class CheckpointManager:
                     continue
                 names.append(path_info.name.rsplit("/", 1)[-1])
             return sorted(names)
+
+        try:
+            return self._retry(_list, label=f"checkpoint.list_source_files {delta_location}")
         except Exception:
             return []
 
@@ -545,17 +569,21 @@ class CheckpointManager:
             fs = service.get_file_system_client(parsed.container)
             sources_dir = f"{parsed.path.rstrip('/')}/{_CHECKPOINT_DIR}/{_SOURCES_DIR}"
 
-            # Try JSONL first
-            try:
+            def _read_jsonl() -> list[dict]:
                 jsonl_path = f"{sources_dir}/{batch_id}"
                 file_client = fs.get_file_client(jsonl_path)
                 raw = file_client.download_file().readall().decode("utf-8")
                 return [json.loads(line) for line in raw.strip().split("\n") if line.strip()]
+
+            try:
+                return self._retry(
+                    _read_jsonl,
+                    label=f"checkpoint.read_batch_source jsonl batch={batch_id}",
+                )
             except Exception:
                 pass
 
-            # Try parquet snapshot (compaction batches)
-            try:
+            def _read_parquet() -> list[dict]:
                 import os
 
                 import duckdb
@@ -575,12 +603,17 @@ class CheckpointManager:
                             f"DESCRIBE SELECT * FROM read_parquet('{tmp_path}')"
                         ).fetchall()
                     ]
-                    # Filter to only records for this batch_id
                     all_records = [dict(zip(cols, row, strict=False)) for row in rows]
                     return [r for r in all_records if r.get("batchId") == batch_id]
                 finally:
                     conn.close()
                     os.remove(tmp_path)
+
+            try:
+                return self._retry(
+                    _read_parquet,
+                    label=f"checkpoint.read_batch_source parquet batch={batch_id}",
+                )
             except Exception:
                 pass
 

@@ -36,6 +36,7 @@ from dbt.adapters.scope.constants import (
 from dbt.adapters.scope.credentials import ScopeCredentials
 from dbt.adapters.scope.delta_lake import RetryPolicy, build_credential
 from dbt.adapters.scope.file_tracker import FileTracker
+from dbt.adapters.scope.message_retry import MessageRetryPolicy, retry_on_message
 from dbt.adapters.scope.relation import ScopeRelation
 from dbt.adapters.scope.script_builder import ColumnDef, ScriptConfig
 from dbt.adapters.scope.trigger_config import parse_trigger_config
@@ -366,6 +367,8 @@ class ScopeAdapter(BaseAdapter):
         if not creds.storage_account or not creds.container:
             return []
 
+        message_retry_policy = MessageRetryPolicy.from_credentials(creds)
+
         try:
             from azure.identity import CredentialUnavailableError
             from azure.storage.filedatalake import DataLakeServiceClient
@@ -384,11 +387,15 @@ class ScopeAdapter(BaseAdapter):
             fs = service.get_file_system_client(creds.container)
 
             t0 = time.monotonic()
-            dirs = [
-                p
-                for p in fs.get_paths(path=creds.delta_base_path, recursive=False)
-                if p.is_directory
-            ]
+            dirs = retry_on_message(
+                lambda: [
+                    p
+                    for p in fs.get_paths(path=creds.delta_base_path, recursive=False)
+                    if p.is_directory
+                ],
+                policy=message_retry_policy,
+                label=f"list_relations.get_paths {creds.delta_base_path}",
+            )
             elapsed_ms = (time.monotonic() - t0) * 1000
             log.debug(
                 f"list_relations: get_paths found {len(dirs)} directories in {elapsed_ms:.1f} ms"
@@ -399,8 +406,16 @@ class ScopeAdapter(BaseAdapter):
                 table_name = path_info.name.split("/")[-1]
                 t0 = time.monotonic()
                 try:
-                    delta_log = fs.get_directory_client(f"{path_info.name}/_delta_log")
-                    delta_log.get_directory_properties()
+
+                    def _probe(name=path_info.name):
+                        delta_log = fs.get_directory_client(f"{name}/_delta_log")
+                        delta_log.get_directory_properties()
+
+                    retry_on_message(
+                        _probe,
+                        policy=message_retry_policy,
+                        label=f"list_relations.probe {table_name}",
+                    )
                     relations.append(
                         self.Relation.create(
                             database=creds.storage_account,
@@ -908,6 +923,7 @@ class ScopeAdapter(BaseAdapter):
                 account=creds.adls_gen1_account,
                 credential=build_credential(creds),
                 retry_policy=RetryPolicy.from_http_retries(creds.http_retries),
+                message_retry_policy=MessageRetryPolicy.from_credentials(creds),
             )
         return self._gen1_client
 
@@ -918,6 +934,7 @@ class ScopeAdapter(BaseAdapter):
             self._checkpoint_manager = CheckpointManager(
                 credential=build_credential(creds),
                 retry_policy=RetryPolicy.from_http_retries(creds.http_retries),
+                message_retry_policy=MessageRetryPolicy.from_credentials(creds),
             )
         return self._checkpoint_manager
 

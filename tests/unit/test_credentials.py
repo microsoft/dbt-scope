@@ -124,3 +124,58 @@ class TestAuthenticationFields:
             **_BASE_KWARGS,
         )
         assert creds.credential_class == "my_pkg.MyCredential"
+
+
+class TestMessageRetryFields:
+    def test_defaults(self):
+        creds = ScopeCredentials(adla_account="x", **_BASE_KWARGS)
+        assert creds.retry_on_error_messages == ["Cannot exceed", " queued SCOPE jobs"]
+        assert creds.max_retries_on_error == 25
+        assert creds.initial_wait_on_error_seconds == 1.0
+        assert creds.max_wait_on_error_seconds == 30.0
+
+    def test_custom_values_accepted(self):
+        creds = ScopeCredentials(
+            adla_account="x",
+            retry_on_error_messages=["a", "re:b\\d+"],
+            max_retries_on_error=10,
+            initial_wait_on_error_seconds=2.0,
+            max_wait_on_error_seconds=60.0,
+            **_BASE_KWARGS,
+        )
+        assert creds.retry_on_error_messages == ["a", "re:b\\d+"]
+        assert creds.max_retries_on_error == 10
+        assert creds.initial_wait_on_error_seconds == 2.0
+        assert creds.max_wait_on_error_seconds == 60.0
+
+    def test_negative_max_retries_rejected(self):
+        with pytest.raises(DbtRuntimeError, match="max_retries_on_error must be >= 0"):
+            ScopeCredentials(adla_account="x", max_retries_on_error=-1, **_BASE_KWARGS)
+
+    def test_non_positive_initial_wait_rejected(self):
+        with pytest.raises(DbtRuntimeError, match="initial_wait_on_error_seconds must be > 0"):
+            ScopeCredentials(adla_account="x", initial_wait_on_error_seconds=0, **_BASE_KWARGS)
+
+    def test_non_positive_max_wait_rejected(self):
+        with pytest.raises(DbtRuntimeError, match="max_wait_on_error_seconds must be > 0"):
+            ScopeCredentials(adla_account="x", max_wait_on_error_seconds=0, **_BASE_KWARGS)
+
+    def test_initial_greater_than_max_rejected(self):
+        with pytest.raises(DbtRuntimeError, match="must be <= max_wait_on_error_seconds"):
+            ScopeCredentials(
+                adla_account="x",
+                initial_wait_on_error_seconds=60,
+                max_wait_on_error_seconds=30,
+                **_BASE_KWARGS,
+            )
+
+    def test_empty_pattern_string_rejected(self):
+        with pytest.raises(DbtRuntimeError, match="non-empty strings"):
+            ScopeCredentials(adla_account="x", retry_on_error_messages=[""], **_BASE_KWARGS)
+
+    def test_retry_fields_in_connection_keys(self):
+        keys = ScopeCredentials(adla_account="x", **_BASE_KWARGS)._connection_keys()
+        assert "retry_on_error_messages" in keys
+        assert "max_retries_on_error" in keys
+        assert "initial_wait_on_error_seconds" in keys
+        assert "max_wait_on_error_seconds" in keys

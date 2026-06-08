@@ -23,6 +23,7 @@ from azure.identity import CredentialUnavailableError
 from dbt.adapters.events.logging import AdapterLogger
 
 from dbt.adapters.scope.delta_lake import RetryPolicy
+from dbt.adapters.scope.message_retry import MessageRetryPolicy, retry_on_message
 
 log = AdapterLogger("scope")
 
@@ -141,17 +142,22 @@ def _list_one_dir(
     fs: adls_core.AzureDLFileSystem,
     dir_path: str,
     depth: int,
+    *,
+    message_retry_policy: MessageRetryPolicy | None = None,
 ) -> tuple[list[dict], list[dict], str, int, float]:
     """List a single directory. Returns (files, subdirs, path, depth, elapsed_ms)."""
     t0 = time.monotonic()
+    policy = message_retry_policy or MessageRetryPolicy.disabled()
     try:
-        entries = fs.ls(dir_path, detail=True)
+        entries = retry_on_message(
+            lambda: fs.ls(dir_path, detail=True),
+            policy=policy,
+            label=f"gen1.ls {dir_path}",
+        )
     except FileNotFoundError:
         log.debug(f"Path not found (skipping): {dir_path}")
         return [], [], dir_path, depth, (time.monotonic() - t0) * 1000
     except CredentialUnavailableError:
-        # Don't mask auth failures as "no files" — that would silently
-        # skip source ingestion. Surface the error so dbt fails loudly.
         log.error(f"_list_directory: credential acquisition exhausted for {dir_path}")
         raise
     except Exception:
@@ -173,13 +179,18 @@ class AdlsGen1Client:
         *,
         credential: TokenCredential | None = None,
         retry_policy: RetryPolicy | None = None,
+        message_retry_policy: MessageRetryPolicy | None = None,
     ) -> None:
         self._account = account
         self._credential = credential
         self._retry_policy = retry_policy
+        self._message_retry_policy = message_retry_policy or MessageRetryPolicy.disabled()
         self._fs: adls_core.AzureDLFileSystem | None = None
         self._file_cache: dict[tuple[str, str | None], list[FileInfo]] = {}
         self._enrichment_cache: dict[str, tuple[int, tuple[str, ...]]] = {}
+
+    def _retry(self, op, *, label: str):
+        return retry_on_message(op, policy=self._message_retry_policy, label=label)
 
     def _get_fs(self) -> adls_core.AzureDLFileSystem:
         """Lazily initialize the ADLS Gen1 filesystem client.
@@ -250,11 +261,14 @@ class AdlsGen1Client:
 
         walk_start = time.monotonic()
         if recursive:
-            raw_entries = self._walk(fs, root, max_workers)
+            raw_entries = self._walk(fs, root, max_workers, self._message_retry_policy)
         else:
             t0 = time.monotonic()
             try:
-                raw_entries = fs.ls(root, detail=True)
+                raw_entries = self._retry(
+                    lambda: fs.ls(root, detail=True),
+                    label=f"gen1.list_files {root}",
+                )
             except FileNotFoundError:
                 log.debug(f"Path not found: {root}")
                 return []
@@ -312,6 +326,7 @@ class AdlsGen1Client:
         fs: adls_core.AzureDLFileSystem,
         root: str,
         max_workers: int,
+        message_retry_policy: MessageRetryPolicy | None = None,
     ) -> list[dict]:
         """Walk directories in parallel, logging per-directory progress."""
         all_files: list[dict] = []
@@ -320,7 +335,9 @@ class AdlsGen1Client:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures: dict[Future, tuple[str, int]] = {}
 
-            f = executor.submit(_list_one_dir, fs, root, 0)
+            f = executor.submit(
+                _list_one_dir, fs, root, 0, message_retry_policy=message_retry_policy
+            )
             futures[f] = (root, 0)
 
             while futures:
@@ -331,9 +348,6 @@ class AdlsGen1Client:
                     try:
                         files, dirs, dir_path, depth, elapsed_ms = completed.result()
                     except CredentialUnavailableError:
-                        # Don't swallow exhausted credential retries —
-                        # otherwise discovery returns a partial file list
-                        # and the watermark advances past unseen files.
                         for pending in futures:
                             pending.cancel()
                         raise
@@ -353,7 +367,13 @@ class AdlsGen1Client:
                     all_files.extend(files)
 
                     for d in sorted(dirs, key=lambda e: e.get("name", "")):
-                        new_f = executor.submit(_list_one_dir, fs, d["name"], depth + 1)
+                        new_f = executor.submit(
+                            _list_one_dir,
+                            fs,
+                            d["name"],
+                            depth + 1,
+                            message_retry_policy=message_retry_policy,
+                        )
                         futures[new_f] = (d["name"], depth + 1)
 
                 if futures:
@@ -457,11 +477,10 @@ class AdlsGen1Client:
         )
         return enriched
 
-    @staticmethod
-    def _directory_exists(path: str, fs: adls_core.AzureDLFileSystem) -> bool:
+    def _directory_exists(self, path: str, fs: adls_core.AzureDLFileSystem) -> bool:
         """Check if a directory exists on ADLS Gen1."""
         try:
-            info = fs.info(path)
+            info = self._retry(lambda: fs.info(path), label=f"gen1.info {path}")
             return info.get("type") == "DIRECTORY"
         except FileNotFoundError:
             return False
@@ -472,8 +491,8 @@ class AdlsGen1Client:
             log.debug(f"_directory_exists: error checking {path} — assuming not exists")
             return False
 
-    @staticmethod
     def _list_directory_files(
+        self,
         dir_path: str,
         fs: adls_core.AzureDLFileSystem,
     ) -> list[dict]:
@@ -484,7 +503,10 @@ class AdlsGen1Client:
         while dirs_to_visit:
             current = dirs_to_visit.pop()
             try:
-                entries = fs.ls(current, detail=True)
+                entries = self._retry(
+                    lambda c=current: fs.ls(c, detail=True),
+                    label=f"gen1.ls {current}",
+                )
             except FileNotFoundError:
                 continue
             except CredentialUnavailableError:
