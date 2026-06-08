@@ -16,11 +16,10 @@ from datetime import datetime, timezone
 
 from azure.core.credentials import TokenCredential
 from azure.datalake.store import core as adls_core
-from azure.identity import AzureCliCredential, CredentialUnavailableError
+from azure.identity import CredentialUnavailableError
 from dbt.adapters.events.logging import AdapterLogger
 
-from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK
-from dbt.adapters.scope.delta_lake import LockedTokenCredential, RetryPolicy
+from dbt.adapters.scope.delta_lake import RetryPolicy
 
 log = AdapterLogger("scope")
 
@@ -113,12 +112,10 @@ class AdlsGen1Client:
         account: str,
         *,
         credential: TokenCredential | None = None,
-        lock_file: str = AZ_CLI_TOKEN_LOCK,
         retry_policy: RetryPolicy | None = None,
     ) -> None:
         self._account = account
         self._credential = credential
-        self._lock_file = lock_file
         self._retry_policy = retry_policy
         self._fs: adls_core.AzureDLFileSystem | None = None
         self._file_cache: dict[tuple[str, str | None], list[FileInfo]] = {}
@@ -127,18 +124,13 @@ class AdlsGen1Client:
     def _get_fs(self) -> adls_core.AzureDLFileSystem:
         """Lazily initialize the ADLS Gen1 filesystem client."""
         if self._fs is None:
-            # Use the caller-supplied credential as-is (typically the result of
-            # ``build_credential`` — which already applies LockedTokenCredential
-            # only for the CLI path). Fall back to ``AzureCliCredential`` wrapped
-            # in ``LockedTokenCredential`` for backward compat when no credential
-            # is provided (tests and legacy callers).
-            credential = self._credential or LockedTokenCredential(
-                AzureCliCredential(),
-                lock_file=self._lock_file,
-                retry_policy=self._retry_policy,
-            )
+            if self._credential is None:
+                raise RuntimeError(
+                    "AdlsGen1Client requires an explicit ``credential``; "
+                    "callers should pass ``credential=build_credential(creds)``."
+                )
             self._fs = adls_core.AzureDLFileSystem(
-                token_credential=credential,
+                token_credential=self._credential,
                 store_name=self._account,
             )
         return self._fs

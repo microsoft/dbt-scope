@@ -11,7 +11,7 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -104,9 +104,8 @@ def checkpoint_mgr(adls_store):
     service = InMemoryServiceClient(adls_store)
     with (
         patch("dbt.adapters.scope.checkpoint._get_service", return_value=service),
-        patch("dbt.adapters.scope.checkpoint.AzureCliCredential"),
     ):
-        yield CheckpointManager()
+        yield CheckpointManager(credential=MagicMock())
 
 
 def _make_times(count: int, base_year: int = 2026, base_month: int = 4) -> list[datetime]:

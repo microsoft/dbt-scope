@@ -49,8 +49,7 @@ class TestFileInfo:
 
 class TestAdlsGen1Client:
     @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
-    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
-    def test_list_files_basic(self, mock_cred, mock_adls):
+    def test_list_files_basic(self, mock_adls):
         mock_fs = MagicMock()
         mock_fs.ls.return_value = [
             {
@@ -68,14 +67,13 @@ class TestAdlsGen1Client:
         ]
         mock_adls.AzureDLFileSystem.return_value = mock_fs
 
-        client = AdlsGen1Client("test-account")
+        client = AdlsGen1Client("test-account", credential=MagicMock())
         files = client.list_files("/shares/test", recursive=False)
         assert len(files) == 2
         assert files[0].name == "a.ss"
 
     @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
-    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
-    def test_list_files_with_pattern(self, mock_cred, mock_adls):
+    def test_list_files_with_pattern(self, mock_adls):
         mock_fs = MagicMock()
         mock_fs.ls.return_value = [
             {
@@ -93,14 +91,13 @@ class TestAdlsGen1Client:
         ]
         mock_adls.AzureDLFileSystem.return_value = mock_fs
 
-        client = AdlsGen1Client("test-account")
+        client = AdlsGen1Client("test-account", credential=MagicMock())
         files = client.list_files("/shares/test", pattern=r".*\.ss$", recursive=False)
         assert len(files) == 1
         assert files[0].name == "file.ss"
 
     @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
-    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
-    def test_list_files_sorted_by_modification_time(self, mock_cred, mock_adls):
+    def test_list_files_sorted_by_modification_time(self, mock_adls):
         mock_fs = MagicMock()
         mock_fs.ls.return_value = [
             {
@@ -118,25 +115,23 @@ class TestAdlsGen1Client:
         ]
         mock_adls.AzureDLFileSystem.return_value = mock_fs
 
-        client = AdlsGen1Client("test-account")
+        client = AdlsGen1Client("test-account", credential=MagicMock())
         files = client.list_files("/shares/test", recursive=False)
         assert files[0].name == "older.ss"
         assert files[1].name == "newer.ss"
 
     @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
-    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
-    def test_list_files_not_found_returns_empty(self, mock_cred, mock_adls):
+    def test_list_files_not_found_returns_empty(self, mock_adls):
         mock_fs = MagicMock()
         mock_fs.ls.side_effect = FileNotFoundError("not found")
         mock_adls.AzureDLFileSystem.return_value = mock_fs
 
-        client = AdlsGen1Client("test-account")
+        client = AdlsGen1Client("test-account", credential=MagicMock())
         files = client.list_files("/shares/nonexistent", recursive=False)
         assert files == []
 
     @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
-    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
-    def test_list_files_recursive(self, mock_cred, mock_adls):
+    def test_list_files_recursive(self, mock_adls):
         mock_fs = MagicMock()
 
         # Root has a directory and a file
@@ -162,15 +157,14 @@ class TestAdlsGen1Client:
         mock_fs.ls.side_effect = [root_entries, subdir_entries]
         mock_adls.AzureDLFileSystem.return_value = mock_fs
 
-        client = AdlsGen1Client("test-account")
+        client = AdlsGen1Client("test-account", credential=MagicMock())
         files = client.list_files("/shares/test", recursive=True)
         assert len(files) == 2
         names = {f.name for f in files}
         assert names == {"root.ss", "nested.ss"}
 
     @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
-    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
-    def test_recursive_parallel_multiple_subdirs(self, mock_cred, mock_adls):
+    def test_recursive_parallel_multiple_subdirs(self, mock_adls):
         """Multiple sibling directories are walked in parallel."""
         mock_fs = MagicMock()
 
@@ -215,14 +209,13 @@ class TestAdlsGen1Client:
         mock_fs.ls.side_effect = mock_ls
         mock_adls.AzureDLFileSystem.return_value = mock_fs
 
-        client = AdlsGen1Client("test-account")
+        client = AdlsGen1Client("test-account", credential=MagicMock())
         files = client.list_files("/shares/test", recursive=True)
         assert len(files) == 3
         assert {f.name for f in files} == {"a.ss", "b.ss", "c.ss"}
 
     @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
-    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
-    def test_recursive_subdir_error_skips_gracefully(self, mock_cred, mock_adls):
+    def test_recursive_subdir_error_skips_gracefully(self, mock_adls):
         """If one subdirectory fails, the others still succeed."""
         mock_fs = MagicMock()
 
@@ -250,14 +243,13 @@ class TestAdlsGen1Client:
         mock_fs.ls.side_effect = mock_ls
         mock_adls.AzureDLFileSystem.return_value = mock_fs
 
-        client = AdlsGen1Client("test-account")
+        client = AdlsGen1Client("test-account", credential=MagicMock())
         files = client.list_files("/shares/test", recursive=True)
         assert len(files) == 1
         assert files[0].name == "ok.ss"
 
     @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
-    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
-    def test_recursive_subdir_credential_exhaustion_propagates(self, mock_cred, mock_adls):
+    def test_recursive_subdir_credential_exhaustion_propagates(self, mock_adls):
         """If a subdirectory raises CredentialUnavailableError, ``list_files`` must
         propagate it — otherwise the watermark advances past unseen files.
 
@@ -294,13 +286,12 @@ class TestAdlsGen1Client:
         mock_fs.ls.side_effect = mock_ls
         mock_adls.AzureDLFileSystem.return_value = mock_fs
 
-        client = AdlsGen1Client("test-account")
+        client = AdlsGen1Client("test-account", credential=MagicMock())
         with pytest.raises(CredentialUnavailableError):
             client.list_files("/shares/test", recursive=True)
 
     @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
-    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
-    def test_non_recursive_credential_exhaustion_propagates(self, mock_cred, mock_adls):
+    def test_non_recursive_credential_exhaustion_propagates(self, mock_adls):
         """Same guarantee for the non-recursive top-level ``ls`` path."""
         from azure.identity import CredentialUnavailableError
 
@@ -310,13 +301,12 @@ class TestAdlsGen1Client:
         )
         mock_adls.AzureDLFileSystem.return_value = mock_fs
 
-        client = AdlsGen1Client("test-account")
+        client = AdlsGen1Client("test-account", credential=MagicMock())
         with pytest.raises(CredentialUnavailableError):
             client.list_files("/shares/test", recursive=False)
 
     @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
-    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
-    def test_recursive_deep_nesting(self, mock_cred, mock_adls):
+    def test_recursive_deep_nesting(self, mock_adls):
         """Parallel walk works with nested subdirectories (depth > 1)."""
         mock_fs = MagicMock()
 
@@ -337,7 +327,7 @@ class TestAdlsGen1Client:
         mock_fs.ls.side_effect = mock_ls
         mock_adls.AzureDLFileSystem.return_value = mock_fs
 
-        client = AdlsGen1Client("test-account")
+        client = AdlsGen1Client("test-account", credential=MagicMock())
         files = client.list_files("/root", recursive=True)
         assert len(files) == 1
         assert files[0].name == "deep.ss"
@@ -346,8 +336,7 @@ class TestAdlsGen1Client:
 class TestWalkProgressLogging:
     @patch("dbt.adapters.scope.adls_gen1_client.log")
     @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
-    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
-    def test_logs_per_directory_progress(self, mock_cred, mock_adls, mock_log):
+    def test_logs_per_directory_progress(self, mock_adls, mock_log):
         """Walk logs depth, dir/file counts, and in-flight per directory."""
         mock_fs = MagicMock()
 
@@ -378,7 +367,7 @@ class TestWalkProgressLogging:
         mock_fs.ls.side_effect = mock_ls
         mock_adls.AzureDLFileSystem.return_value = mock_fs
 
-        client = AdlsGen1Client("test-account")
+        client = AdlsGen1Client("test-account", credential=MagicMock())
         client.list_files("/root", recursive=True)
 
         debug_msgs = [c.args[0] if c.args else "" for c in mock_log.debug.call_args_list]
@@ -387,8 +376,7 @@ class TestWalkProgressLogging:
 
     @patch("dbt.adapters.scope.adls_gen1_client.log")
     @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
-    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
-    def test_logs_timing_for_non_recursive(self, mock_cred, mock_adls, mock_log):
+    def test_logs_timing_for_non_recursive(self, mock_adls, mock_log):
         mock_fs = MagicMock()
         mock_fs.ls.return_value = [
             {
@@ -400,7 +388,7 @@ class TestWalkProgressLogging:
         ]
         mock_adls.AzureDLFileSystem.return_value = mock_fs
 
-        client = AdlsGen1Client("test-account")
+        client = AdlsGen1Client("test-account", credential=MagicMock())
         client.list_files("/shares/test", recursive=False)
 
         debug_msgs = [c.args[0] if c.args else "" for c in mock_log.debug.call_args_list]
@@ -409,14 +397,13 @@ class TestWalkProgressLogging:
 
     @patch("dbt.adapters.scope.adls_gen1_client.log")
     @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
-    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
-    def test_logs_on_not_found(self, mock_cred, mock_adls, mock_log):
+    def test_logs_on_not_found(self, mock_adls, mock_log):
         """Walk complete is logged even when root path not found."""
         mock_fs = MagicMock()
         mock_fs.ls.side_effect = FileNotFoundError("not found")
         mock_adls.AzureDLFileSystem.return_value = mock_fs
 
-        client = AdlsGen1Client("test-account")
+        client = AdlsGen1Client("test-account", credential=MagicMock())
         client.list_files("/shares/gone", recursive=True)
 
         debug_msgs = [c.args[0] if c.args else "" for c in mock_log.debug.call_args_list]
@@ -427,22 +414,20 @@ class TestEstimateBytes:
     """Tests for estimate_bytes — SSv3/v4 vs SSv5/v6 detection."""
 
     @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
-    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
-    def test_ssv3_no_sibling_folder(self, mock_cred, mock_adls):
+    def test_ssv3_no_sibling_folder(self, mock_adls):
         """SSv3/v4: no sibling folder → returns (file_length, [])."""
         mock_fs = MagicMock()
         mock_fs.info.side_effect = FileNotFoundError("not found")
         mock_adls.AzureDLFileSystem.return_value = mock_fs
 
-        client = AdlsGen1Client("test-account")
+        client = AdlsGen1Client("test-account", credential=MagicMock())
         est_bytes, contrib = client.estimate_bytes("/shares/test/data.ss", 727393)
 
         assert est_bytes == 727393
         assert contrib == []
 
     @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
-    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
-    def test_ssv5_with_du_files(self, mock_cred, mock_adls):
+    def test_ssv5_with_du_files(self, mock_adls):
         """SSv5/v6: sibling folder with .du files → returns sum."""
         mock_fs = MagicMock()
         mock_fs.info.return_value = {"type": "DIRECTORY"}
@@ -452,7 +437,7 @@ class TestEstimateBytes:
         ]
         mock_adls.AzureDLFileSystem.return_value = mock_fs
 
-        client = AdlsGen1Client("test-account")
+        client = AdlsGen1Client("test-account", credential=MagicMock())
         est_bytes, contrib = client.estimate_bytes("/shares/test/data.ss", 4096)
 
         assert est_bytes == 4096 + 50_000_000 + 48_000_000
@@ -461,8 +446,7 @@ class TestEstimateBytes:
         assert "/shares/test/data/part-00001.du" in contrib
 
     @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
-    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
-    def test_ssv5_with_delta_subfolder(self, mock_cred, mock_adls):
+    def test_ssv5_with_delta_subfolder(self, mock_adls):
         """SSv5 with delta updates — recursive listing includes subdirs."""
         mock_fs = MagicMock()
         mock_fs.info.return_value = {"type": "DIRECTORY"}
@@ -489,22 +473,21 @@ class TestEstimateBytes:
         mock_fs.ls.side_effect = mock_ls
         mock_adls.AzureDLFileSystem.return_value = mock_fs
 
-        client = AdlsGen1Client("test-account")
+        client = AdlsGen1Client("test-account", credential=MagicMock())
         est_bytes, contrib = client.estimate_bytes("/shares/test/data.ss", 4096)
 
         assert est_bytes == 4096 + 50_000_000 + 1_000_000
         assert len(contrib) == 2
 
     @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
-    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
-    def test_empty_sibling_folder(self, mock_cred, mock_adls):
+    def test_empty_sibling_folder(self, mock_adls):
         """Empty sibling folder → returns (manifest_size, [])."""
         mock_fs = MagicMock()
         mock_fs.info.return_value = {"type": "DIRECTORY"}
         mock_fs.ls.return_value = []
         mock_adls.AzureDLFileSystem.return_value = mock_fs
 
-        client = AdlsGen1Client("test-account")
+        client = AdlsGen1Client("test-account", credential=MagicMock())
         est_bytes, contrib = client.estimate_bytes("/shares/test/data.ss", 2048)
 
         assert est_bytes == 2048
@@ -520,14 +503,13 @@ class TestEnrichWithEstimates:
     """Tests for enrich_with_estimates — bulk enrichment of FileInfo lists."""
 
     @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
-    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
-    def test_enriches_all_files(self, mock_cred, mock_adls):
+    def test_enriches_all_files(self, mock_adls):
         mock_fs = MagicMock()
         # No sibling folders (SSv3/v4 for both)
         mock_fs.info.side_effect = FileNotFoundError("not found")
         mock_adls.AzureDLFileSystem.return_value = mock_fs
 
-        client = AdlsGen1Client("test-account")
+        client = AdlsGen1Client("test-account", credential=MagicMock())
         files = [
             FileInfo(
                 path="/shares/test/a.ss",
@@ -551,8 +533,7 @@ class TestEnrichWithEstimates:
         assert enriched[1].contributing_files == ()
 
     @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
-    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
-    def test_enriches_ssv5_files(self, mock_cred, mock_adls):
+    def test_enriches_ssv5_files(self, mock_adls):
         mock_fs = MagicMock()
         mock_fs.info.return_value = {"type": "DIRECTORY"}
         mock_fs.ls.return_value = [
@@ -560,7 +541,7 @@ class TestEnrichWithEstimates:
         ]
         mock_adls.AzureDLFileSystem.return_value = mock_fs
 
-        client = AdlsGen1Client("test-account")
+        client = AdlsGen1Client("test-account", credential=MagicMock())
         files = [
             FileInfo(
                 path="/shares/test/a.ss",
@@ -579,14 +560,13 @@ class TestEnrichWithEstimates:
         assert client.enrich_with_estimates([]) == []
 
     @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
-    @patch("dbt.adapters.scope.adls_gen1_client.AzureCliCredential")
-    def test_fallback_on_error(self, mock_cred, mock_adls):
+    def test_fallback_on_error(self, mock_adls):
         """If estimate_bytes fails for a file, fall back to file length."""
         mock_fs = MagicMock()
         mock_fs.info.side_effect = Exception("network error")
         mock_adls.AzureDLFileSystem.return_value = mock_fs
 
-        client = AdlsGen1Client("test-account")
+        client = AdlsGen1Client("test-account", credential=MagicMock())
         files = [
             FileInfo(
                 path="/shares/test/bad.ss",

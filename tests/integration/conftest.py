@@ -20,10 +20,11 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from azure.identity import AzureCliCredential
 from datagen import ScopeDataset, make_default_dataset, submit_datagen_job
 from dbt.cli.main import dbtRunner
 
-from dbt.adapters.scope.delta_lake import get_default_delta_client
+from dbt.adapters.scope.delta_lake import DuckDbDeltaLakeClient, LockedTokenCredential
 
 PROJECT_DIR = Path(__file__).parent / "dbt_project"
 REPO_ROOT = Path(__file__).parent.parent.parent
@@ -52,7 +53,8 @@ def _delta_path(table_name: str) -> str:
 
 
 def _delta_client():
-    return get_default_delta_client()
+    # Integration tests run on dev machines authenticated via ``az login``.
+    return DuckDbDeltaLakeClient(credential=LockedTokenCredential(AzureCliCredential()))
 
 
 # -- Datagen datasets --------------------------------------------------------

@@ -17,7 +17,6 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Any
 
 import duckdb
@@ -396,9 +395,3 @@ class DuckDbDeltaLakeClient(DeltaLakeClient):
         except Exception:
             log.warning(f"list_table_paths({delta_location}) failed")
             return []
-
-
-@lru_cache(maxsize=1)
-def get_default_delta_client() -> DuckDbDeltaLakeClient:
-    """Return the default Delta client used by the adapter and test helpers."""
-    return DuckDbDeltaLakeClient(credential=LockedTokenCredential(AzureCliCredential()))

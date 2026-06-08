@@ -24,12 +24,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from azure.core.credentials import TokenCredential
-from azure.identity import AzureCliCredential, CredentialUnavailableError
+from azure.identity import CredentialUnavailableError
 from azure.storage.filedatalake import DataLakeServiceClient
 from dbt.adapters.events.logging import AdapterLogger
 
-from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK
-from dbt.adapters.scope.delta_lake import AbfssLocation, LockedTokenCredential, RetryPolicy
+from dbt.adapters.scope.delta_lake import AbfssLocation, RetryPolicy
 
 log = AdapterLogger("scope")
 
@@ -114,15 +113,15 @@ class CheckpointManager:
         self,
         *,
         credential: TokenCredential | None = None,
-        lock_file: str = AZ_CLI_TOKEN_LOCK,
         retry_policy: RetryPolicy | None = None,
     ) -> None:
-        # Production callers (impl.py) pass ``credential=build_credential(creds)``
-        # so SNI / notebookutils / managed-identity flow through.
-        # The CLI fallback is retained for tests that don't supply a credential.
-        self._credential = credential or LockedTokenCredential(
-            AzureCliCredential(), lock_file=lock_file, retry_policy=retry_policy
-        )
+        if credential is None:
+            raise RuntimeError(
+                "CheckpointManager requires an explicit ``credential``; "
+                "callers should pass ``credential=build_credential(creds)``."
+            )
+        self._credential = credential
+        self._retry_policy = retry_policy
 
     # -- Watermark ---------------------------------------------------------
 
