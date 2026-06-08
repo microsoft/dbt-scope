@@ -14,6 +14,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
+from azure.core.credentials import TokenCredential
 from azure.datalake.store import core as adls_core
 from azure.identity import AzureCliCredential, CredentialUnavailableError
 from dbt.adapters.events.logging import AdapterLogger
@@ -111,10 +112,12 @@ class AdlsGen1Client:
         self,
         account: str,
         *,
+        credential: TokenCredential | None = None,
         lock_file: str = AZ_CLI_TOKEN_LOCK,
         retry_policy: RetryPolicy | None = None,
     ) -> None:
         self._account = account
+        self._credential = credential
         self._lock_file = lock_file
         self._retry_policy = retry_policy
         self._fs: adls_core.AzureDLFileSystem | None = None
@@ -124,10 +127,12 @@ class AdlsGen1Client:
     def _get_fs(self) -> adls_core.AzureDLFileSystem:
         """Lazily initialize the ADLS Gen1 filesystem client."""
         if self._fs is None:
-            # Wrap in LockedTokenCredential so the ``get_token`` calls
-            # that ``AzureDLFileSystem`` makes internally inherit both
-            # the file lock and the credential retry policy.
-            credential = LockedTokenCredential(
+            # Use the caller-supplied credential as-is (typically the result of
+            # ``build_credential`` — which already applies LockedTokenCredential
+            # only for the CLI path). Fall back to ``AzureCliCredential`` wrapped
+            # in ``LockedTokenCredential`` for backward compat when no credential
+            # is provided (tests and legacy callers).
+            credential = self._credential or LockedTokenCredential(
                 AzureCliCredential(),
                 lock_file=self._lock_file,
                 retry_policy=self._retry_policy,

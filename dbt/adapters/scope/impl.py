@@ -34,7 +34,7 @@ from dbt.adapters.scope.constants import (
     DEFAULT_WAIT_ON_CANCEL_SECONDS,
 )
 from dbt.adapters.scope.credentials import ScopeCredentials
-from dbt.adapters.scope.delta_lake import RetryPolicy
+from dbt.adapters.scope.delta_lake import RetryPolicy, build_credential
 from dbt.adapters.scope.file_tracker import FileTracker
 from dbt.adapters.scope.relation import ScopeRelation
 from dbt.adapters.scope.script_builder import ColumnDef, ScriptConfig
@@ -153,6 +153,17 @@ def _scope_open_hook(credentials: ScopeCredentials) -> None:
 
 
 ScopeConnectionManager._on_open = staticmethod(_scope_open_hook)
+
+# Install signal handlers eagerly at module-load time. ``dbt.adapters.scope.impl``
+# is imported during dbt's main-thread CLI bootstrap (before any worker threads
+# are spawned for model execution), so this is the only reliable place to win
+# the race against ``signal.signal()``'s main-thread-only requirement.
+# ``ScopeConnectionManager.open()`` runs on per-model worker threads (via
+# dbt's ``LazyHandle(self.open)``), where ``signal.signal()`` would raise
+# ``ValueError: signal only works in main thread of the main interpreter``
+# and our ``_install_signal_handlers`` guard would early-return.
+_install_signal_handlers()
+_register_atexit()
 
 
 _TIMESTAMP_COLS = ("accessTime", "modificationTime", "msExpirationTime", "expiryTime")
@@ -356,10 +367,8 @@ class ScopeAdapter(BaseAdapter):
             return []
 
         try:
-            from azure.identity import AzureCliCredential, CredentialUnavailableError
+            from azure.identity import CredentialUnavailableError
             from azure.storage.filedatalake import DataLakeServiceClient
-
-            from dbt.adapters.scope.delta_lake import LockedTokenCredential
 
             t_start = time.monotonic()
             log.debug(
@@ -367,10 +376,7 @@ class ScopeAdapter(BaseAdapter):
                 f"{creds.delta_base_path} for Delta tables"
             )
 
-            credential = LockedTokenCredential(
-                AzureCliCredential(),
-                retry_policy=RetryPolicy.from_http_retries(creds.http_retries),
-            )
+            credential = build_credential(creds)
             service = DataLakeServiceClient(
                 account_url=f"https://{creds.storage_account}.dfs.core.windows.net",
                 credential=credential,
@@ -900,6 +906,7 @@ class ScopeAdapter(BaseAdapter):
             creds = self._credentials()
             self._gen1_client = AdlsGen1Client(
                 account=creds.adls_gen1_account,
+                credential=build_credential(creds),
                 retry_policy=RetryPolicy.from_http_retries(creds.http_retries),
             )
         return self._gen1_client
@@ -909,6 +916,7 @@ class ScopeAdapter(BaseAdapter):
         if not hasattr(self, "_checkpoint_manager"):
             creds = self._credentials()
             self._checkpoint_manager = CheckpointManager(
+                credential=build_credential(creds),
                 retry_policy=RetryPolicy.from_http_retries(creds.http_retries),
             )
         return self._checkpoint_manager

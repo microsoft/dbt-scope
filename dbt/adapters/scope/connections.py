@@ -13,7 +13,6 @@ from urllib.parse import quote as url_quote
 
 import agate
 import requests
-from azure.identity import AzureCliCredential
 from dbt.adapters.base import BaseConnectionManager
 from dbt.adapters.contracts.connection import (
     AdapterResponse,
@@ -25,9 +24,8 @@ from dbt_common.exceptions import DbtDatabaseError, DbtRuntimeError
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK
 from dbt.adapters.scope.credentials import ScopeCredentials
-from dbt.adapters.scope.delta_lake import LockedTokenCredential, RetryPolicy
+from dbt.adapters.scope.delta_lake import build_credential
 
 log = AdapterLogger("scope")
 
@@ -188,11 +186,7 @@ class ScopeConnectionHandle:
         self._account = credentials.adla_account
         self._base_url = f"https://{self._account}.azuredatalakeanalytics.net"
         self._timeout = credentials.http_timeout_seconds
-        self._credential = LockedTokenCredential(
-            AzureCliCredential(),
-            lock_file=AZ_CLI_TOKEN_LOCK,
-            retry_policy=RetryPolicy.from_http_retries(credentials.http_retries),
-        )
+        self._credential = build_credential(credentials)
         self._session = self._build_session(credentials.http_retries)
         self._cached_token: str | None = None
         self._token_expires_at: float = 0

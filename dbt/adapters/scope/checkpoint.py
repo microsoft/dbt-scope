@@ -23,6 +23,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from azure.core.credentials import TokenCredential
 from azure.identity import AzureCliCredential, CredentialUnavailableError
 from azure.storage.filedatalake import DataLakeServiceClient
 from dbt.adapters.events.logging import AdapterLogger
@@ -102,7 +103,7 @@ class Watermark:
         )
 
 
-def _get_service(parsed: AbfssLocation, credential: LockedTokenCredential) -> DataLakeServiceClient:
+def _get_service(parsed: AbfssLocation, credential: TokenCredential) -> DataLakeServiceClient:
     return DataLakeServiceClient(account_url=parsed.account_url, credential=credential)
 
 
@@ -112,10 +113,14 @@ class CheckpointManager:
     def __init__(
         self,
         *,
+        credential: TokenCredential | None = None,
         lock_file: str = AZ_CLI_TOKEN_LOCK,
         retry_policy: RetryPolicy | None = None,
     ) -> None:
-        self._credential = LockedTokenCredential(
+        # Production callers (impl.py) pass ``credential=build_credential(creds)``
+        # so SNI / notebookutils / managed-identity flow through.
+        # The CLI fallback is retained for tests that don't supply a credential.
+        self._credential = credential or LockedTokenCredential(
             AzureCliCredential(), lock_file=lock_file, retry_policy=retry_policy
         )
 

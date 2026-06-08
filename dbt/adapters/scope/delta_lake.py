@@ -160,6 +160,36 @@ class LockedTokenCredential(TokenCredential):
         raise last_exc
 
 
+def build_credential(
+    credentials: Any, *, retry_policy: RetryPolicy | None = None
+) -> TokenCredential:
+    """Return the configured TokenCredential for a ScopeCredentials object.
+
+    For the default ``authentication='cli'`` path, returns
+    ``LockedTokenCredential(AzureCliCredential(), ...)`` — the file lock plus
+    transient-error retry are tuned for the ``az`` subprocess token cache.
+
+    For ``authentication='token_credential'``, returns the user-supplied
+    credential as-is (the lock/retry are CLI-specific and counter-productive
+    for SNI / notebookutils / managed-identity credentials).
+    """
+    auth = (getattr(credentials, "authentication", "cli") or "cli").lower()
+    if auth == "token_credential":
+        # Lazy import keeps `delta_lake.py` importable in places that don't
+        # need the custom-credential plumbing.
+        from dbt.adapters.scope.custom_credential import load_custom_credential
+
+        return load_custom_credential(credentials.credential_class, credentials.credential_kwargs)
+    policy = retry_policy or RetryPolicy.from_http_retries(
+        getattr(credentials, "http_retries", None)
+    )
+    return LockedTokenCredential(
+        AzureCliCredential(),
+        lock_file=AZ_CLI_TOKEN_LOCK,
+        retry_policy=policy,
+    )
+
+
 class DeltaLakeClient(ABC):
     """Abstract read-only contract for Delta Lake inspection and verification."""
 
@@ -312,12 +342,8 @@ class DuckDbDeltaLakeClient(DeltaLakeClient):
         credential: TokenCredential,
         *,
         connection_factory: Callable[[], duckdb.DuckDBPyConnection] | None = None,
-        lock_file: str = AZ_CLI_TOKEN_LOCK,
-        retry_policy: RetryPolicy | None = None,
     ) -> None:
-        self._credential = LockedTokenCredential(
-            credential, lock_file=lock_file, retry_policy=retry_policy
-        )
+        self._credential = credential
         self._connection_factory = connection_factory or duckdb.connect
 
     @contextmanager
@@ -366,4 +392,4 @@ class DuckDbDeltaLakeClient(DeltaLakeClient):
 @lru_cache(maxsize=1)
 def get_default_delta_client() -> DuckDbDeltaLakeClient:
     """Return the default Delta client used by the adapter and test helpers."""
-    return DuckDbDeltaLakeClient(credential=AzureCliCredential())
+    return DuckDbDeltaLakeClient(credential=LockedTokenCredential(AzureCliCredential()))

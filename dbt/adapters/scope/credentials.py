@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 from dbt.adapters.contracts.connection import Credentials
+from dbt_common.exceptions import DbtRuntimeError
 
 from dbt.adapters.scope.constants import (
     DEFAULT_CANCEL_JOBS_ON_SHUTDOWN,
@@ -35,6 +37,21 @@ class ScopeCredentials(Credentials):
               max_file_count_per_output_file_set: 5000  # SCOPE @@MaxFileCountPerOutputFileSet
               cancel_jobs_on_shutdown: true             # cancel in-flight ADLA jobs on SIGINT/SIGTERM
               wait_on_cancel_seconds: 30                # wait per job for ADLA terminal state
+
+              # Optional: plug a custom azure.core.credentials.TokenCredential.
+              # Defaults to authentication='cli' which uses az login.
+              authentication: token_credential
+              credential_class: "fabric_entra_auth.EntraTokenCredential"
+              credential_kwargs:
+                auth:
+                  authentication_method: SNI
+                  sni:
+                    client_id: <guid>
+                    tenant_id: <guid>
+                    vault_url: 'https://<vault>.vault.azure.net/'
+                    vault_certificate_name: <name>
+                    vault_pull_config:
+                      authentication_method: azCli
     """
 
     adla_account: str = ""
@@ -55,6 +72,13 @@ class ScopeCredentials(Credentials):
     http_retries: int = 10
     scope_feature_previews: str | None = "EnableDeltaTableDynamicInsert:on"
     delta_lake_commit_condition: str = "FailIfFileConflict"
+
+    # "cli" (default — AzureCliCredential) or "token_credential" (dotted-path)
+    authentication: str = "cli"
+    # Dotted path to a TokenCredential implementation loaded via importlib
+    # when authentication='token_credential'.
+    credential_class: str | None = None
+    credential_kwargs: dict[str, Any] = field(default_factory=dict)
 
     @property
     def type(self) -> str:
@@ -79,4 +103,22 @@ class ScopeCredentials(Credentials):
             "cancel_jobs_on_shutdown",
             "wait_on_cancel_seconds",
             "delta_lake_commit_condition",
+            "authentication",
+            "credential_class",
         )
+
+    def __post_init__(self) -> None:
+        is_token_credential_auth = (
+            isinstance(self.authentication, str)
+            and self.authentication.lower() == "token_credential"
+        )
+        if is_token_credential_auth and not self.credential_class:
+            raise DbtRuntimeError(
+                "authentication='token_credential' requires `credential_class` "
+                "(dotted path to an azure.core.credentials.TokenCredential)."
+            )
+        if not is_token_credential_auth and (self.credential_class or self.credential_kwargs):
+            raise DbtRuntimeError(
+                "`credential_class` and `credential_kwargs` are only valid when "
+                "authentication='token_credential'."
+            )
