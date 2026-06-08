@@ -6,7 +6,7 @@ import tempfile
 import threading
 from pathlib import Path
 
-from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK, FileLock
+from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK, FABRIC_TOKEN_LOCK, FileLock
 
 
 class TestFileLock:
@@ -70,3 +70,9 @@ class TestFileLock:
         """AZ_CLI_TOKEN_LOCK is a well-known path in the temp directory."""
         assert "dbt-scope-az-cli-token" in AZ_CLI_TOKEN_LOCK
         assert tempfile.gettempdir() in AZ_CLI_TOKEN_LOCK
+
+    def test_fabric_token_lock_constant(self):
+        """FABRIC_TOKEN_LOCK is a well-known path in the temp directory."""
+        assert "dbt-scope-fabric-token" in FABRIC_TOKEN_LOCK
+        assert tempfile.gettempdir() in FABRIC_TOKEN_LOCK
+        assert FABRIC_TOKEN_LOCK != AZ_CLI_TOKEN_LOCK

@@ -26,7 +26,7 @@ from azure.storage.filedatalake import DataLakeServiceClient
 from dbt.adapters.events.logging import AdapterLogger
 from dbt_common.exceptions import DbtRuntimeError
 
-from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK, FileLock
+from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK, FABRIC_TOKEN_LOCK, FileLock
 
 log = AdapterLogger("scope")
 
@@ -189,11 +189,13 @@ def build_credential(
         inner: TokenCredential = load_custom_credential(
             credentials.credential_class, credentials.credential_kwargs
         )
+        lock_file = FABRIC_TOKEN_LOCK
     else:
         inner = AzureCliCredential()
+        lock_file = AZ_CLI_TOKEN_LOCK
     return LockedTokenCredential(
         inner,
-        lock_file=AZ_CLI_TOKEN_LOCK,
+        lock_file=lock_file,
         retry_policy=policy,
     )
 

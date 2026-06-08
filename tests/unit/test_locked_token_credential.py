@@ -258,3 +258,38 @@ class TestLockedTokenCredential:
         # Default RetryPolicy → 10 retries + 1 initial == 11 calls
         assert inner.get_token.call_count == 11
         assert len(sleep.calls) == 10
+
+
+# -- build_credential lock-file dispatch ---------------------------------
+
+
+class TestBuildCredentialLockFile:
+    """``build_credential`` picks the lock file based on ``authentication``."""
+
+    def test_cli_auth_uses_az_cli_lock(self) -> None:
+        from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK
+        from dbt.adapters.scope.delta_lake import build_credential
+
+        creds = SimpleNamespace(authentication="cli", http_retries=0)
+        cred = build_credential(creds)
+        assert isinstance(cred, LockedTokenCredential)
+        assert cred._lock_file == AZ_CLI_TOKEN_LOCK
+
+    def test_token_credential_auth_uses_fabric_lock(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from dbt.adapters.scope._file_lock import FABRIC_TOKEN_LOCK
+        from dbt.adapters.scope.delta_lake import build_credential
+
+        fake_inner = MagicMock(name="custom_inner")
+        monkeypatch.setattr(
+            "dbt.adapters.scope.custom_credential.load_custom_credential",
+            lambda *_a, **_k: fake_inner,
+        )
+        creds = SimpleNamespace(
+            authentication="token_credential",
+            credential_class="some.module.SomeCred",
+            credential_kwargs={},
+            http_retries=0,
+        )
+        cred = build_credential(creds)
+        assert isinstance(cred, LockedTokenCredential)
+        assert cred._lock_file == FABRIC_TOKEN_LOCK
