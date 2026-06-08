@@ -163,28 +163,37 @@ class LockedTokenCredential(TokenCredential):
 def build_credential(
     credentials: Any, *, retry_policy: RetryPolicy | None = None
 ) -> TokenCredential:
-    """Return the configured TokenCredential for a ScopeCredentials object.
+    """Return the configured TokenCredential for a ScopeCredentials object,
+    always wrapped in ``LockedTokenCredential``.
 
-    For the default ``authentication='cli'`` path, returns
-    ``LockedTokenCredential(AzureCliCredential(), ...)`` — the file lock plus
-    transient-error retry are tuned for the ``az`` subprocess token cache.
+    The file lock serializes concurrent dbt threads through a single token
+    acquisition. Without it, 4 parallel workers each independently walk the
+    inner credential's fallback chain — which on headless Fabric notebooks can
+    land on interactive device-code auth (one prompt per thread).
 
-    For ``authentication='token_credential'``, returns the user-supplied
-    credential as-is (the lock/retry are CLI-specific and counter-productive
-    for SNI / notebookutils / managed-identity credentials).
+    - ``authentication='cli'``: wraps ``AzureCliCredential()``. File lock and
+      transient-error retry are tuned for the ``az`` subprocess token cache.
+    - ``authentication='token_credential'``: wraps the user-supplied credential
+      (e.g. ``EntraTokenCredential``). The first thread populates the cache;
+      subsequent threads reuse the cached token without re-entering the inner
+      credential's fallback chain.
     """
+    policy = retry_policy or RetryPolicy.from_http_retries(
+        getattr(credentials, "http_retries", None)
+    )
     auth = (getattr(credentials, "authentication", "cli") or "cli").lower()
     if auth == "token_credential":
         # Lazy import keeps `delta_lake.py` importable in places that don't
         # need the custom-credential plumbing.
         from dbt.adapters.scope.custom_credential import load_custom_credential
 
-        return load_custom_credential(credentials.credential_class, credentials.credential_kwargs)
-    policy = retry_policy or RetryPolicy.from_http_retries(
-        getattr(credentials, "http_retries", None)
-    )
+        inner: TokenCredential = load_custom_credential(
+            credentials.credential_class, credentials.credential_kwargs
+        )
+    else:
+        inner = AzureCliCredential()
     return LockedTokenCredential(
-        AzureCliCredential(),
+        inner,
         lock_file=AZ_CLI_TOKEN_LOCK,
         retry_policy=policy,
     )
