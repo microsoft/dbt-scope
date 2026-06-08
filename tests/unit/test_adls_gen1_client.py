@@ -579,3 +579,112 @@ class TestEnrichWithEstimates:
         enriched = client.enrich_with_estimates(files)
         assert enriched[0].estimated_bytes == 999
         assert enriched[0].contributing_files == ()
+
+
+class TestLegacyDataLakeCredentialAdapter:
+    """Cover the legacy ``azure-datalake-store`` 0.0.5x compatibility shim."""
+
+    def test_signed_session_caches_token_until_expiry(self):
+        from azure.core.credentials import AccessToken
+
+        from dbt.adapters.scope.adls_gen1_client import _LegacyDataLakeCredentialAdapter
+
+        far_future = int(__import__("time").time()) + 3600
+        credential = MagicMock()
+        credential.get_token.return_value = AccessToken("tok-A", far_future)
+
+        adapter = _LegacyDataLakeCredentialAdapter(credential)
+        s1 = adapter.signed_session()
+        s2 = adapter.signed_session()
+
+        assert s1.headers["Authorization"] == "Bearer tok-A"
+        assert s2.headers["Authorization"] == "Bearer tok-A"
+        credential.get_token.assert_called_once_with("https://datalake.azure.net//.default")
+
+    def test_signed_session_refreshes_when_near_expiry(self):
+        from azure.core.credentials import AccessToken
+
+        from dbt.adapters.scope.adls_gen1_client import _LegacyDataLakeCredentialAdapter
+
+        now = int(__import__("time").time())
+        # First token expires in 60s — below the 300s refresh lead, so the
+        # next signed_session() call must refresh.
+        credential = MagicMock()
+        credential.get_token.side_effect = [
+            AccessToken("tok-old", now + 60),
+            AccessToken("tok-new", now + 3600),
+        ]
+
+        adapter = _LegacyDataLakeCredentialAdapter(credential)
+        s1 = adapter.signed_session()
+        s2 = adapter.signed_session()
+
+        assert s1.headers["Authorization"] == "Bearer tok-old"
+        assert s2.headers["Authorization"] == "Bearer tok-new"
+        assert credential.get_token.call_count == 2
+
+    def test_refresh_token_forces_unconditional_reacquire(self):
+        from azure.core.credentials import AccessToken
+
+        from dbt.adapters.scope.adls_gen1_client import _LegacyDataLakeCredentialAdapter
+
+        now = int(__import__("time").time())
+        credential = MagicMock()
+        credential.get_token.side_effect = [
+            AccessToken("first", now + 3600),
+            AccessToken("second", now + 3600),
+        ]
+        adapter = _LegacyDataLakeCredentialAdapter(credential)
+        adapter.signed_session()
+        adapter.refresh_token()
+        s = adapter.signed_session()
+
+        assert s.headers["Authorization"] == "Bearer second"
+        assert credential.get_token.call_count == 2
+
+
+class TestLegacyGen1SdkDetection:
+    """Ensure ``_get_fs`` routes the legacy SDK through the adapter."""
+
+    @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
+    @patch("dbt.adapters.scope.adls_gen1_client._legacy_gen1_sdk_in_use")
+    def test_legacy_sdk_uses_token_kwarg_with_adapter(self, mock_is_legacy, mock_adls):
+        from dbt.adapters.scope.adls_gen1_client import (
+            AdlsGen1Client,
+            _LegacyDataLakeCredentialAdapter,
+        )
+
+        mock_is_legacy.return_value = True
+        mock_adls.AzureDLFileSystem.return_value = MagicMock()
+        credential = MagicMock()
+
+        client = AdlsGen1Client("acct", credential=credential)
+        client._get_fs()
+
+        kwargs = mock_adls.AzureDLFileSystem.call_args.kwargs
+        assert "token_credential" not in kwargs
+        assert isinstance(kwargs["token"], _LegacyDataLakeCredentialAdapter)
+        assert kwargs["store_name"] == "acct"
+
+    @patch("dbt.adapters.scope.adls_gen1_client.adls_core")
+    @patch("dbt.adapters.scope.adls_gen1_client._legacy_gen1_sdk_in_use")
+    def test_modern_sdk_uses_token_credential_kwarg(self, mock_is_legacy, mock_adls):
+        from dbt.adapters.scope.adls_gen1_client import AdlsGen1Client
+
+        mock_is_legacy.return_value = False
+        mock_adls.AzureDLFileSystem.return_value = MagicMock()
+        credential = MagicMock()
+
+        client = AdlsGen1Client("acct", credential=credential)
+        client._get_fs()
+
+        kwargs = mock_adls.AzureDLFileSystem.call_args.kwargs
+        assert kwargs["token_credential"] is credential
+        assert "token" not in kwargs
+        assert kwargs["store_name"] == "acct"
+
+    def test_legacy_sdk_in_use_inspects_constructor_signature(self):
+        from dbt.adapters.scope.adls_gen1_client import _legacy_gen1_sdk_in_use
+
+        # The locally-installed SDK is 1.x and accepts ``token_credential``.
+        assert _legacy_gen1_sdk_in_use() is False

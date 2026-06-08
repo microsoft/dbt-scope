@@ -7,13 +7,16 @@ used for watermark-based filtering.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import re
+import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
+import requests
 from azure.core.credentials import TokenCredential
 from azure.datalake.store import core as adls_core
 from azure.identity import CredentialUnavailableError
@@ -22,6 +25,63 @@ from dbt.adapters.events.logging import AdapterLogger
 from dbt.adapters.scope.delta_lake import RetryPolicy
 
 log = AdapterLogger("scope")
+
+
+_LEGACY_GEN1_SCOPE = "https://datalake.azure.net//.default"
+
+
+class _LegacyDataLakeCredentialAdapter:
+    """Bridge a modern ``azure.core.credentials.TokenCredential`` to the legacy
+    ``azure.datalake.store.lib.DataLakeCredential`` ``signed_session()`` API.
+
+    Fabric notebook runtimes ship ``azure-datalake-store`` 0.0.5x preinstalled.
+    That version's ``DatalakeRESTInterface.__init__`` silently drops the
+    modern ``token_credential=`` kwarg and falls back to MSAL device-code
+    interactive auth — a hard-failure on any headless surface. This adapter
+    keeps the bundled wheel honest by exposing ``signed_session()`` on top
+    of our non-interactive credential, refreshing the bearer token a few
+    minutes before expiry. The 5-minute skew matches the legacy SDK's own
+    100-second slop window with extra headroom for long-running directory
+    walks.
+    """
+
+    _REFRESH_LEAD_SECONDS = 300
+
+    def __init__(self, credential: TokenCredential, *, scope: str = _LEGACY_GEN1_SCOPE) -> None:
+        self._credential = credential
+        self._scope = scope
+        self._lock = threading.Lock()
+        self._access_token: str | None = None
+        self._expires_on: int = 0
+
+    def _refresh(self) -> None:
+        token = self._credential.get_token(self._scope)
+        self._access_token = token.token
+        self._expires_on = int(token.expires_on)
+
+    def signed_session(self) -> requests.Session:
+        with self._lock:
+            now = int(time.time())
+            if not self._access_token or now > self._expires_on - self._REFRESH_LEAD_SECONDS:
+                self._refresh()
+            bearer = self._access_token
+        session = requests.Session()
+        session.headers["Authorization"] = f"Bearer {bearer}"
+        return session
+
+    def refresh_token(self, authority: str | None = None) -> None:
+        with self._lock:
+            self._refresh()
+
+
+def _legacy_gen1_sdk_in_use() -> bool:
+    """Return True when the running ``AzureDLFileSystem.__init__`` predates the
+    1.x ``token_credential=`` kwarg and therefore needs the legacy adapter."""
+    try:
+        params = inspect.signature(adls_core.AzureDLFileSystem.__init__).parameters
+    except (TypeError, ValueError):
+        return False
+    return "token_credential" not in params
 
 
 class _SuppressFileNotFound(logging.Filter):
@@ -122,17 +182,34 @@ class AdlsGen1Client:
         self._enrichment_cache: dict[str, tuple[int, tuple[str, ...]]] = {}
 
     def _get_fs(self) -> adls_core.AzureDLFileSystem:
-        """Lazily initialize the ADLS Gen1 filesystem client."""
+        """Lazily initialize the ADLS Gen1 filesystem client.
+
+        On Fabric notebook runtimes the preinstalled ``azure-datalake-store``
+        is the 0.0.5x line, whose ``DatalakeRESTInterface.__init__`` silently
+        ignores ``token_credential=`` and falls back to MSAL device-code
+        interactive auth. We detect that signature mismatch and route
+        through :class:`_LegacyDataLakeCredentialAdapter` instead.
+        """
         if self._fs is None:
             if self._credential is None:
                 raise RuntimeError(
                     "AdlsGen1Client requires an explicit ``credential``; "
                     "callers should pass ``credential=build_credential(creds)``."
                 )
-            self._fs = adls_core.AzureDLFileSystem(
-                token_credential=self._credential,
-                store_name=self._account,
-            )
+            if _legacy_gen1_sdk_in_use():
+                log.debug(
+                    "AdlsGen1Client: legacy azure-datalake-store detected — "
+                    "wrapping credential in _LegacyDataLakeCredentialAdapter"
+                )
+                self._fs = adls_core.AzureDLFileSystem(
+                    token=_LegacyDataLakeCredentialAdapter(self._credential),
+                    store_name=self._account,
+                )
+            else:
+                self._fs = adls_core.AzureDLFileSystem(
+                    token_credential=self._credential,
+                    store_name=self._account,
+                )
         return self._fs
 
     def list_files(
