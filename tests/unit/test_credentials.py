@@ -129,7 +129,7 @@ class TestAuthenticationFields:
 class TestMessageRetryFields:
     def test_defaults(self):
         creds = ScopeCredentials(adla_account="x", **_BASE_KWARGS)
-        assert creds.retry_on_error_messages == ["Cannot exceed", " queued SCOPE jobs"]
+        assert creds.retry_on_error_messages == []
         assert creds.max_retries_on_error == 25
         assert creds.initial_wait_on_error_seconds == 1.0
         assert creds.max_wait_on_error_seconds == 30.0
@@ -179,3 +179,53 @@ class TestMessageRetryFields:
         assert "max_retries_on_error" in keys
         assert "initial_wait_on_error_seconds" in keys
         assert "max_wait_on_error_seconds" in keys
+
+
+class TestQuotaEvictionFields:
+    def test_defaults(self):
+        creds = ScopeCredentials(adla_account="x", **_BASE_KWARGS)
+        assert creds.enable_quota_eviction is True
+        assert creds.quota_eviction_max_attempts == 25
+        assert creds.quota_eviction_cancel_num == 5
+        assert creds.quota_eviction_wait_seconds == 30.0
+        assert creds.quota_eviction_jitter_seconds == 5.0
+
+    def test_custom_values_accepted(self):
+        creds = ScopeCredentials(
+            adla_account="x",
+            enable_quota_eviction=False,
+            quota_eviction_max_attempts=3,
+            quota_eviction_cancel_num=10,
+            quota_eviction_wait_seconds=60.0,
+            quota_eviction_jitter_seconds=0.0,
+            **_BASE_KWARGS,
+        )
+        assert creds.enable_quota_eviction is False
+        assert creds.quota_eviction_max_attempts == 3
+        assert creds.quota_eviction_cancel_num == 10
+        assert creds.quota_eviction_wait_seconds == 60.0
+        assert creds.quota_eviction_jitter_seconds == 0.0
+
+    def test_negative_max_attempts_rejected(self):
+        with pytest.raises(DbtRuntimeError, match="quota_eviction_max_attempts must be >= 0"):
+            ScopeCredentials(adla_account="x", quota_eviction_max_attempts=-1, **_BASE_KWARGS)
+
+    def test_zero_cancel_num_rejected(self):
+        with pytest.raises(DbtRuntimeError, match="quota_eviction_cancel_num must be >= 1"):
+            ScopeCredentials(adla_account="x", quota_eviction_cancel_num=0, **_BASE_KWARGS)
+
+    def test_non_positive_wait_rejected(self):
+        with pytest.raises(DbtRuntimeError, match="quota_eviction_wait_seconds must be > 0"):
+            ScopeCredentials(adla_account="x", quota_eviction_wait_seconds=0, **_BASE_KWARGS)
+
+    def test_negative_jitter_rejected(self):
+        with pytest.raises(DbtRuntimeError, match="quota_eviction_jitter_seconds must be >= 0"):
+            ScopeCredentials(adla_account="x", quota_eviction_jitter_seconds=-1, **_BASE_KWARGS)
+
+    def test_fields_in_connection_keys(self):
+        keys = ScopeCredentials(adla_account="x", **_BASE_KWARGS)._connection_keys()
+        assert "enable_quota_eviction" in keys
+        assert "quota_eviction_max_attempts" in keys
+        assert "quota_eviction_cancel_num" in keys
+        assert "quota_eviction_wait_seconds" in keys
+        assert "quota_eviction_jitter_seconds" in keys

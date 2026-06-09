@@ -73,15 +73,16 @@ class ScopeCredentials(Credentials):
     scope_feature_previews: str | None = "EnableDeltaTableDynamicInsert:on"
     delta_lake_commit_condition: str = "FailIfFileConflict"
 
-    retry_on_error_messages: list[str] = field(
-        default_factory=lambda: [
-            "Cannot exceed",
-            " queued SCOPE jobs",
-        ]
-    )
+    retry_on_error_messages: list[str] = field(default_factory=list)
     max_retries_on_error: int = 25
     initial_wait_on_error_seconds: float = 1.0
     max_wait_on_error_seconds: float = 30.0
+
+    enable_quota_eviction: bool = True
+    quota_eviction_max_attempts: int = 25
+    quota_eviction_cancel_num: int = 5
+    quota_eviction_wait_seconds: float = 30.0
+    quota_eviction_jitter_seconds: float = 5.0
 
     # "cli" (default — AzureCliCredential) or "token_credential" (dotted-path)
     authentication: str = "cli"
@@ -117,6 +118,11 @@ class ScopeCredentials(Credentials):
             "max_retries_on_error",
             "initial_wait_on_error_seconds",
             "max_wait_on_error_seconds",
+            "enable_quota_eviction",
+            "quota_eviction_max_attempts",
+            "quota_eviction_cancel_num",
+            "quota_eviction_wait_seconds",
+            "quota_eviction_jitter_seconds",
             "authentication",
             "credential_class",
         )
@@ -160,3 +166,21 @@ class ScopeCredentials(Credentials):
                 raise DbtRuntimeError(
                     f"retry_on_error_messages entries must be non-empty strings; got {entry!r}"
                 )
+
+        if self.quota_eviction_max_attempts < 0:
+            raise DbtRuntimeError(
+                f"quota_eviction_max_attempts must be >= 0; got {self.quota_eviction_max_attempts}"
+            )
+        if self.quota_eviction_cancel_num < 1:
+            raise DbtRuntimeError(
+                f"quota_eviction_cancel_num must be >= 1; got {self.quota_eviction_cancel_num}"
+            )
+        if self.quota_eviction_wait_seconds <= 0:
+            raise DbtRuntimeError(
+                f"quota_eviction_wait_seconds must be > 0; got {self.quota_eviction_wait_seconds}"
+            )
+        if self.quota_eviction_jitter_seconds < 0:
+            raise DbtRuntimeError(
+                "quota_eviction_jitter_seconds must be >= 0; "
+                f"got {self.quota_eviction_jitter_seconds}"
+            )

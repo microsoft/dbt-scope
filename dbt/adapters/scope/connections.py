@@ -27,6 +27,7 @@ from urllib3.util.retry import Retry
 from dbt.adapters.scope.credentials import ScopeCredentials
 from dbt.adapters.scope.delta_lake import build_credential
 from dbt.adapters.scope.message_retry import MessageRetryPolicy, retry_on_message
+from dbt.adapters.scope.quota_eviction import QuotaEvictionPolicy, retry_with_quota_eviction
 
 log = AdapterLogger("scope")
 
@@ -190,6 +191,7 @@ class ScopeConnectionHandle:
         self._credential = build_credential(credentials)
         self._session = self._build_session(credentials.http_retries)
         self._message_retry_policy = MessageRetryPolicy.from_credentials(credentials)
+        self._quota_eviction_policy = QuotaEvictionPolicy.from_credentials(credentials)
         self._cached_token: str | None = None
         self._token_expires_at: float = 0
         self._next_job_name: str | None = None
@@ -232,7 +234,16 @@ class ScopeConnectionHandle:
             }
         log.debug(f"Submitting SCOPE job '{name}' (AU={au}) → {job_id}")
         log.debug(f"SCOPE script for '{name}':\n{script}")
-        resp = self._request("PUT", url, json=body)
+
+        def _put() -> dict:
+            return self._request("PUT", url, json=body)
+
+        resp = retry_with_quota_eviction(
+            _put,
+            eviction_ctx=self,
+            policy=self._quota_eviction_policy,
+            label=f"submit_job '{name}' ({job_id})",
+        )
         job = ADLAJob(job_id=job_id, name=name)
         job.update_from_response(resp)
         return job
@@ -279,6 +290,17 @@ class ScopeConnectionHandle:
                     f"result={resp.get('result')} ({elapsed:.1f}s)"
                 )
                 return
+
+    def cancel_job_async(self, job_id: str) -> None:
+        """Fire-and-forget cancel — POST CancelJob without polling for terminal state.
+
+        Used by the quota-eviction layer where we cancel multiple victims
+        per attempt and only need the queue slot to free up, not strict
+        confirmation.
+        """
+        url = f"{self._base_url}/jobs/{job_id}/CancelJob?api-version={API_VERSION}"
+        log.debug(f"Cancelling ADLA job {job_id} (fire-and-forget)")
+        self._request("POST", url)
 
     def list_jobs(self, filter_expr: str | None = None, top: int = 100) -> list[dict[str, Any]]:
         """List ADLA jobs, optionally filtered by an OData ``$filter`` expression."""
