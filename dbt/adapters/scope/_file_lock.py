@@ -18,6 +18,8 @@ T = TypeVar("T")
 
 # Well-known lock file for Azure CLI token serialization
 AZ_CLI_TOKEN_LOCK = str(Path(tempfile.gettempdir()) / "dbt-scope-az-cli-token")
+# Well-known lock file for custom (e.g. Fabric notebook / SNI) token credentials
+FABRIC_TOKEN_LOCK = str(Path(tempfile.gettempdir()) / "dbt-scope-fabric-token")
 
 # Default timeout for acquiring the lock (seconds).  With several xdist workers
 # all racing for the Azure CLI token at startup, contention is high.

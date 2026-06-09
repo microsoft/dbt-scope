@@ -7,10 +7,11 @@ without any Azure credentials or SCOPE execution.
 
 from __future__ import annotations
 
+import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -103,9 +104,8 @@ def checkpoint_mgr(adls_store):
     service = InMemoryServiceClient(adls_store)
     with (
         patch("dbt.adapters.scope.checkpoint._get_service", return_value=service),
-        patch("dbt.adapters.scope.checkpoint.AzureCliCredential"),
     ):
-        yield CheckpointManager()
+        yield CheckpointManager(credential=MagicMock())
 
 
 def _make_times(count: int, base_year: int = 2026, base_month: int = 4) -> list[datetime]:
@@ -505,7 +505,6 @@ class TestCheckpointLifecycle:
             ls -la /tmp/dbt_scope_checkpoint_demo/_checkpoint/sources/
             duckdb -c "SELECT * FROM read_parquet('/tmp/dbt_scope_checkpoint_demo/_checkpoint/sources/100.parquet') LIMIT 20"
         """
-        import json
         import shutil
 
         import duckdb
@@ -690,3 +689,162 @@ class TestCheckpointLifecycle:
             f"Validated {len(parquet_snapshots)} parquet snapshots: "
             f"each = previous parquet + intermediate JSONL diffs ✓"
         )
+
+    def test_compaction_handles_timestamp_typed_prior_snapshot(self, checkpoint_mgr, adls_store):
+        """Regression for: ``Object of type datetime is not JSON serializable``.
+
+        In production, batches are spaced minutes apart so the
+        ``batchProcessingTime`` strings in a per-snapshot NDJSON have
+        enough variation for DuckDB's ``read_json_auto`` to infer
+        ``TIMESTAMP``. The resulting parquet snapshot then stores the
+        column as ``TIMESTAMP``, and the **next** compaction reads it
+        back as Python ``datetime`` — which used to crash
+        ``json.dumps(...)`` inside ``_write_snapshot_parquet``.
+
+        This test reproduces that exact shape deterministically by
+        pre-seeding a parquet snapshot whose ``batchProcessingTime``
+        column is ``TIMESTAMP``, then triggering a second compaction.
+        Pre-fix: raises ``TypeError: Object of type datetime is not JSON
+        serializable``. Post-fix: succeeds.
+        """
+        import duckdb
+
+        sources_prefix = "delta/lifecycle_test/_checkpoint/sources"  # matches DELTA_LOC's path
+        compaction_interval = 10
+
+        # ── 1. Build a parquet snapshot whose ``batchProcessingTime`` is
+        # explicitly ``TIMESTAMP``-typed — mimicking what happens in
+        # production when DuckDB's ``read_json_auto`` infers TIMESTAMP
+        # from well-spaced batch processing times. (DuckDB's inference
+        # heuristic varies across versions/sample sizes, so we force the
+        # cast here to make the test deterministic across environments.)
+        seeded_records = 22  # 11 batches x 2 files
+        prior_snapshot_path = f"/tmp/test_prior_snapshot_{id(self)}.parquet"
+        prior_ndjson_path = f"/tmp/test_prior_snapshot_{id(self)}.ndjson"
+        try:
+            with open(prior_ndjson_path, "w") as f:
+                for i in range(seeded_records):
+                    ts = datetime(2026, 6, 1, tzinfo=timezone.utc) + timedelta(minutes=i * 5)
+                    f.write(
+                        json.dumps(
+                            {
+                                "path": f"/shares/seed/file_{i:04d}.ss",
+                                "modificationTime": 1700000000000 + i,
+                                "batchId": i // 2,
+                                "batchProcessingTime": ts.isoformat(),
+                            }
+                        )
+                        + "\n"
+                    )
+            conn = duckdb.connect()
+            try:
+                # Force TIMESTAMP via explicit CAST so the test is
+                # deterministic regardless of DuckDB's auto-inference
+                # heuristic — what we want to assert is the read-back +
+                # next-compaction behaviour, not DuckDB's inference.
+                conn.execute(
+                    "CREATE TABLE t AS "
+                    "SELECT path, "
+                    '"modificationTime", '
+                    '"batchId", '
+                    'CAST("batchProcessingTime" AS TIMESTAMP) AS "batchProcessingTime" '
+                    f"FROM read_json_auto('{prior_ndjson_path}')"
+                )
+                schema = conn.execute("DESCRIBE t").fetchall()
+                assert any(
+                    col[0] == "batchProcessingTime" and col[1] == "TIMESTAMP" for col in schema
+                ), f"Setup precondition failed: expected TIMESTAMP, got {schema}"
+                conn.execute(f"COPY t TO '{prior_snapshot_path}' (FORMAT PARQUET)")
+            finally:
+                conn.close()
+
+            with open(prior_snapshot_path, "rb") as f:
+                prior_parquet_bytes = f.read()
+        finally:
+            for p in (prior_ndjson_path, prior_snapshot_path):
+                if os.path.exists(p):
+                    os.remove(p)
+
+        # ── 2. Inject the prior snapshot directly into in-memory ADLS as
+        # "10.parquet" so the next compaction will see it.
+        adls_store[f"{sources_prefix}/10.parquet"] = prior_parquet_bytes
+
+        # ── 2b. Also seed a JSONL diff for batch 15 — _write_snapshot_parquet
+        # is supposed to merge "prior snapshot + JSONL diffs since snapshot +
+        # current batch", so we want to exercise all three legs.
+        intermediate_paths = _make_paths(3, prefix="/shares/b15")
+        intermediate_times = _make_times(3, base_month=6)
+        checkpoint_mgr.write_batch_sources(
+            DELTA_LOC,
+            batch_id=15,
+            file_paths=intermediate_paths,
+            modification_times=intermediate_times,
+            compaction_interval=compaction_interval,  # 15 % 10 != 0 → JSONL
+        )
+        assert "15" in checkpoint_mgr.list_source_files(DELTA_LOC), (
+            "Intermediate JSONL diff for batch 15 should exist"
+        )
+
+        # ── 3. Trigger compaction at batch 20. Pre-fix: this raises
+        # ``TypeError: Object of type datetime is not JSON serializable``
+        # from inside _write_snapshot_parquet. Post-fix: success.
+        new_batch_paths = _make_paths(2, prefix="/shares/b20")
+        new_batch_times = _make_times(2, base_month=7)
+        checkpoint_mgr.write_batch_sources(
+            DELTA_LOC,
+            batch_id=20,
+            file_paths=new_batch_paths,
+            modification_times=new_batch_times,
+            compaction_interval=compaction_interval,
+        )
+
+        # ── 4. Verify the new snapshot exists and contains records from
+        # every leg of the union (prior 22 + intermediate JSONL 3 + current 2 = 27).
+        sources = checkpoint_mgr.list_source_files(DELTA_LOC)
+        assert "20.parquet" in sources, f"Expected 20.parquet, got {sources}"
+        assert "10.parquet" in sources, "Prior snapshot should still exist"
+        assert "15" in sources, "Intermediate JSONL diff should still exist"
+
+        new_snapshot_key = next(k for k in adls_store if k.endswith("20.parquet"))
+        new_local = f"/tmp/test_new_snapshot_{id(self)}.parquet"
+        with open(new_local, "wb") as f:
+            f.write(adls_store[new_snapshot_key])
+        try:
+            conn = duckdb.connect()
+            try:
+                total = conn.execute(
+                    f"SELECT count(*) FROM read_parquet('{new_local}')"
+                ).fetchone()[0]
+                expected = seeded_records + len(intermediate_paths) + len(new_batch_paths)
+                assert total == expected, (
+                    f"Expected {expected} records in new snapshot, got {total}"
+                )
+
+                seen_batch_ids = {
+                    row[0]
+                    for row in conn.execute(
+                        f"SELECT DISTINCT \"batchId\" FROM read_parquet('{new_local}')"
+                    ).fetchall()
+                }
+                assert 15 in seen_batch_ids, (
+                    f"JSONL diff records (batchId=15) missing from snapshot: {seen_batch_ids}"
+                )
+                assert 20 in seen_batch_ids, (
+                    f"Current batch records (batchId=20) missing from snapshot: {seen_batch_ids}"
+                )
+                assert any(bid <= 10 for bid in seen_batch_ids), (
+                    f"Prior snapshot records (batchId<=10) missing: {seen_batch_ids}"
+                )
+
+                # New snapshot's batchProcessingTime is deterministically
+                # TIMESTAMP (enforced by the explicit CAST in the fix).
+                new_schema = conn.execute(
+                    f"DESCRIBE SELECT * FROM read_parquet('{new_local}')"
+                ).fetchall()
+                assert any(
+                    col[0] == "batchProcessingTime" and col[1] == "TIMESTAMP" for col in new_schema
+                ), f"Expected TIMESTAMP schema in new snapshot, got {new_schema}"
+            finally:
+                conn.close()
+        finally:
+            os.remove(new_local)

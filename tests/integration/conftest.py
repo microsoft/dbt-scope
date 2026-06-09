@@ -20,10 +20,11 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from azure.identity import AzureCliCredential
 from datagen import ScopeDataset, make_default_dataset, submit_datagen_job
 from dbt.cli.main import dbtRunner
 
-from dbt.adapters.scope.delta_lake import get_default_delta_client
+from dbt.adapters.scope.delta_lake import DuckDbDeltaLakeClient, LockedTokenCredential
 
 PROJECT_DIR = Path(__file__).parent / "dbt_project"
 REPO_ROOT = Path(__file__).parent.parent.parent
@@ -52,7 +53,8 @@ def _delta_path(table_name: str) -> str:
 
 
 def _delta_client():
-    return get_default_delta_client()
+    # Integration tests run on dev machines authenticated via ``az login``.
+    return DuckDbDeltaLakeClient(credential=LockedTokenCredential(AzureCliCredential()))
 
 
 # -- Datagen datasets --------------------------------------------------------
@@ -273,22 +275,22 @@ def verify_delta_with_duckdb(
 # -- Watermark + sources checkpoint verification ------------------------------
 
 
-def read_watermark(delta_path: str):
-    """Read the watermark checkpoint for a Delta table."""
+def _checkpoint_manager():
     from dbt.adapters.scope.checkpoint import CheckpointManager
 
-    return CheckpointManager().read_watermark(delta_path)
+    return CheckpointManager(credential=LockedTokenCredential(AzureCliCredential()))
+
+
+def read_watermark(delta_path: str):
+    """Read the watermark checkpoint for a Delta table."""
+    return _checkpoint_manager().read_watermark(delta_path)
 
 
 def list_source_files(delta_path: str) -> list[str]:
     """List files in ``_checkpoint/sources/``."""
-    from dbt.adapters.scope.checkpoint import CheckpointManager
-
-    return CheckpointManager().list_source_files(delta_path)
+    return _checkpoint_manager().list_source_files(delta_path)
 
 
 def read_batch_source(delta_path: str, batch_id: int) -> list[dict]:
     """Read a batch JSONL file from ``_checkpoint/sources/{batch_id}``."""
-    from dbt.adapters.scope.checkpoint import CheckpointManager
-
-    return CheckpointManager().read_batch_source(delta_path, batch_id)
+    return _checkpoint_manager().read_batch_source(delta_path, batch_id)

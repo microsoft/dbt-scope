@@ -7,20 +7,82 @@ used for watermark-based filtering.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import re
+import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
+import requests
+from azure.core.credentials import TokenCredential
 from azure.datalake.store import core as adls_core
-from azure.identity import AzureCliCredential
+from azure.identity import CredentialUnavailableError
 from dbt.adapters.events.logging import AdapterLogger
 
-from dbt.adapters.scope._file_lock import AZ_CLI_TOKEN_LOCK, FileLock
+from dbt.adapters.scope.delta_lake import RetryPolicy
+from dbt.adapters.scope.message_retry import MessageRetryPolicy, retry_on_message
 
 log = AdapterLogger("scope")
+
+
+_LEGACY_GEN1_SCOPE = "https://datalake.azure.net//.default"
+
+
+class _LegacyDataLakeCredentialAdapter:
+    """Bridge a modern ``azure.core.credentials.TokenCredential`` to the legacy
+    ``azure.datalake.store.lib.DataLakeCredential`` ``signed_session()`` API.
+
+    Fabric notebook runtimes ship ``azure-datalake-store`` 0.0.5x preinstalled.
+    That version's ``DatalakeRESTInterface.__init__`` silently drops the
+    modern ``token_credential=`` kwarg and falls back to MSAL device-code
+    interactive auth — a hard-failure on any headless surface. This adapter
+    keeps the bundled wheel honest by exposing ``signed_session()`` on top
+    of our non-interactive credential, refreshing the bearer token a few
+    minutes before expiry. The 5-minute skew matches the legacy SDK's own
+    100-second slop window with extra headroom for long-running directory
+    walks.
+    """
+
+    _REFRESH_LEAD_SECONDS = 300
+
+    def __init__(self, credential: TokenCredential, *, scope: str = _LEGACY_GEN1_SCOPE) -> None:
+        self._credential = credential
+        self._scope = scope
+        self._lock = threading.Lock()
+        self._access_token: str | None = None
+        self._expires_on: int = 0
+
+    def _refresh(self) -> None:
+        token = self._credential.get_token(self._scope)
+        self._access_token = token.token
+        self._expires_on = int(token.expires_on)
+
+    def signed_session(self) -> requests.Session:
+        with self._lock:
+            now = int(time.time())
+            if not self._access_token or now > self._expires_on - self._REFRESH_LEAD_SECONDS:
+                self._refresh()
+            bearer = self._access_token
+        session = requests.Session()
+        session.headers["Authorization"] = f"Bearer {bearer}"
+        return session
+
+    def refresh_token(self, authority: str | None = None) -> None:
+        with self._lock:
+            self._refresh()
+
+
+def _legacy_gen1_sdk_in_use() -> bool:
+    """Return True when the running ``AzureDLFileSystem.__init__`` predates the
+    1.x ``token_credential=`` kwarg and therefore needs the legacy adapter."""
+    try:
+        params = inspect.signature(adls_core.AzureDLFileSystem.__init__).parameters
+    except (TypeError, ValueError):
+        return False
+    return "token_credential" not in params
 
 
 class _SuppressFileNotFound(logging.Filter):
@@ -80,14 +142,24 @@ def _list_one_dir(
     fs: adls_core.AzureDLFileSystem,
     dir_path: str,
     depth: int,
+    *,
+    message_retry_policy: MessageRetryPolicy | None = None,
 ) -> tuple[list[dict], list[dict], str, int, float]:
     """List a single directory. Returns (files, subdirs, path, depth, elapsed_ms)."""
     t0 = time.monotonic()
+    policy = message_retry_policy or MessageRetryPolicy.disabled()
     try:
-        entries = fs.ls(dir_path, detail=True)
+        entries = retry_on_message(
+            lambda: fs.ls(dir_path, detail=True),
+            policy=policy,
+            label=f"gen1.ls {dir_path}",
+        )
     except FileNotFoundError:
         log.debug(f"Path not found (skipping): {dir_path}")
         return [], [], dir_path, depth, (time.monotonic() - t0) * 1000
+    except CredentialUnavailableError:
+        log.error(f"_list_directory: credential acquisition exhausted for {dir_path}")
+        raise
     except Exception:
         log.warning(f"Failed to list {dir_path} (skipping)")
         return [], [], dir_path, depth, (time.monotonic() - t0) * 1000
@@ -105,23 +177,50 @@ class AdlsGen1Client:
         self,
         account: str,
         *,
-        lock_file: str = AZ_CLI_TOKEN_LOCK,
+        credential: TokenCredential | None = None,
+        retry_policy: RetryPolicy | None = None,
+        message_retry_policy: MessageRetryPolicy | None = None,
     ) -> None:
         self._account = account
-        self._lock_file = lock_file
+        self._credential = credential
+        self._retry_policy = retry_policy
+        self._message_retry_policy = message_retry_policy or MessageRetryPolicy.disabled()
         self._fs: adls_core.AzureDLFileSystem | None = None
         self._file_cache: dict[tuple[str, str | None], list[FileInfo]] = {}
         self._enrichment_cache: dict[str, tuple[int, tuple[str, ...]]] = {}
 
+    def _retry(self, op, *, label: str):
+        return retry_on_message(op, policy=self._message_retry_policy, label=label)
+
     def _get_fs(self) -> adls_core.AzureDLFileSystem:
-        """Lazily initialize the ADLS Gen1 filesystem client."""
+        """Lazily initialize the ADLS Gen1 filesystem client.
+
+        On Fabric notebook runtimes the preinstalled ``azure-datalake-store``
+        is the 0.0.5x line, whose ``DatalakeRESTInterface.__init__`` silently
+        ignores ``token_credential=`` and falls back to MSAL device-code
+        interactive auth. We detect that signature mismatch and route
+        through :class:`_LegacyDataLakeCredentialAdapter` instead.
+        """
         if self._fs is None:
-            with FileLock(self._lock_file):
-                credential = AzureCliCredential()
-            self._fs = adls_core.AzureDLFileSystem(
-                token_credential=credential,
-                store_name=self._account,
-            )
+            if self._credential is None:
+                raise RuntimeError(
+                    "AdlsGen1Client requires an explicit ``credential``; "
+                    "callers should pass ``credential=build_credential(creds)``."
+                )
+            if _legacy_gen1_sdk_in_use():
+                log.debug(
+                    "AdlsGen1Client: legacy azure-datalake-store detected — "
+                    "wrapping credential in _LegacyDataLakeCredentialAdapter"
+                )
+                self._fs = adls_core.AzureDLFileSystem(
+                    token=_LegacyDataLakeCredentialAdapter(self._credential),
+                    store_name=self._account,
+                )
+            else:
+                self._fs = adls_core.AzureDLFileSystem(
+                    token_credential=self._credential,
+                    store_name=self._account,
+                )
         return self._fs
 
     def list_files(
@@ -162,14 +261,20 @@ class AdlsGen1Client:
 
         walk_start = time.monotonic()
         if recursive:
-            raw_entries = self._walk(fs, root, max_workers)
+            raw_entries = self._walk(fs, root, max_workers, self._message_retry_policy)
         else:
             t0 = time.monotonic()
             try:
-                raw_entries = fs.ls(root, detail=True)
+                raw_entries = self._retry(
+                    lambda: fs.ls(root, detail=True),
+                    label=f"gen1.list_files {root}",
+                )
             except FileNotFoundError:
                 log.debug(f"Path not found: {root}")
                 return []
+            except CredentialUnavailableError:
+                log.error(f"list_files: credential acquisition exhausted for {root}")
+                raise
             except Exception:
                 log.warning(f"Failed to list {root}")
                 return []
@@ -221,6 +326,7 @@ class AdlsGen1Client:
         fs: adls_core.AzureDLFileSystem,
         root: str,
         max_workers: int,
+        message_retry_policy: MessageRetryPolicy | None = None,
     ) -> list[dict]:
         """Walk directories in parallel, logging per-directory progress."""
         all_files: list[dict] = []
@@ -229,7 +335,9 @@ class AdlsGen1Client:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures: dict[Future, tuple[str, int]] = {}
 
-            f = executor.submit(_list_one_dir, fs, root, 0)
+            f = executor.submit(
+                _list_one_dir, fs, root, 0, message_retry_policy=message_retry_policy
+            )
             futures[f] = (root, 0)
 
             while futures:
@@ -239,6 +347,10 @@ class AdlsGen1Client:
                     futures.pop(completed)
                     try:
                         files, dirs, dir_path, depth, elapsed_ms = completed.result()
+                    except CredentialUnavailableError:
+                        for pending in futures:
+                            pending.cancel()
+                        raise
                     except Exception:
                         dirs_done += 1
                         continue
@@ -255,7 +367,13 @@ class AdlsGen1Client:
                     all_files.extend(files)
 
                     for d in sorted(dirs, key=lambda e: e.get("name", "")):
-                        new_f = executor.submit(_list_one_dir, fs, d["name"], depth + 1)
+                        new_f = executor.submit(
+                            _list_one_dir,
+                            fs,
+                            d["name"],
+                            depth + 1,
+                            message_retry_policy=message_retry_policy,
+                        )
                         futures[new_f] = (d["name"], depth + 1)
 
                 if futures:
@@ -344,6 +462,9 @@ class AdlsGen1Client:
                         contributing_files=contrib_tuple,
                     )
                 )
+            except CredentialUnavailableError:
+                log.error(f"enrich_with_estimates: credential acquisition exhausted for {f.path}")
+                raise
             except Exception:
                 log.warning(f"Failed to estimate bytes for {f.path} — using file length")
                 self._enrichment_cache[f.path] = (f.length, ())
@@ -356,20 +477,22 @@ class AdlsGen1Client:
         )
         return enriched
 
-    @staticmethod
-    def _directory_exists(path: str, fs: adls_core.AzureDLFileSystem) -> bool:
+    def _directory_exists(self, path: str, fs: adls_core.AzureDLFileSystem) -> bool:
         """Check if a directory exists on ADLS Gen1."""
         try:
-            info = fs.info(path)
+            info = self._retry(lambda: fs.info(path), label=f"gen1.info {path}")
             return info.get("type") == "DIRECTORY"
         except FileNotFoundError:
             return False
+        except CredentialUnavailableError:
+            log.error(f"_directory_exists: credential acquisition exhausted for {path}")
+            raise
         except Exception:
             log.debug(f"_directory_exists: error checking {path} — assuming not exists")
             return False
 
-    @staticmethod
     def _list_directory_files(
+        self,
         dir_path: str,
         fs: adls_core.AzureDLFileSystem,
     ) -> list[dict]:
@@ -380,9 +503,15 @@ class AdlsGen1Client:
         while dirs_to_visit:
             current = dirs_to_visit.pop()
             try:
-                entries = fs.ls(current, detail=True)
+                entries = self._retry(
+                    lambda c=current: fs.ls(c, detail=True),
+                    label=f"gen1.ls {current}",
+                )
             except FileNotFoundError:
                 continue
+            except CredentialUnavailableError:
+                log.error(f"_list_directory_files: credential acquisition exhausted for {current}")
+                raise
             except Exception:
                 log.debug(f"_list_directory_files: failed to list {current} — skipping")
                 continue

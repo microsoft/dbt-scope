@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import signal
 import threading
 import time
@@ -18,16 +19,24 @@ from dbt_common.exceptions import DbtRuntimeError
 from dbt.adapters.scope.adls_gen1_client import AdlsGen1Client, FileInfo
 from dbt.adapters.scope.checkpoint import CheckpointManager, Watermark
 from dbt.adapters.scope.column import ScopeColumn
-from dbt.adapters.scope.connections import ScopeConnectionHandle, ScopeConnectionManager
+from dbt.adapters.scope.connections import (
+    ScopeConnectionHandle,
+    ScopeConnectionManager,
+    _shutdown_event,
+    cancel_all_active_jobs,
+)
 from dbt.adapters.scope.constants import (
     DEFAULT_MAX_BYTES_PER_TRIGGER,
     DEFAULT_PROCESSING_TIME_TIMEOUT_SECONDS,
     DEFAULT_SAFETY_BUFFER_SECONDS,
     DEFAULT_SOURCE_COMPACTION_INTERVAL,
     DEFAULT_SOURCE_RETENTION_FILES,
+    DEFAULT_WAIT_ON_CANCEL_SECONDS,
 )
 from dbt.adapters.scope.credentials import ScopeCredentials
+from dbt.adapters.scope.delta_lake import RetryPolicy, build_credential
 from dbt.adapters.scope.file_tracker import FileTracker
+from dbt.adapters.scope.message_retry import MessageRetryPolicy, retry_on_message
 from dbt.adapters.scope.relation import ScopeRelation
 from dbt.adapters.scope.script_builder import ColumnDef, ScriptConfig
 from dbt.adapters.scope.trigger_config import parse_trigger_config
@@ -37,13 +46,45 @@ log = AdapterLogger("scope")
 # ---------------------------------------------------------------------------
 # Graceful shutdown support
 # ---------------------------------------------------------------------------
-_shutdown_event = threading.Event()
 _signal_handlers_installed = False
 _signal_lock = threading.Lock()
+_atexit_registered = False
+
+# Credentials observed across all ScopeConnectionManager.open() calls in this
+# process. Used by the signal handler to decide (a) whether to cancel
+# in-flight jobs, and (b) how long to wait for ADLA to confirm terminal state.
+_observed_credentials: list[ScopeCredentials] = []
+_observed_credentials_lock = threading.Lock()
+
+
+def _observe_credentials(credentials: ScopeCredentials) -> None:
+    """Record a credentials object so the signal handler can read its preferences."""
+    with _observed_credentials_lock:
+        for existing in _observed_credentials:
+            if existing is credentials:
+                return
+        _observed_credentials.append(credentials)
+
+
+def _any_observed_cancel_on_shutdown_enabled() -> bool:
+    with _observed_credentials_lock:
+        if not _observed_credentials:
+            return True
+        return any(getattr(c, "cancel_jobs_on_shutdown", True) for c in _observed_credentials)
+
+
+def _observed_max_wait_on_cancel_seconds() -> int:
+    with _observed_credentials_lock:
+        values = [
+            getattr(c, "wait_on_cancel_seconds", DEFAULT_WAIT_ON_CANCEL_SECONDS)
+            for c in _observed_credentials
+            if getattr(c, "cancel_jobs_on_shutdown", True)
+        ]
+    return max(values) if values else DEFAULT_WAIT_ON_CANCEL_SECONDS
 
 
 def _install_signal_handlers() -> None:
-    """Install SIGTERM/SIGINT handlers that set the shutdown event.
+    """Install SIGTERM/SIGINT handlers that trigger graceful shutdown.
 
     Safe to call from any thread — only installs handlers when called from
     the main thread. Subsequent calls are no-ops.
@@ -61,11 +102,16 @@ def _install_signal_handlers() -> None:
 
         def _handler(signum: int, frame: Any) -> None:
             sig_name = signal.Signals(signum).name
-            log.info(
-                f"Received {sig_name} — requesting graceful shutdown of processing_time models"
-            )
+            log.info(f"Received {sig_name} — requesting graceful shutdown")
             _shutdown_event.set()
-            # Chain to previous handler (e.g. dbt's own handler)
+            if _any_observed_cancel_on_shutdown_enabled():
+                try:
+                    cancel_all_active_jobs(
+                        f"signal:{sig_name}",
+                        wait_seconds=_observed_max_wait_on_cancel_seconds(),
+                    )
+                except Exception as exc:
+                    log.warning(f"cancel_all_active_jobs failed in signal handler: {exc}")
             prev = _prev_sigterm if signum == signal.SIGTERM else _prev_sigint
             if callable(prev) and prev not in (signal.SIG_DFL, signal.SIG_IGN):
                 prev(signum, frame)
@@ -73,6 +119,52 @@ def _install_signal_handlers() -> None:
         signal.signal(signal.SIGTERM, _handler)
         signal.signal(signal.SIGINT, _handler)
         _signal_handlers_installed = True
+
+
+def _atexit_cancel_all() -> None:
+    """Fallback cancel-all invoked on interpreter shutdown.
+
+    Covers paths where dbt unwinds via an unhandled exception that does not
+    pass through our signal handler.
+    """
+    if not _any_observed_cancel_on_shutdown_enabled():
+        return
+    try:
+        cancel_all_active_jobs(
+            "atexit",
+            wait_seconds=_observed_max_wait_on_cancel_seconds(),
+        )
+    except Exception as exc:
+        log.warning(f"cancel_all_active_jobs failed in atexit hook: {exc}")
+
+
+def _register_atexit() -> None:
+    global _atexit_registered
+    if _atexit_registered:
+        return
+    atexit.register(_atexit_cancel_all)
+    _atexit_registered = True
+
+
+def _scope_open_hook(credentials: ScopeCredentials) -> None:
+    """Invoked by ``ScopeConnectionManager.open()`` for every connection."""
+    _observe_credentials(credentials)
+    _install_signal_handlers()
+    _register_atexit()
+
+
+ScopeConnectionManager._on_open = staticmethod(_scope_open_hook)
+
+# Install signal handlers eagerly at module-load time. ``dbt.adapters.scope.impl``
+# is imported during dbt's main-thread CLI bootstrap (before any worker threads
+# are spawned for model execution), so this is the only reliable place to win
+# the race against ``signal.signal()``'s main-thread-only requirement.
+# ``ScopeConnectionManager.open()`` runs on per-model worker threads (via
+# dbt's ``LazyHandle(self.open)``), where ``signal.signal()`` would raise
+# ``ValueError: signal only works in main thread of the main interpreter``
+# and our ``_install_signal_handlers`` guard would early-return.
+_install_signal_handlers()
+_register_atexit()
 
 
 _TIMESTAMP_COLS = ("accessTime", "modificationTime", "msExpirationTime", "expiryTime")
@@ -222,7 +314,7 @@ class ScopeAdapter(BaseAdapter):
 
     @classmethod
     def is_cancelable(cls) -> bool:
-        return False
+        return True
 
     def list_schemas(self, database: str) -> list[str]:
         """Return the single 'schema' — the container path."""
@@ -275,11 +367,11 @@ class ScopeAdapter(BaseAdapter):
         if not creds.storage_account or not creds.container:
             return []
 
-        try:
-            from azure.identity import AzureCliCredential
-            from azure.storage.filedatalake import DataLakeServiceClient
+        message_retry_policy = MessageRetryPolicy.from_credentials(creds)
 
-            from dbt.adapters.scope.delta_lake import LockedTokenCredential
+        try:
+            from azure.identity import CredentialUnavailableError
+            from azure.storage.filedatalake import DataLakeServiceClient
 
             t_start = time.monotonic()
             log.debug(
@@ -287,7 +379,7 @@ class ScopeAdapter(BaseAdapter):
                 f"{creds.delta_base_path} for Delta tables"
             )
 
-            credential = LockedTokenCredential(AzureCliCredential())
+            credential = build_credential(creds)
             service = DataLakeServiceClient(
                 account_url=f"https://{creds.storage_account}.dfs.core.windows.net",
                 credential=credential,
@@ -295,11 +387,15 @@ class ScopeAdapter(BaseAdapter):
             fs = service.get_file_system_client(creds.container)
 
             t0 = time.monotonic()
-            dirs = [
-                p
-                for p in fs.get_paths(path=creds.delta_base_path, recursive=False)
-                if p.is_directory
-            ]
+            dirs = retry_on_message(
+                lambda: [
+                    p
+                    for p in fs.get_paths(path=creds.delta_base_path, recursive=False)
+                    if p.is_directory
+                ],
+                policy=message_retry_policy,
+                label=f"list_relations.get_paths {creds.delta_base_path}",
+            )
             elapsed_ms = (time.monotonic() - t0) * 1000
             log.debug(
                 f"list_relations: get_paths found {len(dirs)} directories in {elapsed_ms:.1f} ms"
@@ -310,8 +406,16 @@ class ScopeAdapter(BaseAdapter):
                 table_name = path_info.name.split("/")[-1]
                 t0 = time.monotonic()
                 try:
-                    delta_log = fs.get_directory_client(f"{path_info.name}/_delta_log")
-                    delta_log.get_directory_properties()
+
+                    def _probe(name=path_info.name):
+                        delta_log = fs.get_directory_client(f"{name}/_delta_log")
+                        delta_log.get_directory_properties()
+
+                    retry_on_message(
+                        _probe,
+                        policy=message_retry_policy,
+                        label=f"list_relations.probe {table_name}",
+                    )
                     relations.append(
                         self.Relation.create(
                             database=creds.storage_account,
@@ -325,6 +429,8 @@ class ScopeAdapter(BaseAdapter):
                         f"list_relations: [{i + 1}/{len(dirs)}] {table_name} — "
                         f"Delta table found in {elapsed_ms:.1f} ms"
                     )
+                except CredentialUnavailableError:
+                    raise
                 except Exception:
                     elapsed_ms = (time.monotonic() - t0) * 1000
                     log.debug(
@@ -335,6 +441,11 @@ class ScopeAdapter(BaseAdapter):
             total_ms = (time.monotonic() - t_start) * 1000
             log.debug(f"list_relations: found {len(relations)} Delta tables in {total_ms:.1f} ms")
             return relations
+        except CredentialUnavailableError:
+            log.error(
+                f"list_relations: credential acquisition exhausted for {creds.delta_base_path}"
+            )
+            raise
         except Exception:
             log.debug(f"No Delta tables found at {creds.delta_base_path} (path may not exist yet)")
             return []
@@ -808,13 +919,23 @@ class ScopeAdapter(BaseAdapter):
         """Return an ADLS Gen1 client for the configured account."""
         if not hasattr(self, "_gen1_client"):
             creds = self._credentials()
-            self._gen1_client = AdlsGen1Client(account=creds.adls_gen1_account)
+            self._gen1_client = AdlsGen1Client(
+                account=creds.adls_gen1_account,
+                credential=build_credential(creds),
+                retry_policy=RetryPolicy.from_http_retries(creds.http_retries),
+                message_retry_policy=MessageRetryPolicy.from_credentials(creds),
+            )
         return self._gen1_client
 
     def _get_checkpoint_manager(self) -> CheckpointManager:
         """Return the checkpoint manager singleton."""
         if not hasattr(self, "_checkpoint_manager"):
-            self._checkpoint_manager = CheckpointManager()
+            creds = self._credentials()
+            self._checkpoint_manager = CheckpointManager(
+                credential=build_credential(creds),
+                retry_policy=RetryPolicy.from_http_retries(creds.http_retries),
+                message_retry_policy=MessageRetryPolicy.from_credentials(creds),
+            )
         return self._checkpoint_manager
 
     def _get_file_tracker(self) -> FileTracker:

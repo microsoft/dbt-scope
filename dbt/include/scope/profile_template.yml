@@ -17,3 +17,12 @@ prompts:
   priority:
     hint: "Job priority (lower = higher priority)"
     default: 1
+  authentication:
+    hint: "Auth mode: 'cli' (AzureCliCredential) or 'token_credential' (custom)"
+    default: "cli"
+  credential_class:
+    hint: "Dotted path to a TokenCredential implementation (e.g. 'fabric_entra_auth.EntraTokenCredential') — only used when authentication='token_credential'"
+    default: ""
+  credential_kwargs:
+    hint: "Mapping of kwargs forwarded to credential_class — only used when authentication='token_credential'"
+    default: {}

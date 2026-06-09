@@ -56,8 +56,7 @@ class TestWatermark:
 
 class TestCheckpointManagerWatermark:
     @patch("dbt.adapters.scope.checkpoint.DataLakeServiceClient")
-    @patch("dbt.adapters.scope.checkpoint.AzureCliCredential")
-    def test_read_watermark(self, mock_cred, mock_service):
+    def test_read_watermark(self, mock_service):
         wm_json = Watermark(
             version=1, modified_time="2026-04-01T12:00:00+00:00", batch_id=3
         ).to_json()
@@ -69,24 +68,51 @@ class TestCheckpointManagerWatermark:
         mock_fs.get_file_client.return_value = mock_file
         mock_service.return_value.get_file_system_client.return_value = mock_fs
 
-        result = CheckpointManager().read_watermark("abfss://c@a.dfs.core.windows.net/d/t")
+        result = CheckpointManager(credential=MagicMock()).read_watermark(
+            "abfss://c@a.dfs.core.windows.net/d/t"
+        )
         assert result is not None
         assert result.batch_id == 3
 
     @patch("dbt.adapters.scope.checkpoint.DataLakeServiceClient")
-    @patch("dbt.adapters.scope.checkpoint.AzureCliCredential")
-    def test_read_watermark_none_on_missing(self, mock_cred, mock_service):
+    def test_read_watermark_none_on_missing(self, mock_service):
         mock_fs = MagicMock()
         mock_fs.get_file_client.side_effect = Exception("Not found")
         mock_service.return_value.get_file_system_client.return_value = mock_fs
-        assert CheckpointManager().read_watermark("abfss://c@a.dfs.core.windows.net/d/t") is None
-
-    def test_read_watermark_none_for_bad_path(self):
-        assert CheckpointManager().read_watermark("https://bad") is None
+        assert (
+            CheckpointManager(credential=MagicMock()).read_watermark(
+                "abfss://c@a.dfs.core.windows.net/d/t"
+            )
+            is None
+        )
 
     @patch("dbt.adapters.scope.checkpoint.DataLakeServiceClient")
-    @patch("dbt.adapters.scope.checkpoint.AzureCliCredential")
-    def test_write_watermark(self, mock_cred, mock_service):
+    def test_read_watermark_propagates_credential_exhaustion(self, mock_service):
+        """``read_watermark`` MUST NOT swallow ``CredentialUnavailableError``.
+
+        Returning ``None`` on auth failure would silently flip an
+        incremental run into a full refresh and re-ingest the entire
+        source history. Regression for PR #32.
+        """
+        import pytest
+        from azure.identity import CredentialUnavailableError
+
+        mock_fs = MagicMock()
+        mock_fs.get_file_client.side_effect = CredentialUnavailableError(
+            message="Failed to invoke the Azure CLI"
+        )
+        mock_service.return_value.get_file_system_client.return_value = mock_fs
+
+        with pytest.raises(CredentialUnavailableError):
+            CheckpointManager(credential=MagicMock()).read_watermark(
+                "abfss://c@a.dfs.core.windows.net/d/t"
+            )
+
+    def test_read_watermark_none_for_bad_path(self):
+        assert CheckpointManager(credential=MagicMock()).read_watermark("https://bad") is None
+
+    @patch("dbt.adapters.scope.checkpoint.DataLakeServiceClient")
+    def test_write_watermark(self, mock_service):
         mock_dir = MagicMock()
         mock_file = MagicMock()
         mock_fs = MagicMock()
@@ -95,26 +121,28 @@ class TestCheckpointManagerWatermark:
         mock_service.return_value.get_file_system_client.return_value = mock_fs
 
         wm = Watermark(version=0, modified_time="2026-04-01T12:00:00+00:00", batch_id=0)
-        CheckpointManager().write_watermark("abfss://c@a.dfs.core.windows.net/d/t", wm)
+        CheckpointManager(credential=MagicMock()).write_watermark(
+            "abfss://c@a.dfs.core.windows.net/d/t", wm
+        )
         mock_file.upload_data.assert_called_once()
 
     @patch("dbt.adapters.scope.checkpoint.DataLakeServiceClient")
-    @patch("dbt.adapters.scope.checkpoint.AzureCliCredential")
-    def test_delete_watermark(self, mock_cred, mock_service):
+    def test_delete_watermark(self, mock_service):
         mock_file = MagicMock()
         mock_fs = MagicMock()
         mock_fs.get_file_client.return_value = mock_file
         mock_fs.get_paths.return_value = []
         mock_service.return_value.get_file_system_client.return_value = mock_fs
 
-        CheckpointManager().delete_watermark("abfss://c@a.dfs.core.windows.net/d/t")
+        CheckpointManager(credential=MagicMock()).delete_watermark(
+            "abfss://c@a.dfs.core.windows.net/d/t"
+        )
         mock_file.delete_file.assert_called_once()
 
 
 class TestCheckpointManagerSources:
     @patch("dbt.adapters.scope.checkpoint.DataLakeServiceClient")
-    @patch("dbt.adapters.scope.checkpoint.AzureCliCredential")
-    def test_write_jsonl_on_normal_batch(self, mock_cred, mock_service):
+    def test_write_jsonl_on_normal_batch(self, mock_service):
         """Non-compaction batch writes a JSONL diff file."""
         from datetime import datetime, timezone
 
@@ -125,7 +153,7 @@ class TestCheckpointManagerSources:
         mock_fs.get_file_client.return_value = mock_file
         mock_service.return_value.get_file_system_client.return_value = mock_fs
 
-        CheckpointManager().write_batch_sources(
+        CheckpointManager(credential=MagicMock()).write_batch_sources(
             "abfss://c@a.dfs.core.windows.net/d/t",
             batch_id=3,
             file_paths=["/shares/a.ss", "/shares/b.ss"],
@@ -147,8 +175,7 @@ class TestCheckpointManagerSources:
         assert "batchProcessingTime" in r0
 
     @patch("dbt.adapters.scope.checkpoint.DataLakeServiceClient")
-    @patch("dbt.adapters.scope.checkpoint.AzureCliCredential")
-    def test_batch_zero_always_writes_jsonl(self, mock_cred, mock_service):
+    def test_batch_zero_always_writes_jsonl(self, mock_service):
         """Batch 0 is never a compaction boundary, even with interval=1."""
         from datetime import datetime, timezone
 
@@ -159,7 +186,7 @@ class TestCheckpointManagerSources:
         mock_fs.get_file_client.return_value = mock_file
         mock_service.return_value.get_file_system_client.return_value = mock_fs
 
-        CheckpointManager().write_batch_sources(
+        CheckpointManager(credential=MagicMock()).write_batch_sources(
             "abfss://c@a.dfs.core.windows.net/d/t",
             batch_id=0,
             file_paths=["/shares/a.ss"],
@@ -175,8 +202,7 @@ class TestCheckpointManagerSources:
         json.loads(uploaded.decode("utf-8").split("\n")[0])
 
     @patch("dbt.adapters.scope.checkpoint.DataLakeServiceClient")
-    @patch("dbt.adapters.scope.checkpoint.AzureCliCredential")
-    def test_cleanup_deletes_oldest(self, mock_cred, mock_service):
+    def test_cleanup_deletes_oldest(self, mock_service):
         mock_file = MagicMock()
         mock_fs = MagicMock()
         mock_fs.get_file_client.return_value = mock_file
@@ -189,22 +215,21 @@ class TestCheckpointManagerSources:
         ]
         mock_service.return_value.get_file_system_client.return_value = mock_fs
 
-        deleted = CheckpointManager().cleanup_sources(
+        deleted = CheckpointManager(credential=MagicMock()).cleanup_sources(
             "abfss://c@a.dfs.core.windows.net/d/t", max_files=3
         )
         assert deleted == 2
         assert mock_file.delete_file.call_count == 2
 
     @patch("dbt.adapters.scope.checkpoint.DataLakeServiceClient")
-    @patch("dbt.adapters.scope.checkpoint.AzureCliCredential")
-    def test_cleanup_noop_under_limit(self, mock_cred, mock_service):
+    def test_cleanup_noop_under_limit(self, mock_service):
         mock_fs = MagicMock()
         mock_fs.get_paths.return_value = [
             SimpleNamespace(name="d/t/_checkpoint/sources/0", is_directory=False),
         ]
         mock_service.return_value.get_file_system_client.return_value = mock_fs
 
-        deleted = CheckpointManager().cleanup_sources(
+        deleted = CheckpointManager(credential=MagicMock()).cleanup_sources(
             "abfss://c@a.dfs.core.windows.net/d/t", max_files=100
         )
         assert deleted == 0

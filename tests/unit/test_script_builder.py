@@ -271,6 +271,82 @@ class TestScriptConfig:
         cfg = ScriptConfig()
         assert cfg.safety_buffer_seconds == 30
 
+    def test_max_file_count_per_output_file_set_default(self):
+        cfg = ScriptConfig()
+        assert cfg.max_file_count_per_output_file_set == 5000
+
+
+class TestMaxFileCountPerOutputFileSet:
+    """Tests for the @@MaxFileCountPerOutputFileSet SET emission and validation."""
+
+    def test_default_emitted_in_full_refresh(self, sample_config):
+        script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
+        assert "SET @@MaxFileCountPerOutputFileSet = 5000;" in script
+
+    def test_default_emitted_in_incremental(self, sample_config):
+        script = ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
+        assert "SET @@MaxFileCountPerOutputFileSet = 5000;" in script
+
+    def test_override_emitted_in_full_refresh(self, sample_config):
+        sample_config.max_file_count_per_output_file_set = 100000
+        script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
+        assert "SET @@MaxFileCountPerOutputFileSet = 100000;" in script
+        assert "SET @@MaxFileCountPerOutputFileSet = 5000;" not in script
+
+    def test_override_emitted_in_incremental(self, sample_config):
+        sample_config.max_file_count_per_output_file_set = 250000
+        script = ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
+        assert "SET @@MaxFileCountPerOutputFileSet = 250000;" in script
+
+    def test_min_boundary_accepted(self, sample_config):
+        sample_config.max_file_count_per_output_file_set = 1
+        script = ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
+        assert "SET @@MaxFileCountPerOutputFileSet = 1;" in script
+
+    def test_max_boundary_accepted(self, sample_config):
+        sample_config.max_file_count_per_output_file_set = 1_000_000
+        script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
+        assert "SET @@MaxFileCountPerOutputFileSet = 1000000;" in script
+
+    def test_zero_raises(self, sample_config):
+        sample_config.max_file_count_per_output_file_set = 0
+        with pytest.raises(DbtRuntimeError, match="max_file_count_per_output_file_set"):
+            ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
+
+    def test_negative_raises(self, sample_config):
+        sample_config.max_file_count_per_output_file_set = -1
+        with pytest.raises(DbtRuntimeError, match="max_file_count_per_output_file_set"):
+            ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
+
+    def test_above_max_raises(self, sample_config):
+        sample_config.max_file_count_per_output_file_set = 2_000_000
+        with pytest.raises(DbtRuntimeError, match=r"\[1, 1000000\]"):
+            ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
+
+    def test_non_int_raises(self, sample_config):
+        sample_config.max_file_count_per_output_file_set = "5000"
+        with pytest.raises(DbtRuntimeError, match="must be an int"):
+            ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
+
+    def test_bool_rejected_despite_subclassing_int(self, sample_config):
+        sample_config.max_file_count_per_output_file_set = True
+        with pytest.raises(DbtRuntimeError, match="must be an int"):
+            ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
+
+    def test_emitted_before_declare_path_full_refresh(self, sample_config):
+        script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
+        commit_pos = script.index("SET @@DeltaLakeCommitCondition")
+        max_files_pos = script.index("SET @@MaxFileCountPerOutputFileSet")
+        declare_pos = script.index("#DECLARE @deltaPath")
+        assert commit_pos < max_files_pos < declare_pos
+
+    def test_emitted_before_declare_path_incremental(self, sample_config):
+        script = ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
+        commit_pos = script.index("SET @@DeltaLakeCommitCondition")
+        max_files_pos = script.index("SET @@MaxFileCountPerOutputFileSet")
+        declare_pos = script.index("#DECLARE @deltaPath")
+        assert commit_pos < max_files_pos < declare_pos
+
 
 class TestScriptBuilderModelSQL:
     """Tests for model SQL handling in the new file-based approach."""

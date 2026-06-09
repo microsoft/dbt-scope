@@ -42,6 +42,10 @@
     {%- set source_patterns = config.get('source_patterns', ['.*\\.ss$']) -%}
     {%- set max_files_per_trigger = config.get('max_files_per_trigger', target.max_files_per_trigger) | int -%}
     {%- set max_bytes_per_trigger = config.get('max_bytes_per_trigger', target.max_bytes_per_trigger) | int -%}
+    {%- set max_file_count_per_output_file_set = config.get(
+        'max_file_count_per_output_file_set',
+        target.max_file_count_per_output_file_set | default(defaults.max_file_count_per_output_file_set, true)
+    ) | int -%}
     {%- set safety_buffer_seconds = config.get('safety_buffer_seconds', defaults.safety_buffer_seconds) | int -%}
     {%- set source_compaction_interval = config.get('source_compaction_interval', defaults.source_compaction_interval) | int -%}
     {%- set source_retention_files = config.get('source_retention_files', defaults.source_retention_files) | int -%}
@@ -141,7 +145,8 @@
                     ns.file_batch,
                     is_full_refresh=is_first_full_refresh_batch,
                     is_incremental=(not is_first_full_refresh_batch),
-                    delta_lake_commit_condition=delta_lake_commit_condition
+                    delta_lake_commit_condition=delta_lake_commit_condition,
+                    max_file_count_per_output_file_set=max_file_count_per_output_file_set
                 ) -%}
 
                 {%- set mode_label = "full-refresh" if full_refresh_mode else "incremental" -%}

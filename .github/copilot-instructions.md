@@ -8,6 +8,7 @@ uv sync --extra dev                             # create .venv and install dev d
 .scripts/run.sh integration-test                # requires ADLA + az login + .env
 .scripts/run.sh lint                            # ruff check + format --check
 .scripts/run.sh fix                             # ruff auto-fix + format
+.scripts/run.sh upload                          # build and upload the adapter to a storage account
 
 # Single test file or test
 uv run pytest tests/unit/test_script_builder.py -v

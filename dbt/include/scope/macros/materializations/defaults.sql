@@ -12,6 +12,7 @@
         "safety_buffer_seconds": 30,
         "source_compaction_interval": 10,
         "source_retention_files": 100,
+        "max_file_count_per_output_file_set": 5000,
         "delta_lake_commit_condition": "FailIfFileConflict",
     }) %}
 {% endmacro %}
