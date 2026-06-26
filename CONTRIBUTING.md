@@ -59,8 +59,7 @@
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh  # one-time install for uv
-cp .env.example .env      # fill in your ADLA/storage values
-.scripts/run.sh all       # uv venv, sync, build, lint, unit-test, debug, integration-test
+.scripts/run.sh all                              # uv venv, sync, build, lint, unit-test, debug, integration-test
 ```
 
 ## Dev script
