@@ -4,6 +4,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: gci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   IS_GH_ACTION: "1"
   IMDS_ROUTER_PORT: "8080"
@@ -50,7 +54,15 @@ jobs:
       - name: "🔐 Az Login with Fake UAMI"
         run: |
           set -euo pipefail
-          az login --identity --client-id "$UAMI_CLIENT_ID" > /dev/null 2>&1
+          for attempt in $(seq 1 25); do
+            if az login --identity --client-id "$UAMI_CLIENT_ID" > /dev/null 2>&1; then
+              exit 0
+            fi
+            echo "az login attempt ${attempt}/25 failed; retrying in 1s" >&2
+            sleep 1
+          done
+          echo "az login still failing; final attempt (errors shown):" >&2
+          az login --identity --client-id "$UAMI_CLIENT_ID"
 
       - name: "⚙️ Bootstrap Dev Environment"
         run: |
