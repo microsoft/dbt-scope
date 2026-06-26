@@ -102,6 +102,8 @@
         {%- endcall -%}
     {%- else -%}
         {%- set total_batches = adapter.get_total_batches() -%}
+        {# -- Compute schema evolution once against the live Delta table -- #}
+        {%- set evolve_columns = adapter.compute_schema_evolution(delta_location, delta_table_columns, partition_by) -%}
         {%- for _ in range(loop_cap) -%}
             {%- if not ns.keep_running -%}
                 {# Shutdown or max_cycles reached — exit loop #}
@@ -146,7 +148,8 @@
                     is_full_refresh=is_first_full_refresh_batch,
                     is_incremental=(not is_first_full_refresh_batch),
                     delta_lake_commit_condition=delta_lake_commit_condition,
-                    max_file_count_per_output_file_set=max_file_count_per_output_file_set
+                    max_file_count_per_output_file_set=max_file_count_per_output_file_set,
+                    evolve_columns=evolve_columns
                 ) -%}
 
                 {%- set mode_label = "full-refresh" if full_refresh_mode else "incremental" -%}

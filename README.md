@@ -304,7 +304,7 @@ WHERE edition == "Standard"
 | `source_compaction_interval` | `10`                                   | Every N batches, write a parquet snapshot of all source history                                                                                                                        |
 | `source_retention_files`     | `100`                                  | Max files in `_checkpoint/sources/` — oldest are deleted first                                                                                                                         |
 | `starting_timestamp`         | —                                      | ISO 8601 timestamp (e.g. `2026-01-01T00:00:00+00:00`); only process files modified after this time when no watermark exists                                                            |
-| `delta_table_columns`        | `[]`                                   | Delta table schema (CREATE TABLE). List of `{name, type}` dicts                                                                                                                        |
+| `delta_table_columns`        | `[]`                                   | Delta table schema (CREATE TABLE). List of `{name, type}` dicts. Adding a column triggers automatic [schema evolution](#schema-evolution)                                              |
 | `extract_columns`            | `[]`                                   | Source file columns (EXTRACT). List of `{name, type}` dicts                                                                                                                            |
 | `partition_by`               | —                                      | Single column name or list of columns for Delta table partitioning                                                                                                                     |
 | `scope_settings`             | `{}`                                   | Delta table properties passed to `ALTER TABLE SET TBLPROPERTIES` (e.g. compression, checkpoint intervals)                                                                              |
@@ -315,6 +315,24 @@ WHERE edition == "Standard"
 | `scope_feature_previews`     | `"EnableDeltaTableDynamicInsert:on"`   | Per-model SCOPE feature preview flags override                                                                                                                                         |
 
 `dbt retry` re-runs failed batches. `dbt run --full-refresh` resets the checkpoint and reprocesses all files.
+
+### Schema evolution
+
+Before building each SCOPE script, the adapter compares the model's `delta_table_columns`
+against the live Delta table schema (read with DuckDB, after confirming `_delta_log` exists
+on ADLS). The diff drives one of three outcomes:
+
+- **New column** in `delta_table_columns` that the table lacks → the adapter injects
+  `ALTER TABLE @target ADD COLUMN IF NOT EXISTS <name> <type>;` into the script so the table
+  evolves before the `INSERT`. Existing rows get `NULL` for the new column.
+- **Column removed** from `delta_table_columns` that the table still has → the run **fails**
+  with a `DbtRuntimeError` showing both schemas and the offending columns (dbt-scope never
+  drops columns).
+- **Column type changed** for an existing column → the run **fails** with a diff. (Type
+  comparison is equivalence-based, e.g. SCOPE `long` ≡ Delta `BIGINT`.)
+
+If the Delta table does not exist yet, no evolution happens — `CREATE TABLE` creates the full
+schema. This applies to both the `table` (full-refresh) and `incremental` materializations.
 
 ### Byte estimation for SSv5/v6 structured streams
 
