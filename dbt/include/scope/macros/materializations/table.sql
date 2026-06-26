@@ -208,7 +208,7 @@ DELETE FROM @target_rw WHERE true;
 @batch_data =
     {{ model_sql }};
 
-INSERT INTO @target
+INSERT INTO @target ({{ delta_table_columns | map(attribute='name') | join(', ') }})
 SELECT {{ delta_table_columns | map(attribute='name') | join(', ') }} FROM @batch_data;
 
 {% endmacro %}

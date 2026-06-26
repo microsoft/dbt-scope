@@ -172,9 +172,13 @@ def run_dbt(
     print(f"    Logs: {log_dir}")
 
     summary_file = log_dir / "result_summary.txt"
-    summary_file.write_text(
-        f"command: dbt {' '.join(args)}\nsuccess: {result.success}\nresult: {result.result}\n"
-    )
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        summary_file.write_text(
+            f"command: dbt {' '.join(args)}\nsuccess: {result.success}\nresult: {result.result}\n"
+        )
+    except OSError as exc:
+        log.warning("Could not write result summary to %s: %s", summary_file, exc)
 
     return result
 

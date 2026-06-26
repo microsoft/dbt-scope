@@ -299,10 +299,21 @@ class TestSchemaEvolution:
             f"region_name must be present after v2 schema evolution, got {cols_after}"
         )
 
-        non_null = query_delta_with_duckdb(
-            f"SELECT COUNT(*) FROM delta_scan('{delta_loc}') WHERE region_name IS NOT NULL"
+        region_rows = query_delta_with_duckdb(
+            f"SELECT DISTINCT region_name FROM delta_scan('{delta_loc}') "
+            f"WHERE region_name IS NOT NULL ORDER BY region_name"
         )
-        assert non_null[0][0] > 0, "region_name should be populated from the v2 SS batch"
+        region_values = {r[0] for r in region_rows}
+        assert region_values, "region_name should be populated from the v2 SS batch"
+        expected_regions = {r["region_name"] for r in dataset_to_records(evolve_scenario.new_data)}
+        assert region_values <= expected_regions, (
+            f"region_name holds unexpected values {sorted(region_values)}; "
+            f"expected a subset of {sorted(expected_regions)}. "
+            f"This indicates a positional INSERT column mismatch after schema evolution."
+        )
+        assert not any(str(v).isdigit() and len(str(v)) == 8 for v in region_values), (
+            f"region_name contains date-like values {sorted(region_values)} — column shift detected"
+        )
 
         after_info = verify_delta_with_duckdb(delta_loc)
         assert after_info["total_rows"] > before_info["total_rows"], (
@@ -311,10 +322,10 @@ class TestSchemaEvolution:
 
         log.info(
             "Schema evolution passed: cols %d->%d (region_name added), rows %d->%d, "
-            "region_name non-null=%d",
+            "region_name values=%s",
             len(cols_before),
             len(cols_after),
             before_info["total_rows"],
             after_info["total_rows"],
-            non_null[0][0],
+            sorted(region_values),
         )
