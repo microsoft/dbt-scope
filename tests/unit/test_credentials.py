@@ -181,6 +181,65 @@ class TestMessageRetryFields:
         assert "max_wait_on_error_seconds" in keys
 
 
+class TestJobRetryFields:
+    def test_defaults(self):
+        creds = ScopeCredentials(adla_account="x", **_BASE_KWARGS)
+        assert creds.enable_job_retry is True
+        assert creds.job_retry_on_messages == []
+        assert creds.job_retry_max_attempts == 3
+        assert creds.job_retry_initial_wait_seconds == 30.0
+        assert creds.job_retry_max_wait_seconds == 300.0
+
+    def test_custom_values_accepted(self):
+        creds = ScopeCredentials(
+            adla_account="x",
+            enable_job_retry=False,
+            job_retry_on_messages=["re:Operation timed out", "Flaky"],
+            job_retry_max_attempts=5,
+            job_retry_initial_wait_seconds=10.0,
+            job_retry_max_wait_seconds=120.0,
+            **_BASE_KWARGS,
+        )
+        assert creds.enable_job_retry is False
+        assert creds.job_retry_on_messages == ["re:Operation timed out", "Flaky"]
+        assert creds.job_retry_max_attempts == 5
+        assert creds.job_retry_initial_wait_seconds == 10.0
+        assert creds.job_retry_max_wait_seconds == 120.0
+
+    def test_zero_attempts_rejected(self):
+        with pytest.raises(DbtRuntimeError, match="job_retry_max_attempts must be >= 1"):
+            ScopeCredentials(adla_account="x", job_retry_max_attempts=0, **_BASE_KWARGS)
+
+    def test_non_positive_initial_wait_rejected(self):
+        with pytest.raises(DbtRuntimeError, match="job_retry_initial_wait_seconds must be > 0"):
+            ScopeCredentials(adla_account="x", job_retry_initial_wait_seconds=0, **_BASE_KWARGS)
+
+    def test_non_positive_max_wait_rejected(self):
+        with pytest.raises(DbtRuntimeError, match="job_retry_max_wait_seconds must be > 0"):
+            ScopeCredentials(adla_account="x", job_retry_max_wait_seconds=0, **_BASE_KWARGS)
+
+    def test_initial_greater_than_max_rejected(self):
+        with pytest.raises(DbtRuntimeError, match="must be <= job_retry_max_wait_seconds"):
+            ScopeCredentials(
+                adla_account="x",
+                job_retry_initial_wait_seconds=300,
+                job_retry_max_wait_seconds=30,
+                **_BASE_KWARGS,
+            )
+
+    def test_empty_pattern_string_rejected(self):
+        with pytest.raises(DbtRuntimeError, match="non-empty strings"):
+            ScopeCredentials(adla_account="x", job_retry_on_messages=[""], **_BASE_KWARGS)
+
+    def test_job_retry_fields_in_connection_keys(self):
+        keys = ScopeCredentials(adla_account="x", **_BASE_KWARGS)._connection_keys()
+        assert "enable_job_retry" in keys
+        assert "job_retry_on_messages" in keys
+        assert "job_retry_max_attempts" in keys
+        assert "job_retry_initial_wait_seconds" in keys
+        assert "job_retry_max_wait_seconds" in keys
+
+
 class TestQuotaEvictionFields:
     def test_defaults(self):
         creds = ScopeCredentials(adla_account="x", **_BASE_KWARGS)

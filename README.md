@@ -162,25 +162,30 @@ my_project:
 
 ### Profile reference
 
-| Field                     | Default                                    | Description                                                        |
-| ------------------------- | ------------------------------------------ | ------------------------------------------------------------------ |
-| `adla_account`            | —                                          | ADLA account name                                                  |
-| `storage_account`         | —                                          | ADLS Gen2 storage account name (also used as dbt `database`)       |
-| `container`               | —                                          | ADLS Gen2 container (also used as dbt `schema`)                    |
-| `delta_base_path`         | `"delta"`                                  | Base path under the container for Delta tables                     |
-| `adls_gen1_account`       | `""`                                       | ADLS Gen1 account for source file listing                          |
-| `au`                      | `100`                                      | Default ADLA Analytics Units (parallelism) per job                 |
-| `priority`                | `1`                                        | Default ADLA job priority                                          |
-| `poll_interval_seconds`   | `5`                                        | How often (seconds) to poll ADLA for job status                    |
-| `job_timeout_seconds`     | `36000`                                    | Max seconds to wait for a SCOPE job before timing out              |
-| `max_files_per_trigger`   | `50`                                       | Default max files per SCOPE job (overridable per-model)            |
-| `max_bytes_per_trigger`   | `10737418240000` (10 TB)                   | Default max estimated bytes per batch (overridable per-model)      |
-| `max_file_count_per_output_file_set` | `5000`                          | SCOPE `@@MaxFileCountPerOutputFileSet` (overridable per-model)     |
-| `cancel_jobs_on_shutdown` | `true`                                     | Cancel in-flight ADLA jobs on SIGINT/SIGTERM                       |
-| `wait_on_cancel_seconds`  | `30`                                       | Per-job wait for ADLA terminal state when cancelling on shutdown   |
-| `http_timeout_seconds`    | `30`                                       | HTTP request timeout for ADLA REST API calls                       |
-| `http_retries`            | `3`                                        | Number of HTTP retries for transient errors (429, 5xx)             |
-| `scope_feature_previews`  | `"EnableDeltaTableDynamicInsert:on"`       | SCOPE feature preview flags (overridable per-model)                |
+| Field                                | Default                              | Description                                                                                                        |
+| ------------------------------------ | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
+| `adla_account`                       | —                                    | ADLA account name                                                                                                  |
+| `storage_account`                    | —                                    | ADLS Gen2 storage account name (also used as dbt `database`)                                                       |
+| `container`                          | —                                    | ADLS Gen2 container (also used as dbt `schema`)                                                                    |
+| `delta_base_path`                    | `"delta"`                            | Base path under the container for Delta tables                                                                     |
+| `adls_gen1_account`                  | `""`                                 | ADLS Gen1 account for source file listing                                                                          |
+| `au`                                 | `100`                                | Default ADLA Analytics Units (parallelism) per job                                                                 |
+| `priority`                           | `1`                                  | Default ADLA job priority                                                                                          |
+| `poll_interval_seconds`              | `5`                                  | How often (seconds) to poll ADLA for job status                                                                    |
+| `job_timeout_seconds`                | `36000`                              | Max seconds to wait for a SCOPE job before timing out                                                              |
+| `max_files_per_trigger`              | `50`                                 | Default max files per SCOPE job (overridable per-model)                                                            |
+| `max_bytes_per_trigger`              | `10737418240000` (10 TB)             | Default max estimated bytes per batch (overridable per-model)                                                      |
+| `max_file_count_per_output_file_set` | `5000`                               | SCOPE `@@MaxFileCountPerOutputFileSet` (overridable per-model)                                                     |
+| `cancel_jobs_on_shutdown`            | `true`                               | Cancel in-flight ADLA jobs on SIGINT/SIGTERM                                                                       |
+| `wait_on_cancel_seconds`             | `30`                                 | Per-job wait for ADLA terminal state when cancelling on shutdown                                                   |
+| `http_timeout_seconds`               | `30`                                 | HTTP request timeout for ADLA REST API calls                                                                       |
+| `http_retries`                       | `3`                                  | Number of HTTP retries for transient errors (429, 5xx)                                                             |
+| `enable_job_retry`                   | `true`                               | Re-submit a SCOPE job when it fails with a known-transient error (see [Transient job retry](#transient-job-retry)) |
+| `job_retry_on_messages`              | `[]`                                 | Extra retry patterns (substring, or `re:` regex) merged with the built-in rules                                    |
+| `job_retry_max_attempts`             | `3`                                  | Total attempts (1 = no retry) for a transient job failure                                                          |
+| `job_retry_initial_wait_seconds`     | `30`                                 | Initial backoff before the first job re-submit                                                                     |
+| `job_retry_max_wait_seconds`         | `300`                                | Cap on the exponential job-retry backoff                                                                           |
+| `scope_feature_previews`             | `"EnableDeltaTableDynamicInsert:on"` | SCOPE feature preview flags (overridable per-model)                                                                |
 
 | dbt concept   | SCOPE concept                                                                   |
 | ------------- | ------------------------------------------------------------------------------- |
@@ -189,6 +194,52 @@ my_project:
 | `table`       | Full-refresh: `CREATE TABLE` + `INSERT INTO`                                    |
 | `incremental` | File-based append: discover → process → checkpoint, looped until all files done |
 | model SQL     | `SELECT` from `@data` (extracted SS rowset)                                     |
+
+### Transient job retry
+
+SCOPE jobs occasionally fail with transient infrastructure errors (e.g. a vertex
+that times out opening a DMS stream) or are cancelled by an external actor. The
+adapter re-submits the job when the terminal error message matches a known-transient
+rule, using a capped exponential backoff (`job_retry_initial_wait_seconds` →
+`job_retry_max_wait_seconds`) up to `job_retry_max_attempts`. A non-matching failure
+(e.g. a SCOPE compilation error) is **not** retried.
+
+Rules are a curated, growable RegEx data structure (`DEFAULT_JOB_RETRY_RULES` in
+`dbt/adapters/scope/message_retry.py`). The built-in seed set covers:
+
+- `Exception in VertexManager ... Failed to open stream ... Operation timed out`
+  (transient DMS stream-open timeout).
+- `Job cancelled by user ...` (cancelled by an external actor, e.g. another pipeline's
+  quota eviction).
+
+Add your own patterns via `job_retry_on_messages` (plain substring, or `re:`-prefixed
+regex) — they are merged with the built-ins. Set `enable_job_retry: false` to turn the
+layer off entirely.
+
+```yaml
+# profiles.yml
+my_project:
+  target: dev
+  outputs:
+    dev:
+      type: scope
+      # ... other settings ...
+      job_retry_on_messages:
+        - "Operation timed out"                        # plain substring (case-sensitive)
+        - "Vertex failed with"                         # plain substring
+        - "re:Failed to open stream .* timed out"      # regex (prefix with 're:')
+        - 're:E_\d{4} transient'                       # regex with escaped digits
+      # Optional tuning (defaults shown):
+      enable_job_retry: true
+      job_retry_max_attempts: 3
+      job_retry_initial_wait_seconds: 30
+      job_retry_max_wait_seconds: 300
+```
+
+**Self-cancel safety:** the quota-eviction layer (which cancels low-priority jobs when
+the workspace queue is saturated) never evicts a job belonging to the current dbt run —
+it skips any job in this run (`related.runId`) or any job this process is actively
+polling. So the adapter will not cancel its own in-flight work.
 
 ## Usage
 
@@ -295,7 +346,7 @@ WHERE edition == "Standard"
 
 | Config                       | Default                                | Description                                                                                                                                                                            |
 | ---------------------------- | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `delta_location`             | `""`                                   | ABFSS path to the Delta table (e.g. `abfss://ctr@acct.dfs.core.windows.net/delta/my_table`)                                                                                           |
+| `delta_location`             | `""`                                   | ABFSS path to the Delta table (e.g. `abfss://ctr@acct.dfs.core.windows.net/delta/my_table`)                                                                                            |
 | `source_roots`               | `[]`                                   | List of ADLS Gen1 root paths to list source files from                                                                                                                                 |
 | `source_patterns`            | `['.*\\.ss$']`                         | List of regexes; the adapter discovers files for each root × pattern combo                                                                                                             |
 | `max_files_per_trigger`      | from profile (`50`)                    | Max files per SCOPE job. Larger = fewer jobs; smaller = faster feedback                                                                                                                |
@@ -386,11 +437,11 @@ Add the `trigger` config to your model's `config()` block:
 
 #### Trigger options
 
-| Option       | Type   | Required                    | Description                                                     |
-| ------------ | ------ | --------------------------- | --------------------------------------------------------------- |
+| Option       | Type   | Required                      | Description                                                    |
+| ------------ | ------ | ----------------------------- | -------------------------------------------------------------- |
 | `type`       | string | No (default: `available_now`) | `available_now` or `processing_time`                           |
-| `interval`   | string | Yes (for `processing_time`)  | Sleep duration between cycles: `'10 seconds'`, `'30s'`, `'5m'` |
-| `max_cycles` | int    | No (default: infinite)       | Maximum number of cycles before exiting                         |
+| `interval`   | string | Yes (for `processing_time`)   | Sleep duration between cycles: `'10 seconds'`, `'30s'`, `'5m'` |
+| `max_cycles` | int    | No (default: infinite)        | Maximum number of cycles before exiting                        |
 
 #### Behavior
 

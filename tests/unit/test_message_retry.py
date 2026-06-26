@@ -8,7 +8,9 @@ import pytest
 from dbt_common.exceptions import DbtDatabaseError
 
 from dbt.adapters.scope.message_retry import (
+    DEFAULT_JOB_RETRY_RULES,
     MessageRetryPolicy,
+    RetryRule,
     retry_on_message,
 )
 
@@ -258,3 +260,127 @@ class TestRetryOnMessage:
             retry_on_message(op, policy=policy, label="test", sleep=sleeps.append)
         assert calls["n"] == 1
         assert sleeps == []
+
+
+_VERTEX_TIMEOUT_MSG = (
+    "SCOPE job 'm_incremental_batch_1_of_1_files_6' (5838e41a) failed: "
+    "Exception in VertexManager, vertex:vertex_1782102387750_7438_1_16 [SV16_Process],"
+    "com.microsoft.scopeam.store.cosmos.GrapheneJniException: Failed to open stream "
+    "dms://Scopeonbbc-prod/~vm-96533376/2107c3fc_0_0 with error Operation timed out"
+)
+_CANCELLED_MSG = (
+    "SCOPE job 'mon_hue_hue_162bf0_incremental_batch_1_of_1_files_3' (bc09a681) failed: "
+    "Job cancelled by user someSpn-app@SPI through ADL FE"
+)
+_BENIGN_MSG = "SCOPE job 'm' (abc) failed: E_USER_ERROR: syntax error near 'SELECT'"
+
+
+class TestDefaultJobRetryRules:
+    def test_rules_are_retry_rule_instances(self):
+        assert DEFAULT_JOB_RETRY_RULES
+        assert all(isinstance(r, RetryRule) for r in DEFAULT_JOB_RETRY_RULES)
+
+    def test_rule_names_unique(self):
+        names = [r.name for r in DEFAULT_JOB_RETRY_RULES]
+        assert len(names) == len(set(names))
+
+    def test_every_rule_pattern_compiles(self):
+        for rule in DEFAULT_JOB_RETRY_RULES:
+            re.compile(rule.pattern)
+
+    def test_seed_rules_present(self):
+        names = {r.name for r in DEFAULT_JOB_RETRY_RULES}
+        assert "vertex_stream_open_timeout" in names
+        assert "job_cancelled_by_user" in names
+
+
+class _JobCreds:
+    """Duck-typed stand-in for the job-retry slice of ScopeCredentials."""
+
+    def __init__(
+        self,
+        enable_job_retry=True,
+        job_retry_on_messages=None,
+        job_retry_max_attempts=3,
+        job_retry_initial_wait_seconds=30.0,
+        job_retry_max_wait_seconds=300.0,
+    ):
+        self.enable_job_retry = enable_job_retry
+        self.job_retry_on_messages = job_retry_on_messages
+        self.job_retry_max_attempts = job_retry_max_attempts
+        self.job_retry_initial_wait_seconds = job_retry_initial_wait_seconds
+        self.job_retry_max_wait_seconds = job_retry_max_wait_seconds
+
+
+class TestForJobRetry:
+    def test_builtin_rules_match_known_failures(self):
+        policy = MessageRetryPolicy.for_job_retry(_JobCreds())
+        assert policy.enabled
+        assert policy.matches(DbtDatabaseError(_VERTEX_TIMEOUT_MSG)) is not None
+        assert policy.matches(DbtDatabaseError(_CANCELLED_MSG)) is not None
+
+    def test_benign_failure_not_matched(self):
+        policy = MessageRetryPolicy.for_job_retry(_JobCreds())
+        assert policy.matches(DbtDatabaseError(_BENIGN_MSG)) is None
+
+    def test_attempts_map_to_max_retries(self):
+        policy = MessageRetryPolicy.for_job_retry(_JobCreds(job_retry_max_attempts=3))
+        assert policy.max_retries == 2
+
+    def test_disabled_flag_produces_disabled_policy(self):
+        policy = MessageRetryPolicy.for_job_retry(_JobCreds(enable_job_retry=False))
+        assert not policy.enabled
+        assert policy.matches(DbtDatabaseError(_VERTEX_TIMEOUT_MSG)) is None
+
+    def test_user_patterns_merged_with_builtins(self):
+        policy = MessageRetryPolicy.for_job_retry(
+            _JobCreds(job_retry_on_messages=["re:E_TRANSIENT_\\d+", "Flaky substring"])
+        )
+        assert policy.matches(DbtDatabaseError("boom E_TRANSIENT_42")) is not None
+        assert policy.matches(DbtDatabaseError("a Flaky substring here")) is not None
+        assert policy.matches(DbtDatabaseError(_VERTEX_TIMEOUT_MSG)) is not None
+
+    def test_backoff_defaults_are_job_scaled(self):
+        policy = MessageRetryPolicy.for_job_retry(_JobCreds())
+        assert policy.initial_wait_seconds == 30.0
+        assert policy.max_wait_seconds == 300.0
+
+    def test_rejects_zero_attempts(self):
+        with pytest.raises(ValueError, match="job_retry_max_attempts must be >= 1"):
+            MessageRetryPolicy.for_job_retry(_JobCreds(job_retry_max_attempts=0))
+
+    def test_rejects_initial_greater_than_max(self):
+        with pytest.raises(ValueError, match="must be <="):
+            MessageRetryPolicy.for_job_retry(
+                _JobCreds(job_retry_initial_wait_seconds=500, job_retry_max_wait_seconds=10)
+            )
+
+    def test_rejects_empty_user_pattern(self):
+        with pytest.raises(ValueError, match="non-empty strings"):
+            MessageRetryPolicy.for_job_retry(_JobCreds(job_retry_on_messages=[""]))
+
+    def test_resubmit_on_match_then_succeed(self):
+        policy = MessageRetryPolicy.for_job_retry(_JobCreds())
+        calls = {"n": 0}
+
+        def op():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise DbtDatabaseError(_VERTEX_TIMEOUT_MSG)
+            return "ok"
+
+        result = retry_on_message(op, policy=policy, label="job", sleep=lambda _s: None)
+        assert result == "ok"
+        assert calls["n"] == 2
+
+    def test_no_retry_on_benign_failure(self):
+        policy = MessageRetryPolicy.for_job_retry(_JobCreds())
+        calls = {"n": 0}
+
+        def op():
+            calls["n"] += 1
+            raise DbtDatabaseError(_BENIGN_MSG)
+
+        with pytest.raises(DbtDatabaseError):
+            retry_on_message(op, policy=policy, label="job", sleep=lambda _s: None)
+        assert calls["n"] == 1

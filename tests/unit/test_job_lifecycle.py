@@ -9,12 +9,14 @@ from urllib.parse import quote as url_quote
 
 import pytest
 import requests.exceptions
+from dbt_common.exceptions import DbtDatabaseError
 
 from dbt.adapters.scope.connections import (
     _UUID_NAMESPACE,
     ScopeConnectionHandle,
     ScopeConnectionManager,
 )
+from dbt.adapters.scope.message_retry import MessageRetryPolicy
 
 # A minimal non-comment SCOPE script that won't be skipped by execute()
 _DUMMY_SCRIPT = '// SCOPE script\nSET @@FeaturePreviews = "EnableDeltaTableDynamicInsert:on";'
@@ -411,6 +413,7 @@ class TestExecuteOrphanCancellation:
         handle._next_job_priority = None
         handle._next_job_timeout_seconds = None
         handle._next_job_model_name = None
+        handle._job_retry_policy = MessageRetryPolicy.disabled()
         handle.submit_and_wait = MagicMock()
         handle.submit_and_wait.return_value = MagicMock(job_id="test-id", result="Succeeded")
         handle.cancel_orphaned_jobs = MagicMock(return_value=[])
@@ -492,6 +495,92 @@ class TestNextJobModelNameOnHandle:
         handle = _make_handle()
         handle._next_job_model_name = "my_model"
         assert handle._next_job_model_name == "my_model"
+
+
+_VERTEX_TIMEOUT_FAILURE = (
+    "SCOPE job 'm_incremental_batch_1_of_1_files_6' (5838e41a) failed: "
+    "Exception in VertexManager, vertex:vertex_1 [SV16_Process],"
+    "GrapheneJniException: Failed to open stream dms://x/y_0_0 with error Operation timed out"
+)
+_FATAL_FAILURE = "SCOPE job 'm' (abc) failed: E_USER_ERROR: syntax error near 'SELECT'"
+
+
+class TestExecuteJobRetry:
+    """execute() re-submits a job on a transient regex-matched failure (#39/#40)."""
+
+    def _manager(self, submit_side_effect):
+        from dbt.adapters.scope.message_retry import MessageRetryPolicy
+
+        mgr = MagicMock(spec=ScopeConnectionManager)
+        mgr.execute = ScopeConnectionManager.execute.__get__(mgr, ScopeConnectionManager)
+
+        @contextmanager
+        def _exception_handler(sql):
+            try:
+                yield
+            except Exception as exc:
+                if isinstance(exc, DbtDatabaseError):
+                    raise
+                raise DbtDatabaseError(str(exc)) from exc
+
+        mgr.exception_handler = _exception_handler
+
+        handle = MagicMock()
+        for attr in (
+            "_next_job_name",
+            "_next_job_au",
+            "_next_job_priority",
+            "_next_job_timeout_seconds",
+            "_next_job_model_name",
+        ):
+            setattr(handle, attr, None)
+
+        handle._job_retry_policy = MessageRetryPolicy.for_job_retry(
+            MagicMock(
+                enable_job_retry=True,
+                job_retry_on_messages=[],
+                job_retry_max_attempts=3,
+                job_retry_initial_wait_seconds=0.01,
+                job_retry_max_wait_seconds=0.01,
+            )
+        )
+        handle.submit_and_wait = MagicMock(side_effect=submit_side_effect)
+        handle.cancel_orphaned_jobs = MagicMock(return_value=[])
+
+        connection = MagicMock()
+        connection.handle = handle
+        connection.credentials = MagicMock(
+            au=100, priority=1, poll_interval_seconds=5, job_timeout_seconds=60
+        )
+        mgr.get_thread_connection.return_value = connection
+        return mgr, handle
+
+    def test_resubmits_on_transient_failure_then_succeeds(self):
+        ok = MagicMock(job_id="job-2", result="Succeeded")
+        mgr, handle = self._manager(
+            submit_side_effect=[DbtDatabaseError(_VERTEX_TIMEOUT_FAILURE), ok]
+        )
+        with patch("dbt.adapters.scope.message_retry.time.sleep"):
+            resp, _ = mgr.execute(_DUMMY_SCRIPT)
+        assert handle.submit_and_wait.call_count == 2
+        assert "job-2" in resp._message
+
+    def test_does_not_retry_fatal_failure(self):
+        mgr, handle = self._manager(submit_side_effect=DbtDatabaseError(_FATAL_FAILURE))
+        with pytest.raises(DbtDatabaseError, match="E_USER_ERROR"):
+            mgr.execute(_DUMMY_SCRIPT)
+        assert handle.submit_and_wait.call_count == 1
+
+    def test_orphan_cancel_runs_once_despite_retries(self):
+        ok = MagicMock(job_id="job-2", result="Succeeded")
+        mgr, handle = self._manager(
+            submit_side_effect=[DbtDatabaseError(_VERTEX_TIMEOUT_FAILURE), ok]
+        )
+        handle._next_job_model_name = "events_daily"
+        with patch("dbt.adapters.scope.message_retry.time.sleep"):
+            mgr.execute(_DUMMY_SCRIPT)
+        handle.cancel_orphaned_jobs.assert_called_once_with("events_daily")
+        assert handle.submit_and_wait.call_count == 2
 
 
 # =====================================================================
