@@ -11,6 +11,7 @@ import pytest
 from dbt.adapters.scope.quota_eviction import (
     _EVICTION_LOCKS,
     QuotaEvictionPolicy,
+    _gather_and_cancel,
     _lock_for,
     is_quota_error,
     retry_with_quota_eviction,
@@ -43,6 +44,7 @@ class _FakeCtx:
         self.list_calls: list[tuple[str | None, int]] = []
         self.cancel_calls: list[str] = []
         self.cancel_failures: dict[str, Exception] = {}
+        self.self_job_ids: set[str] = set()
 
     def list_jobs(self, filter_expr: str | None = None, top: int = 100) -> list[dict[str, Any]]:
         self.list_calls.append((filter_expr, top))
@@ -52,6 +54,9 @@ class _FakeCtx:
         self.cancel_calls.append(job_id)
         if job_id in self.cancel_failures:
             raise self.cancel_failures[job_id]
+
+    def is_self_job(self, job: dict[str, Any]) -> bool:
+        return str(job.get("jobId") or "") in self.self_job_ids
 
 
 class TestQuotaEvictionPolicyConstruction:
@@ -160,6 +165,54 @@ class TestSelectVictims:
         ]
         victims = select_victims(jobs, k=2)
         assert victims[0]["jobId"] == "j2"
+
+
+class TestSelfJobExclusion:
+    """_gather_and_cancel must never evict jobs owned by the current run (#39)."""
+
+    def _policy(self, cancel_num: int = 5) -> QuotaEvictionPolicy:
+        return QuotaEvictionPolicy(
+            account="acct",
+            enabled=True,
+            max_attempts=5,
+            cancel_num=cancel_num,
+            wait_seconds=1.0,
+            jitter_seconds=0.0,
+        )
+
+    def test_self_jobs_excluded_from_victims(self):
+        jobs = [
+            {"jobId": "self1", "priority": 1000, "submitTime": "2020-01-01"},
+            {"jobId": "other1", "priority": 900, "submitTime": "2021-01-01"},
+            {"jobId": "other2", "priority": 800, "submitTime": "2022-01-01"},
+        ]
+        ctx = _FakeCtx(jobs)
+        ctx.self_job_ids = {"self1"}
+        cancelled = _gather_and_cancel(ctx, self._policy())
+        assert "self1" not in ctx.cancel_calls
+        assert ctx.cancel_calls == ["other1", "other2"]
+        assert [c["jobId"] for c in cancelled] == ["other1", "other2"]
+
+    def test_all_self_jobs_yields_no_victims(self):
+        jobs = [
+            {"jobId": "self1", "priority": 1000, "submitTime": "2020-01-01"},
+            {"jobId": "self2", "priority": 900, "submitTime": "2021-01-01"},
+        ]
+        ctx = _FakeCtx(jobs)
+        ctx.self_job_ids = {"self1", "self2"}
+        cancelled = _gather_and_cancel(ctx, self._policy())
+        assert ctx.cancel_calls == []
+        assert cancelled == []
+
+    def test_no_self_jobs_cancels_normally(self):
+        jobs = [
+            {"jobId": "a", "priority": 5, "submitTime": "2020-01-01"},
+            {"jobId": "b", "priority": 3, "submitTime": "2021-01-01"},
+        ]
+        ctx = _FakeCtx(jobs)
+        cancelled = _gather_and_cancel(ctx, self._policy())
+        assert ctx.cancel_calls == ["a", "b"]
+        assert len(cancelled) == 2
 
 
 class TestLockFor:

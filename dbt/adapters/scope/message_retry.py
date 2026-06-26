@@ -36,6 +36,60 @@ _REGEX_PREFIX = "re:"
 
 
 @dataclass(frozen=True)
+class RetryRule:
+    """A single regex-based retry rule for transient SCOPE job failures.
+
+    ``DEFAULT_JOB_RETRY_RULES`` below is the curated, growable rule set. To add
+    coverage for a newly-observed transient error, append a ``RetryRule`` with a
+    conservative regex and a short description of why it is safe to retry.
+    """
+
+    name: str
+    pattern: str
+    description: str
+
+
+# Built-in retry rules for SCOPE *job* failures (re-submit the whole job when the
+# terminal error message matches). Keep patterns conservative — broad patterns
+# risk re-running a genuinely-failed job. Grow this tuple over time.
+DEFAULT_JOB_RETRY_RULES: tuple[RetryRule, ...] = (
+    RetryRule(
+        name="vertex_stream_open_timeout",
+        pattern=r"Exception in VertexManager.*Failed to open stream.*Operation timed out",
+        description=("Transient DMS/Cosmos stream-open timeout in a vertex."),
+    ),
+    RetryRule(
+        name="job_cancelled_by_user",
+        pattern=r"Job cancelled by user .*",
+        description=(
+            "Job cancelled by an external actor (e.g. another pipeline's quota "
+            "eviction). Our own run's jobs are excluded from eviction separately "
+        ),
+    ),
+)
+
+
+def _compile_patterns(raw_patterns: list[Any]) -> list[Any]:
+    """Compile a list of pattern entries into substrings / ``re.Pattern`` objects.
+
+    Entries prefixed with ``re:`` are compiled as regexes; all others are kept as
+    plain (case-sensitive) substrings. Raises ``ValueError`` on malformed entries.
+    """
+    compiled: list[Any] = []
+    for entry in raw_patterns:
+        if not isinstance(entry, str) or not entry:
+            raise ValueError(f"retry pattern entries must be non-empty strings; got {entry!r}")
+        if entry.startswith(_REGEX_PREFIX):
+            pattern_text = entry[len(_REGEX_PREFIX) :]
+            if not pattern_text:
+                raise ValueError(f"retry regex entry {entry!r} is empty after 're:'")
+            compiled.append(re.compile(pattern_text))
+        else:
+            compiled.append(entry)
+    return compiled
+
+
+@dataclass(frozen=True)
 class MessageRetryPolicy:
     """Exponential-backoff retry triggered by exception message patterns.
 
@@ -60,21 +114,7 @@ class MessageRetryPolicy:
     @classmethod
     def from_credentials(cls, credentials: Any) -> MessageRetryPolicy:
         raw_patterns = getattr(credentials, "retry_on_error_messages", None) or []
-        compiled: list[Any] = []
-        for entry in raw_patterns:
-            if not isinstance(entry, str) or not entry:
-                raise ValueError(
-                    f"retry_on_error_messages entries must be non-empty strings; got {entry!r}"
-                )
-            if entry.startswith(_REGEX_PREFIX):
-                pattern_text = entry[len(_REGEX_PREFIX) :]
-                if not pattern_text:
-                    raise ValueError(
-                        f"retry_on_error_messages regex entry {entry!r} is empty after 're:'"
-                    )
-                compiled.append(re.compile(pattern_text))
-            else:
-                compiled.append(entry)
+        compiled = _compile_patterns(raw_patterns)
 
         max_retries = int(getattr(credentials, "max_retries_on_error", 25))
         initial_wait = float(getattr(credentials, "initial_wait_on_error_seconds", 1.0))
@@ -95,6 +135,51 @@ class MessageRetryPolicy:
         return cls(
             patterns=tuple(compiled),
             max_retries=max_retries,
+            initial_wait_seconds=initial_wait,
+            max_wait_seconds=max_wait,
+        )
+
+    @classmethod
+    def for_job_retry(cls, credentials: Any) -> MessageRetryPolicy:
+        """Build the policy that re-submits a SCOPE *job* on a transient failure.
+
+        Combines the built-in ``DEFAULT_JOB_RETRY_RULES`` with any user-supplied
+        ``job_retry_on_messages`` (same ``re:`` / substring syntax as
+        ``retry_on_error_messages``). Returns a disabled policy when
+        ``enable_job_retry`` is false so callers run the job exactly once.
+
+        Config (all optional, with defaults):
+          ``enable_job_retry`` (True), ``job_retry_on_messages`` ([]),
+          ``job_retry_max_attempts`` (3 total attempts),
+          ``job_retry_initial_wait_seconds`` (30), ``job_retry_max_wait_seconds`` (300).
+        """
+        if not bool(getattr(credentials, "enable_job_retry", True)):
+            return cls.disabled()
+
+        user_patterns = getattr(credentials, "job_retry_on_messages", None) or []
+        compiled = _compile_patterns(user_patterns)
+        compiled.extend(re.compile(rule.pattern) for rule in DEFAULT_JOB_RETRY_RULES)
+
+        max_attempts = int(getattr(credentials, "job_retry_max_attempts", 3))
+        initial_wait = float(getattr(credentials, "job_retry_initial_wait_seconds", 30.0))
+        max_wait = float(getattr(credentials, "job_retry_max_wait_seconds", 300.0))
+
+        if max_attempts < 1:
+            raise ValueError(f"job_retry_max_attempts must be >= 1; got {max_attempts}")
+        if initial_wait <= 0:
+            raise ValueError(f"job_retry_initial_wait_seconds must be > 0; got {initial_wait}")
+        if max_wait <= 0:
+            raise ValueError(f"job_retry_max_wait_seconds must be > 0; got {max_wait}")
+        if initial_wait > max_wait:
+            raise ValueError(
+                "job_retry_initial_wait_seconds must be <= job_retry_max_wait_seconds; "
+                f"got {initial_wait} > {max_wait}"
+            )
+
+        # MessageRetryPolicy.max_retries == additional attempts after the first.
+        return cls(
+            patterns=tuple(compiled),
+            max_retries=max_attempts - 1,
             initial_wait_seconds=initial_wait,
             max_wait_seconds=max_wait,
         )

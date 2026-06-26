@@ -191,6 +191,7 @@ class ScopeConnectionHandle:
         self._credential = build_credential(credentials)
         self._session = self._build_session(credentials.http_retries)
         self._message_retry_policy = MessageRetryPolicy.from_credentials(credentials)
+        self._job_retry_policy = MessageRetryPolicy.for_job_retry(credentials)
         self._quota_eviction_policy = QuotaEvictionPolicy.from_credentials(credentials)
         self._cached_token: str | None = None
         self._token_expires_at: float = 0
@@ -309,6 +310,24 @@ class ScopeConnectionHandle:
             url += f"&$filter={url_quote(filter_expr)}"
         resp = self._request("GET", url)
         return resp.get("value", [])
+
+    def is_self_job(self, job: dict[str, Any]) -> bool:
+        """Return ``True`` when *job* belongs to the current dbt run.
+
+        A job is considered "self" when either:
+
+        - its ``jobId`` is registered in the process-wide active-jobs registry
+          (we are actively polling it right now), or
+        - its ``related.runId`` matches this process's ``_run_id`` (it was
+          submitted by this dbt invocation, even if not currently being polled).
+        """
+        job_id = str(job.get("jobId") or "")
+        if job_id:
+            with _active_jobs_lock:
+                if job_id in _active_jobs:
+                    return True
+        related = job.get("related") or {}
+        return related.get("runId") == ScopeConnectionHandle._run_id
 
     def cancel_orphaned_jobs(self, model_name: str) -> list[str]:
         """Cancel active ADLA jobs for *previous* runs of ``model_name``.
@@ -610,15 +629,24 @@ class ScopeConnectionManager(BaseConnectionManager):
             if effective_model_name:
                 handle.cancel_orphaned_jobs(effective_model_name)
 
-            job = handle.submit_and_wait(
-                name=effective_name,
-                script=sql,
-                au=effective_au,
-                priority=effective_priority,
-                poll_interval=credentials.poll_interval_seconds,
-                max_wait=effective_max_wait,
-                model_name=effective_model_name,
-                wait_on_cancel_seconds=credentials.wait_on_cancel_seconds,
+            # Re-submit the whole job on a transient, regex-matched failure
+            # Non-matching failures propagate unchanged.
+            def _run_job() -> ADLAJob:
+                return handle.submit_and_wait(
+                    name=effective_name,
+                    script=sql,
+                    au=effective_au,
+                    priority=effective_priority,
+                    poll_interval=credentials.poll_interval_seconds,
+                    max_wait=effective_max_wait,
+                    model_name=effective_model_name,
+                    wait_on_cancel_seconds=credentials.wait_on_cancel_seconds,
+                )
+
+            job = retry_on_message(
+                _run_job,
+                policy=handle._job_retry_policy,
+                label=f"SCOPE job '{effective_name}'",
             )
 
         response = AdapterResponse(

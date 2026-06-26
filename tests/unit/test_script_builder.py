@@ -629,18 +629,18 @@ class TestExtractColumnsSeparation:
 
 
 class TestInsertColumnList:
-    """Tests that INSERT INTO uses explicit SELECT column list to prevent positional mismatch."""
+    """INSERT uses a named-column list."""
 
     def test_insert_includes_column_names(self, sample_config):
-        """SELECT should list all delta column names explicitly in table order."""
+        """INSERT names the target columns and the SELECT lists them in the same order."""
         script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
-        assert "INSERT INTO @target" in script
+        assert "INSERT INTO @target (col_str, col_long, col_dt, event_year_date)" in script
         assert "SELECT col_str, col_long, col_dt, event_year_date FROM @batch_data;" in script
 
     def test_insert_column_order_matches_delta_columns(self, sample_config):
-        """Column list in SELECT must match delta_columns order."""
+        """Named column list and SELECT list both follow delta_columns order."""
         script = ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
-        assert "INSERT INTO @target" in script
+        assert "INSERT INTO @target (col_str, col_long, col_dt, event_year_date)" in script
         assert "SELECT col_str, col_long, col_dt, event_year_date FROM @batch_data;" in script
 
     def test_mismatched_select_order_still_correct_insert(self):
@@ -675,7 +675,10 @@ class TestInsertColumnList:
             "FROM @data"
         )
         script = ScriptBuilder.build_incremental(config, model_sql)
-        # SELECT should reorder columns to match table definition order
+        assert (
+            "INSERT INTO @target (cluster_region_zone, azure_resource_id,"
+            " original_event_timestamp, query_count, event_year_date)"
+        ) in script
         expected = (
             "SELECT cluster_region_zone, azure_resource_id,"
             " original_event_timestamp, query_count, event_year_date"

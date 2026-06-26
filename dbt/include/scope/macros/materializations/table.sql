@@ -60,6 +60,8 @@
         {%- endcall -%}
     {%- else -%}
         {%- set total_batches = adapter.get_total_batches() -%}
+        {# -- Compute schema evolution once against the live Delta table -- #}
+        {%- set evolve_columns = adapter.compute_schema_evolution(delta_location, delta_table_columns, partition_by) -%}
         {%- for _ in range(1000) -%}
             {%- if ns.file_batch | length == 0 -%}
                 {# Break out of loop #}
@@ -79,7 +81,8 @@
                     ns.file_batch,
                     is_full_refresh=(ns.batch_num == 1),
                     delta_lake_commit_condition=delta_lake_commit_condition,
-                    max_file_count_per_output_file_set=max_file_count_per_output_file_set
+                    max_file_count_per_output_file_set=max_file_count_per_output_file_set,
+                    evolve_columns=evolve_columns
                 ) -%}
 
                 {{ log("SCOPE: full-refresh " ~ identifier ~ " batch " ~ ns.batch_num ~ " of " ~ total_batches ~ " (" ~ ns.file_batch | length ~ " files)", info=True) }}
@@ -125,7 +128,8 @@
     is_full_refresh=false,
     is_incremental=false,
     delta_lake_commit_condition="FailIfFileConflict",
-    max_file_count_per_output_file_set=5000
+    max_file_count_per_output_file_set=5000,
+    evolve_columns=[]
 ) %}
 {# -- Normalize partition_by to a list -- #}
 {%- set partition_cols = partition_by if partition_by is iterable and partition_by is not string else ([partition_by] if partition_by else []) -%}
@@ -164,6 +168,13 @@ ALTER TABLE @target SET TBLPROPERTIES (
 );
 {%- endif %}
 
+{# -- Schema evolution: ADD COLUMN for new columns on an existing Delta table -- #}
+{%- if evolve_columns %}
+{%- for col in evolve_columns %}
+ALTER TABLE @target ADD COLUMN IF NOT EXISTS {{ col.name }} {{ col.type }};
+{%- endfor %}
+{%- endif %}
+
 {# -- DELETE existing data for full-refresh idempotency -- #}
 {%- if is_full_refresh %}
 DECLARE TABLE @target_rw
@@ -197,7 +208,7 @@ DELETE FROM @target_rw WHERE true;
 @batch_data =
     {{ model_sql }};
 
-INSERT INTO @target
+INSERT INTO @target ({{ delta_table_columns | map(attribute='name') | join(', ') }})
 SELECT {{ delta_table_columns | map(attribute='name') | join(', ') }} FROM @batch_data;
 
 {% endmacro %}

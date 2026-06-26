@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from dbt.adapters.scope.connections import ScopeConnectionHandle, ScopeConnectionManager
+from dbt.adapters.scope.message_retry import MessageRetryPolicy
 
 # A minimal non-comment SCOPE script that won't be skipped by execute()
 _DUMMY_SCRIPT = '// SCOPE script\nSET @@FeaturePreviews = "EnableDeltaTableDynamicInsert:on";'
@@ -53,6 +54,7 @@ class TestExecuteJobName:
 
         handle = MagicMock()
         handle._next_job_name = None
+        handle._job_retry_policy = MessageRetryPolicy.disabled()
         handle.submit_and_wait = MagicMock()
         handle.submit_and_wait.return_value = MagicMock(job_id="test-id", result="Succeeded")
 
@@ -142,6 +144,7 @@ class TestExecuteMaxWaitOverride:
         handle = MagicMock()
         handle._next_job_name = None
         handle._next_job_timeout_seconds = None
+        handle._job_retry_policy = MessageRetryPolicy.disabled()
         handle.submit_and_wait = MagicMock()
         handle.submit_and_wait.return_value = MagicMock(job_id="test-id", result="Succeeded")
 

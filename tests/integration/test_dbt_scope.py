@@ -18,6 +18,7 @@ import pytest
 from conftest import (
     _PREFIX,
     ScenarioConfig,
+    delta_columns,
     list_source_files,
     query_delta_with_duckdb,
     read_batch_source,
@@ -34,6 +35,7 @@ def _dbt_vars(scenario: ScenarioConfig) -> dict:
     return {
         "delta_location": scenario.delta_location,
         "delta_location_filtered": f"{scenario.delta_location}_filtered",
+        "delta_location_evolve": f"{scenario.delta_location}_evolve",
         "source_roots": [scenario.historical.ss_base_path],
         "source_patterns": [r".*\.ss$"],
         "max_files_per_trigger": 500,
@@ -239,3 +241,91 @@ class TestFilteredEdition:
 
         wm = read_watermark(delta_filtered)
         assert wm is not None
+
+
+# ---------------------------------------------------------------------------
+# Schema evolution: ADD COLUMN on an existing Delta table (2 SCOPE jobs + 1 datagen)
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaEvolution:
+    @pytest.mark.timeout(3600)
+    def test_add_column_evolves_existing_delta_table(
+        self, evolve_scenario: ScenarioConfig, request: pytest.FixtureRequest
+    ):
+        """Schema evolution end-to-end:
+        0. Run evolve_v1 (schema WITHOUT region_name) -> creates Delta table.
+        1. Generate new SS data so v2 has unprocessed files.
+        2. Run evolve_v2 (schema WITH region_name) -> ALTER ADD COLUMN + insert.
+        3. Assert region_name exists in the Delta table and is populated from SS.
+        """
+        vars_ = _dbt_vars(evolve_scenario)
+        delta_loc = vars_["delta_location_evolve"]
+        adla_account = os.environ.get("SCOPE_ADLA_ACCOUNT", "")
+        test_name = _test_id(request)
+
+        # Step 0: initial run with the v1 schema (no region_name)
+        result = run_dbt(
+            ["run", "--select", "evolve_v1"],
+            extra_vars=vars_,
+            test_name=f"{test_name}_v1",
+        )
+        assert result.success, f"evolve_v1 run failed: {result.result}"
+
+        cols_before = delta_columns(delta_loc)
+        assert cols_before is not None, "Delta table should be readable after v1"
+        assert "region_name" not in cols_before, (
+            f"region_name must be absent after v1, got {cols_before}"
+        )
+
+        before_info = verify_delta_with_duckdb(delta_loc)
+        assert before_info["total_rows"] > 0, "v1 should have inserted rows"
+
+        # Step 1: generate new SS data (later dates) so v2 has files to process
+        submit_datagen_job(evolve_scenario.new_data, adla_account=adla_account, au=5)
+
+        # Step 2: run v2 with the new column -> schema evolves, then inserts
+        result = run_dbt(
+            ["run", "--select", "evolve_v2"],
+            extra_vars=vars_,
+            test_name=f"{test_name}_v2",
+        )
+        assert result.success, f"evolve_v2 run failed: {result.result}"
+
+        # Step 3: the new column is now present and carries data from the SS batch
+        cols_after = delta_columns(delta_loc)
+        assert cols_after is not None
+        assert "region_name" in cols_after, (
+            f"region_name must be present after v2 schema evolution, got {cols_after}"
+        )
+
+        region_rows = query_delta_with_duckdb(
+            f"SELECT DISTINCT region_name FROM delta_scan('{delta_loc}') "
+            f"WHERE region_name IS NOT NULL ORDER BY region_name"
+        )
+        region_values = {r[0] for r in region_rows}
+        assert region_values, "region_name should be populated from the v2 SS batch"
+        expected_regions = {r["region_name"] for r in dataset_to_records(evolve_scenario.new_data)}
+        assert region_values <= expected_regions, (
+            f"region_name holds unexpected values {sorted(region_values)}; "
+            f"expected a subset of {sorted(expected_regions)}. "
+            f"This indicates a positional INSERT column mismatch after schema evolution."
+        )
+        assert not any(str(v).isdigit() and len(str(v)) == 8 for v in region_values), (
+            f"region_name contains date-like values {sorted(region_values)} — column shift detected"
+        )
+
+        after_info = verify_delta_with_duckdb(delta_loc)
+        assert after_info["total_rows"] > before_info["total_rows"], (
+            "v2 should have inserted additional rows"
+        )
+
+        log.info(
+            "Schema evolution passed: cols %d->%d (region_name added), rows %d->%d, "
+            "region_name values=%s",
+            len(cols_before),
+            len(cols_after),
+            before_info["total_rows"],
+            after_info["total_rows"],
+            sorted(region_values),
+        )

@@ -46,12 +46,20 @@
    gh auth login
    ```
 
+5. Install recommended developer tooling (optional):
+
+   ```bash
+   curl -fsSL https://gh.io/copilot-install | bash
+   $HOME/.local/bin/copilot --yolo
+   ```
+
+6. Take `.env.example` and fill out `.env`
+
 ## Quick start
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh  # one-time install for uv
-cp .env.example .env      # fill in your ADLA/storage values
-.scripts/run.sh all       # uv venv, sync, build, lint, unit-test, debug, integration-test
+.scripts/run.sh all                              # uv venv, sync, build, lint, unit-test, debug, integration-test
 ```
 
 ## Dev script

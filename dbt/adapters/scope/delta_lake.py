@@ -57,6 +57,163 @@ def _sql_identifier(value: str) -> str:
     return f'"{escaped}"'
 
 
+# ---------------------------------------------------------------------------
+# Delta Lake schema evolution
+# ---------------------------------------------------------------------------
+
+# Canonical equivalence between SCOPE type spellings (as written in a model's
+# ``delta_table_columns``) and the DuckDB type names surfaced by ``delta_scan``.
+# Both spellings map to a single token so a dbt ``long`` and a DuckDB ``BIGINT``
+# compare equal. SCOPE and DuckDB spellings do not collide, so one table works
+# for both sides.
+_CANONICAL_TYPES: dict[str, str] = {
+    # strings
+    "string": "STRING",
+    "varchar": "STRING",
+    "char": "STRING",
+    "text": "STRING",
+    # booleans
+    "bool": "BOOL",
+    "boolean": "BOOL",
+    # integers (width matters: SCOPE int == 32-bit, long == 64-bit)
+    "sbyte": "INT8",
+    "tinyint": "INT8",
+    "int8": "INT8",
+    "short": "INT16",
+    "smallint": "INT16",
+    "int16": "INT16",
+    "int": "INT32",
+    "integer": "INT32",
+    "int32": "INT32",
+    "long": "INT64",
+    "bigint": "INT64",
+    "int64": "INT64",
+    # floating point
+    "float": "FLOAT32",
+    "real": "FLOAT32",
+    "float4": "FLOAT32",
+    "double": "FLOAT64",
+    "float8": "FLOAT64",
+    # temporal
+    "datetime": "DATETIME",
+    "date": "DATE",
+    # binary
+    "byte[]": "BINARY",
+    "binary": "BINARY",
+    "varbinary": "BINARY",
+    "blob": "BINARY",
+    "bytea": "BINARY",
+}
+
+
+def canonical_type(raw: str | None) -> str | None:
+    """Normalize a SCOPE or DuckDB type name to a canonical token.
+
+    Returns ``None`` for unknown types so callers can stay lenient (a type we
+    cannot confidently normalize must not trigger a spurious mismatch failure).
+    """
+    if not raw:
+        return None
+    base = raw.strip().rstrip("?").strip().lower()
+    if base.startswith("timestamp"):
+        return "DATETIME"
+    if base.startswith(("decimal", "numeric")):
+        return "DECIMAL"
+    paren = base.find("(")
+    if paren != -1:
+        base = base[:paren].strip()
+    return _CANONICAL_TYPES.get(base)
+
+
+def _format_schema(columns: list[tuple[str, str]]) -> str:
+    """Render ``[(name, type), ...]`` as an indented, aligned block."""
+    if not columns:
+        return "    (empty)"
+    width = max(len(name) for name, _ in columns)
+    return "\n".join(f"    {name.ljust(width)}  {dtype}" for name, dtype in columns)
+
+
+def diff_schema_for_evolution(
+    dbt_columns: list[dict[str, str]],
+    existing_schema: dict[str, str],
+    *,
+    partition_columns: tuple[str, ...] = (),
+    location: str = "",
+) -> list[dict[str, str]]:
+    """Diff a model's declared columns against the live Delta table schema.
+
+    Args:
+        dbt_columns: ``[{"name": .., "type": ..}, ...]`` from ``delta_table_columns``
+            (``type`` is a SCOPE type spelling).
+        existing_schema: ``{column_name: duckdb_type}`` read from the Delta table.
+        partition_columns: partition column names — excluded from the diff because
+            they are declared in ``CREATE TABLE`` and cannot be ``ALTER ADD COLUMN``-ed.
+        location: Delta table location, for error messages only.
+
+    Returns:
+        The subset of ``dbt_columns`` that are absent from the Delta table and must
+        be added via ``ALTER TABLE ... ADD COLUMN``.
+
+    Raises:
+        DbtRuntimeError: when a column exists in the Delta table but not in the model
+            (dbt-scope never drops columns), or when a column's type changed.
+    """
+    ignore = {c.lower() for c in partition_columns}
+    existing_by_lower = {name.lower(): (name, dtype) for name, dtype in existing_schema.items()}
+    dbt_by_lower = {c["name"].lower(): c for c in dbt_columns}
+
+    to_add: list[dict[str, str]] = []
+    type_mismatches: list[str] = []
+
+    for lower, col in dbt_by_lower.items():
+        if lower in ignore:
+            continue
+        if lower not in existing_by_lower:
+            to_add.append(col)
+            continue
+        _, existing_type = existing_by_lower[lower]
+        dbt_canon = canonical_type(col["type"])
+        existing_canon = canonical_type(existing_type)
+        # Only flag a mismatch when both sides are confidently known and differ.
+        if dbt_canon is not None and existing_canon is not None and dbt_canon != existing_canon:
+            type_mismatches.append(
+                f"    {col['name']}: model declares '{col['type']}' "
+                f"but the Delta table has '{existing_type}'"
+            )
+
+    missing_in_dbt = [
+        orig
+        for lower, (orig, _dtype) in existing_by_lower.items()
+        if lower not in dbt_by_lower and lower not in ignore
+    ]
+
+    if missing_in_dbt or type_mismatches:
+        dbt_block = _format_schema([(c["name"], c["type"]) for c in dbt_columns])
+        delta_block = _format_schema(sorted(existing_schema.items()))
+        problems: list[str] = []
+        if missing_in_dbt:
+            problems.append(
+                "Columns present in the Delta table but MISSING from the model "
+                "(dbt-scope does not drop columns):\n    " + ", ".join(sorted(missing_in_dbt))
+            )
+        if type_mismatches:
+            problems.append(
+                "Columns whose type changed (dbt-scope cannot evolve column types):\n"
+                + "\n".join(type_mismatches)
+            )
+        raise DbtRuntimeError(
+            f"Delta table schema at '{location}' is incompatible with the dbt model.\n\n"
+            f"Model delta_table_columns:\n{dbt_block}\n\n"
+            f"Existing Delta table schema:\n{delta_block}\n\n"
+            + "\n\n".join(problems)
+            + "\n\nFix your dbt model's delta_table_columns to match the Delta table "
+            "(re-add the missing columns and/or revert the changed types), or migrate "
+            "the table out of band. Only ADDING new columns is supported automatically."
+        )
+
+    return to_add
+
+
 @dataclass(frozen=True)
 class AbfssLocation:
     """Structured representation of an ``abfss://`` path."""
@@ -274,6 +431,28 @@ class DeltaLakeClient(ABC):
             log.debug(f"get_columns({delta_location}) → None (error)")
             return None
 
+    def get_schema(self, delta_location: str) -> dict[str, str] | None:
+        """Return the Delta schema as ``{column_name: duckdb_type}``.
+
+        Returns ``None`` when the table is unreadable (does not exist, or the
+        Delta log cannot be parsed). Column order is preserved.
+        """
+        try:
+            escaped_location = _sql_literal(delta_location)
+            with self.connect() as conn:
+                column_description = conn.execute(
+                    f"SELECT * FROM delta_scan('{escaped_location}') LIMIT 0"
+                ).description
+            schema = {column[0]: str(column[1]) for column in column_description}
+            log.debug(f"get_schema({delta_location}) → {schema!s}")
+            return schema
+        except CredentialUnavailableError:
+            log.error(f"get_schema: credential acquisition exhausted for {delta_location}")
+            raise
+        except Exception:
+            log.debug(f"get_schema({delta_location}) → None (error)")
+            return None
+
     def validate_partition_column(self, delta_location: str, partition_col: str) -> None:
         """Raise when an existing Delta table lacks the expected partition column."""
         columns = self.get_columns(delta_location)
@@ -407,3 +586,41 @@ class DuckDbDeltaLakeClient(DeltaLakeClient):
         except Exception:
             log.warning(f"list_table_paths({delta_location}) failed")
             return []
+
+    def delta_log_exists(self, delta_location: str) -> bool:
+        """Return ``True`` if a ``_delta_log/*.json`` commit exists for the table.
+
+        Lists only the ``_delta_log/`` prefix (not the whole table) and exits on
+        the first JSON commit file, so it stays cheap on large tables.
+        """
+        parsed = AbfssLocation.parse(delta_location)
+        if parsed is None:
+            return False
+
+        def _exists() -> bool:
+            service = DataLakeServiceClient(
+                account_url=parsed.account_url,
+                credential=self._credential,
+            )
+            file_system = service.get_file_system_client(parsed.container)
+            prefix = f"{parsed.path.rstrip('/')}/_delta_log"
+            for path in file_system.get_paths(path=prefix, recursive=True):
+                if not getattr(path, "is_directory", False) and path.name.endswith(".json"):
+                    return True
+            return False
+
+        try:
+            result = retry_on_message(
+                _exists,
+                policy=self._message_retry_policy,
+                label=f"delta_lake.delta_log_exists {delta_location}",
+            )
+            log.debug(f"delta_log_exists({delta_location}) → {result}")
+            return result
+        except CredentialUnavailableError:
+            log.error(f"delta_log_exists: credential acquisition exhausted for {delta_location}")
+            raise
+        except Exception:
+            # A missing path raises (path not found) — treat as "does not exist".
+            log.debug(f"delta_log_exists({delta_location}) → False (not found or error)")
+            return False

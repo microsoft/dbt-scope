@@ -92,11 +92,16 @@ class EvictionContext(Protocol):
     ``cancel_job_async`` MUST be fire-and-forget — it must NOT block waiting
     for the job to reach a terminal state. Blocking would multiply the
     recovery time by the number of victims.
+
+    ``is_self_job`` lets the eviction layer skip jobs that belong to the
+    current dbt run (so we never cancel our own in-flight work — issue #39).
     """
 
     def list_jobs(self, filter_expr: str | None = None, top: int = 100) -> list[dict[str, Any]]: ...
 
     def cancel_job_async(self, job_id: str) -> None: ...
+
+    def is_self_job(self, job: dict[str, Any]) -> bool: ...
 
 
 def is_quota_error(exc: BaseException) -> bool:
@@ -186,6 +191,13 @@ def _gather_and_cancel(ctx: EvictionContext, policy: QuotaEvictionPolicy) -> lis
     except Exception as exc:
         log.warning(f"Quota eviction: list_jobs failed ({exc}); cannot pick victims.")
         return []
+
+    # Never evict jobs belonging to the current dbt run.
+    total = len(jobs)
+    jobs = [job for job in jobs if not ctx.is_self_job(job)]
+    skipped = total - len(jobs)
+    if skipped:
+        log.debug(f"Quota eviction: excluded {skipped} self-owned job(s) from eviction.")
 
     victims = select_victims(jobs, policy.cancel_num)
     if not victims:

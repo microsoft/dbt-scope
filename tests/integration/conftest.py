@@ -111,6 +111,21 @@ def append_scenario() -> ScenarioConfig:
     return scenario
 
 
+@pytest.fixture(scope="session")
+def evolve_scenario() -> ScenarioConfig:
+    """Scenario: Delta Lake schema evolution -- dedicated stream so v1 then v2 stays isolated.
+
+    Uses its own SS stream + Delta path so no other test's datagen advances this
+    table's watermark before the v2 (new-column) run.
+    """
+    scenario = _build_scenario("schema_evolve")
+    adla = _env("SCOPE_ADLA_ACCOUNT")
+
+    log.info("Generating historical SS files for schema-evolution scenario")
+    submit_datagen_job(scenario.historical, adla_account=adla, au=5)
+    return scenario
+
+
 # -- dbt runner ---------------------------------------------------------------
 
 
@@ -157,9 +172,13 @@ def run_dbt(
     print(f"    Logs: {log_dir}")
 
     summary_file = log_dir / "result_summary.txt"
-    summary_file.write_text(
-        f"command: dbt {' '.join(args)}\nsuccess: {result.success}\nresult: {result.result}\n"
-    )
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        summary_file.write_text(
+            f"command: dbt {' '.join(args)}\nsuccess: {result.success}\nresult: {result.result}\n"
+        )
+    except OSError as exc:
+        log.warning("Could not write result summary to %s: %s", summary_file, exc)
 
     return result
 
@@ -198,6 +217,11 @@ def verify_delta(delta_path: str) -> dict:
 def query_delta_with_duckdb(query: str) -> list[tuple]:
     """Execute a read-only DuckDB query with Delta + Azure extensions preloaded."""
     return _delta_client().fetchall(query)
+
+
+def delta_columns(delta_path: str) -> list[str] | None:
+    """Return the Delta table's column names (or None if unreadable)."""
+    return _delta_client().get_columns(delta_path)
 
 
 def verify_delta_with_duckdb(

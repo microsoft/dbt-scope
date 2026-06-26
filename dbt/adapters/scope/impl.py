@@ -34,7 +34,12 @@ from dbt.adapters.scope.constants import (
     DEFAULT_WAIT_ON_CANCEL_SECONDS,
 )
 from dbt.adapters.scope.credentials import ScopeCredentials
-from dbt.adapters.scope.delta_lake import RetryPolicy, build_credential
+from dbt.adapters.scope.delta_lake import (
+    DuckDbDeltaLakeClient,
+    RetryPolicy,
+    build_credential,
+    diff_schema_for_evolution,
+)
 from dbt.adapters.scope.file_tracker import FileTracker
 from dbt.adapters.scope.message_retry import MessageRetryPolicy, retry_on_message
 from dbt.adapters.scope.relation import ScopeRelation
@@ -777,6 +782,66 @@ class ScopeAdapter(BaseAdapter):
         }
 
     @available
+    def compute_schema_evolution(
+        self,
+        delta_location: str,
+        delta_table_columns: list[dict[str, str]],
+        partition_by: str | list[str] | None = None,
+    ) -> list[dict[str, str]]:
+        """Return the columns to ``ALTER TABLE ... ADD COLUMN`` for schema evolution.
+
+        Called from the materialization macros before building the SCOPE script:
+
+          1. If no ``_delta_log`` exists under *delta_location* (new table), return
+             ``[]`` — ``CREATE TABLE`` will create the full schema.
+          2. Otherwise read the live Delta schema and diff it against
+             *delta_table_columns*. Columns present in the table but missing from the
+             model, or whose type changed, raise ``DbtRuntimeError``. New columns are
+             returned as ``[{"name": .., "type": ..}, ...]`` to be added.
+
+        Args:
+            delta_location: ``abfss://`` path to the Delta table.
+            delta_table_columns: the model's ``delta_table_columns`` config.
+            partition_by: partition column(s), excluded from the diff.
+        """
+        if not delta_location or not delta_table_columns:
+            return []
+
+        client = self._get_delta_client()
+
+        if not client.delta_log_exists(delta_location):
+            log.debug(f"compute_schema_evolution: no _delta_log at {delta_location} → new table")
+            return []
+
+        existing_schema = client.get_schema(delta_location)
+        if existing_schema is None:
+            raise DbtRuntimeError(
+                f"Delta table at '{delta_location}' has a _delta_log but its schema could "
+                f"not be read for schema-evolution checks. Verify the table is a valid Delta "
+                f"table and that credentials can read it."
+            )
+
+        if isinstance(partition_by, str):
+            partition_columns: tuple[str, ...] = (partition_by,)
+        elif partition_by:
+            partition_columns = tuple(partition_by)
+        else:
+            partition_columns = ()
+
+        to_add = diff_schema_for_evolution(
+            delta_table_columns,
+            existing_schema,
+            partition_columns=partition_columns,
+            location=delta_location,
+        )
+        if to_add:
+            log.info(
+                f"SCOPE: schema evolution for {delta_location} — adding "
+                f"{len(to_add)} column(s): {', '.join(c['name'] for c in to_add)}"
+            )
+        return to_add
+
+    @available
     def get_processing_time_timeout(self) -> int:
         """Return the default timeout (seconds) for processing_time models."""
         return DEFAULT_PROCESSING_TIME_TIMEOUT_SECONDS
@@ -946,3 +1011,13 @@ class ScopeAdapter(BaseAdapter):
                 checkpoint_manager=self._get_checkpoint_manager(),
             )
         return self._file_tracker
+
+    def _get_delta_client(self) -> DuckDbDeltaLakeClient:
+        """Return the DuckDB-backed Delta Lake client singleton."""
+        if not hasattr(self, "_delta_client"):
+            creds = self._credentials()
+            self._delta_client = DuckDbDeltaLakeClient(
+                credential=build_credential(creds),
+                message_retry_policy=MessageRetryPolicy.from_credentials(creds),
+            )
+        return self._delta_client
