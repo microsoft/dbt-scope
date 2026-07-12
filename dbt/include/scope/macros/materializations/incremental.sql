@@ -50,6 +50,7 @@
     {%- set source_compaction_interval = config.get('source_compaction_interval', defaults.source_compaction_interval) | int -%}
     {%- set source_retention_files = config.get('source_retention_files', defaults.source_retention_files) | int -%}
     {%- set starting_timestamp = config.get('starting_timestamp', none) -%}
+    {%- set starting_timestamp_fallback_to_latest = config.get('starting_timestamp_fallback_to_latest', false) -%}
     {%- set partition_by = config.get('partition_by', none) -%}
     {%- set scope_settings = config.get('scope_settings', {}) -%}
     {%- set delta_table_columns = config.get('delta_table_columns', []) -%}
@@ -91,7 +92,7 @@
         cycle_files=0,
         keep_running=true,
         file_batch=adapter.discover_files(
-            source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds, starting_timestamp, max_bytes_per_trigger
+            source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds, starting_timestamp, max_bytes_per_trigger, starting_timestamp_fallback_to_latest
         )
     ) -%}
 
@@ -120,7 +121,7 @@
                     {%- else -%}
                         {%- set ns.cycle_files = 0 -%}
                         {%- set ns.file_batch = adapter.discover_files(
-                            source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds, starting_timestamp, max_bytes_per_trigger
+                            source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds, starting_timestamp, max_bytes_per_trigger, starting_timestamp_fallback_to_latest
                         ) -%}
                         {%- set total_batches = adapter.get_total_batches() -%}
                     {%- endif -%}
@@ -168,7 +169,7 @@
 
                 {# -- Discover next batch (watermark advanced, so new files are eligible) -- #}
                 {%- set ns.file_batch = adapter.discover_files(
-                    source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds, starting_timestamp, max_bytes_per_trigger
+                    source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds, starting_timestamp, max_bytes_per_trigger, starting_timestamp_fallback_to_latest
                 ) -%}
 
                 {# -- If this batch exhausted files AND processing_time: sleep + re-discover -- #}
@@ -183,7 +184,7 @@
                     {%- else -%}
                         {%- set ns.cycle_files = 0 -%}
                         {%- set ns.file_batch = adapter.discover_files(
-                            source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds, starting_timestamp, max_bytes_per_trigger
+                            source_roots, source_patterns, max_files_per_trigger, delta_location, safety_buffer_seconds, starting_timestamp, max_bytes_per_trigger, starting_timestamp_fallback_to_latest
                         ) -%}
                         {%- set total_batches = adapter.get_total_batches() -%}
                     {%- endif -%}

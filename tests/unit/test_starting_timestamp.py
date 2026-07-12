@@ -34,6 +34,7 @@ def _discover_with_starting_timestamp(
     watermark: Watermark | None = None,
     max_files_per_trigger: int = 50,
     safety_buffer_seconds: int = 0,
+    starting_timestamp_fallback_to_latest: bool = False,
 ) -> list[str]:
     """Simulate ScopeAdapter.discover_files() logic with starting_timestamp.
 
@@ -68,17 +69,33 @@ def _discover_with_starting_timestamp(
                     all_unprocessed.append(f)
 
     if used_starting_timestamp and not all_unprocessed:
-        # Check if there are any files at all (re-list without watermark)
-        for root in source_roots:
-            for pattern in source_patterns:
-                files = tracker.discover_unprocessed_files(
-                    root=root, pattern=pattern, watermark=None, safety_buffer_seconds=0
-                )
-                if files:
-                    raise DbtRuntimeError(
-                        f"starting_timestamp '{starting_timestamp}' is after all available "
-                        f"source files."
+        if starting_timestamp_fallback_to_latest:
+            latest: FileInfo | None = None
+            for root in source_roots:
+                for pattern in source_patterns:
+                    files = tracker.discover_unprocessed_files(
+                        root=root,
+                        pattern=pattern,
+                        watermark=None,
+                        safety_buffer_seconds=safety_buffer_seconds,
                     )
+                    for f in files:
+                        if latest is None or f.modification_time > latest.modification_time:
+                            latest = f
+            if latest is not None:
+                all_unprocessed = [latest]
+        else:
+            # Check if there are any files at all (re-list without watermark)
+            for root in source_roots:
+                for pattern in source_patterns:
+                    files = tracker.discover_unprocessed_files(
+                        root=root, pattern=pattern, watermark=None, safety_buffer_seconds=0
+                    )
+                    if files:
+                        raise DbtRuntimeError(
+                            f"starting_timestamp '{starting_timestamp}' is after all available "
+                            f"source files."
+                        )
 
     all_unprocessed.sort(key=lambda f: f.modification_time)
     batch = FileTracker.get_next_batch(all_unprocessed, max_files_per_trigger)
@@ -238,6 +255,67 @@ class TestStartingTimestampValidation:
             starting_timestamp=ts,
         )
         assert result == []
+
+    def test_fallback_to_latest_picks_single_most_recent_file(self):
+        """With fallback enabled, a too-late timestamp processes only the latest file."""
+        files = [
+            _make_file("/root/a.ss", NOW - timedelta(days=10)),
+            _make_file("/root/b.ss", NOW - timedelta(days=5)),
+        ]
+
+        gen1 = MagicMock()
+        gen1.list_files.return_value = files
+        checkpoint = MagicMock()
+
+        ts = (NOW + timedelta(days=1)).isoformat()
+        result = _discover_with_starting_timestamp(
+            gen1,
+            checkpoint,
+            source_roots=["/root"],
+            source_patterns=[r".*\.ss$"],
+            starting_timestamp=ts,
+            starting_timestamp_fallback_to_latest=True,
+        )
+        assert result == ["/root/b.ss"]
+
+    def test_fallback_to_latest_no_files_returns_empty(self):
+        """Fallback on an empty source is not an error and returns empty."""
+        gen1 = MagicMock()
+        gen1.list_files.return_value = []
+        checkpoint = MagicMock()
+
+        ts = (NOW + timedelta(days=1)).isoformat()
+        result = _discover_with_starting_timestamp(
+            gen1,
+            checkpoint,
+            source_roots=["/root"],
+            source_patterns=[r".*\.ss$"],
+            starting_timestamp=ts,
+            starting_timestamp_fallback_to_latest=True,
+        )
+        assert result == []
+
+    def test_fallback_to_latest_picks_global_latest_across_roots(self):
+        """Fallback selects the globally most-recent file across roots/patterns."""
+        by_root = {
+            "/root1": [_make_file("/root1/a.ss", NOW - timedelta(days=8))],
+            "/root2": [_make_file("/root2/b.ss", NOW - timedelta(days=3))],
+        }
+
+        gen1 = MagicMock()
+        gen1.list_files.side_effect = lambda root, pattern: by_root[root]
+        checkpoint = MagicMock()
+
+        ts = (NOW + timedelta(days=1)).isoformat()
+        result = _discover_with_starting_timestamp(
+            gen1,
+            checkpoint,
+            source_roots=["/root1", "/root2"],
+            source_patterns=[r".*\.ss$"],
+            starting_timestamp=ts,
+            starting_timestamp_fallback_to_latest=True,
+        )
+        assert result == ["/root2/b.ss"]
 
     def test_none_starting_timestamp_processes_all(self):
         """When starting_timestamp is None, all files are processed (backward compat)."""
