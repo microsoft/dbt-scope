@@ -21,11 +21,24 @@ runs:
       run: |
         set -euo pipefail
         export IMDS_SUBSCRIPTION_ID="$UAMI_SUBSCRIPTION"
-        nohup python3 .github/scripts/imds_relay_router.py > /tmp/imds-router.log 2>&1 &
+        mkdir -p .logs
+        nohup python3 .github/scripts/imds_relay_router.py > .logs/imds-relay-router.stdout.log 2>&1 &
         echo "IMDS_ROUTER_PID=$!" >> "$GITHUB_ENV"
+        router_pid=$!
+        dump_logs() {
+          echo "----- .logs/imds-relay-router.log -----"
+          cat .logs/imds-relay-router.log 2>/dev/null || true
+          echo "----- .logs/imds-relay-router.stdout.log -----"
+          cat .logs/imds-relay-router.stdout.log 2>/dev/null || true
+        }
         for i in $(seq 1 10); do
+          if ! kill -0 "$router_pid" 2>/dev/null; then
+            echo "IMDS relay router exited during startup (failed validation)." >&2
+            dump_logs
+            exit 1
+          fi
           curl -sf http://localhost:${IMDS_ROUTER_PORT}/healthz > /dev/null 2>&1 && break
-          [ "$i" -eq 10 ] && { cat /tmp/imds-router.log; exit 1; }
+          [ "$i" -eq 10 ] && { dump_logs; exit 1; }
           sleep 1
         done
 
