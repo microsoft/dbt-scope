@@ -557,6 +557,7 @@ class ScopeAdapter(BaseAdapter):
         safety_buffer_seconds: int = DEFAULT_SAFETY_BUFFER_SECONDS,
         starting_timestamp: str | None = None,
         max_bytes_per_trigger: int = DEFAULT_MAX_BYTES_PER_TRIGGER,
+        starting_timestamp_fallback_to_latest: bool = False,
     ) -> list[str]:
         """Discover unprocessed source files and return a batch of file paths.
 
@@ -570,6 +571,13 @@ class ScopeAdapter(BaseAdapter):
         If *starting_timestamp* is provided (ISO-8601 UTC) and no checkpoint
         exists, only files modified after that timestamp are considered.  When
         a checkpoint already exists the parameter is silently ignored.
+
+        If *starting_timestamp* is after every available source file, the
+        behavior depends on *starting_timestamp_fallback_to_latest*: when
+        ``False`` (default) a ``DbtRuntimeError`` is raised; when ``True`` the
+        single most-recent available file is processed instead (the minimum
+        possible lookback), letting developers explore with the least data
+        scanned.
         """
         # Validate starting_timestamp early (fail fast on bad input)
         starting_ts_dt = (
@@ -609,12 +617,31 @@ class ScopeAdapter(BaseAdapter):
                         seen_paths.add(f.path)
                         all_unprocessed.append(f)
 
-        # If starting_timestamp was used and yielded nothing, check whether
-        # there are source files at all — if so, the timestamp is too late.
+        # If starting_timestamp was used and yielded nothing, either fall back
+        # to the single most-recent file (minimum lookback) or raise, depending
+        # on starting_timestamp_fallback_to_latest.
         if used_starting_timestamp and not all_unprocessed:
-            self._validate_starting_timestamp_has_files(
-                tracker, source_roots, source_patterns, starting_timestamp
-            )
+            if starting_timestamp_fallback_to_latest:
+                latest = self._find_latest_available_file(
+                    tracker, source_roots, source_patterns, safety_buffer_seconds
+                )
+                if latest is not None:
+                    log.warning(
+                        "starting_timestamp '%s' is after all available source files; "
+                        "falling back to the single most-recent file '%s' "
+                        "(modificationTime '%s') because "
+                        "starting_timestamp_fallback_to_latest=true.",
+                        starting_timestamp,
+                        latest.path,
+                        latest.modification_time.isoformat(),
+                    )
+                    all_unprocessed = [latest]
+                    seen_paths.add(latest.path)
+                # else: no files exist at all — legitimate empty source, no error
+            else:
+                self._validate_starting_timestamp_has_files(
+                    tracker, source_roots, source_patterns, starting_timestamp
+                )
 
         # Sort by modification_time to maintain deterministic ordering
         all_unprocessed.sort(key=lambda f: f.modification_time)
@@ -676,6 +703,33 @@ class ScopeAdapter(BaseAdapter):
                         f"Use an earlier timestamp or remove starting_timestamp."
                     )
         # No files exist at all — that's a legitimate empty source, not an error
+
+    @staticmethod
+    def _find_latest_available_file(
+        tracker: FileTracker,
+        source_roots: list[str],
+        source_patterns: list[str],
+        safety_buffer_seconds: int,
+    ) -> FileInfo | None:
+        """Return the globally most-recent available source file, or None.
+
+        Re-lists every (root, pattern) with no watermark (still honoring the
+        safety buffer) and returns the file with the maximum ``modification_time``.
+        Returns ``None`` when the source is genuinely empty.
+        """
+        latest: FileInfo | None = None
+        for root in source_roots:
+            for pattern in source_patterns:
+                files = tracker.discover_unprocessed_files(
+                    root=root,
+                    pattern=pattern,
+                    watermark=None,
+                    safety_buffer_seconds=safety_buffer_seconds,
+                )
+                for f in files:
+                    if latest is None or f.modification_time > latest.modification_time:
+                        latest = f
+        return latest
 
     @available
     def update_checkpoint(
@@ -910,6 +964,7 @@ class ScopeAdapter(BaseAdapter):
         delta_location: str,
         safety_buffer_seconds: int = DEFAULT_SAFETY_BUFFER_SECONDS,
         starting_timestamp: str | None = None,
+        starting_timestamp_fallback_to_latest: bool = False,
     ) -> bool:
         """Are there unprocessed files at the source?"""
         files = self.discover_files(
@@ -919,6 +974,7 @@ class ScopeAdapter(BaseAdapter):
             delta_location=delta_location,
             safety_buffer_seconds=safety_buffer_seconds,
             starting_timestamp=starting_timestamp,
+            starting_timestamp_fallback_to_latest=starting_timestamp_fallback_to_latest,
         )
         return len(files) > 0
 

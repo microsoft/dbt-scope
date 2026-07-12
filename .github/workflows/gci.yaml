@@ -30,39 +30,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: "🔐 Start IMDS Relay Router"
-        env:
-          IMDS_RELAY_URL: ${{ secrets.IMDS_RELAY_URL }}
-          IMDS_RELAY_SENDER_KEY: ${{ secrets.IMDS_RELAY_SENDER_KEY }}
-          IMDS_SUBSCRIPTION_ID: ${{ env.UAMI_SUBSCRIPTION }}
-        run: |
-          set -euo pipefail
-          nohup python3 .github/scripts/imds_relay_router.py > /tmp/imds-router.log 2>&1 &
-          echo "IMDS_ROUTER_PID=$!" >> "$GITHUB_ENV"
-          for i in $(seq 1 10); do
-            curl -sf http://localhost:${IMDS_ROUTER_PORT}/healthz > /dev/null 2>&1 && break
-            [ "$i" -eq 10 ] && { cat /tmp/imds-router.log; exit 1; }
-            sleep 1
-          done
-
-      - name: "🔐 Verify IMDS Relay Router"
-        run: |
-          set -euo pipefail
-          SUB=$(curl -sf -H "Metadata: true" "$IMDS_METADATA_ENDPOINT" | jq -r '.compute.subscriptionId')
-          [[ "$SUB" == "$UAMI_SUBSCRIPTION" ]] || { echo "subscriptionId mismatch: expected '$UAMI_SUBSCRIPTION', got '$SUB'"; exit 1; }
-
-      - name: "🔐 Az Login with Fake UAMI"
-        run: |
-          set -euo pipefail
-          for attempt in $(seq 1 25); do
-            if az login --identity --client-id "$UAMI_CLIENT_ID" > /dev/null 2>&1; then
-              exit 0
-            fi
-            echo "az login attempt ${attempt}/25 failed; retrying in 1s" >&2
-            sleep 1
-          done
-          echo "az login still failing; final attempt (errors shown):" >&2
-          az login --identity --client-id "$UAMI_CLIENT_ID"
+      - uses: ./.github/actions/auth
+        with:
+          imds-relay-url: ${{ secrets.IMDS_RELAY_URL }}
+          imds-relay-sender-key: ${{ secrets.IMDS_RELAY_SENDER_KEY }}
 
       - name: "⚙️ Bootstrap Dev Environment"
         run: |
@@ -123,12 +94,11 @@ jobs:
           set -euo pipefail
           .scripts/run.sh integration-test
 
-      - name: "📦 Upload failure logs"
-        if: failure()
+      - name: "📦 Upload logs"
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: failure-logs
-          path: |
-            /tmp/imds-router.log
-            .logs/
+          name: gci-logs
+          path: .logs/
+          if-no-files-found: warn
           retention-days: 7

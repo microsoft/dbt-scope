@@ -1,0 +1,64 @@
+name: "CI auth & runner setup"
+description: >-
+  Shared CI bootstrap: starts the IMDS relay router and logs in with the fake UAMI.
+
+inputs:
+  imds-relay-url:
+    description: "Azure Relay URL for the IMDS relay router (secrets.IMDS_RELAY_URL)."
+    required: true
+  imds-relay-sender-key:
+    description: "Azure Relay sender key for the IMDS relay router (secrets.IMDS_RELAY_SENDER_KEY)."
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: "🔐 Start IMDS Relay Router"
+      shell: bash
+      env:
+        IMDS_RELAY_URL: ${{ inputs.imds-relay-url }}
+        IMDS_RELAY_SENDER_KEY: ${{ inputs.imds-relay-sender-key }}
+      run: |
+        set -euo pipefail
+        export IMDS_SUBSCRIPTION_ID="$UAMI_SUBSCRIPTION"
+        mkdir -p .logs
+        nohup python3 .github/scripts/imds_relay_router.py > .logs/imds-relay-router.stdout.log 2>&1 &
+        echo "IMDS_ROUTER_PID=$!" >> "$GITHUB_ENV"
+        router_pid=$!
+        dump_logs() {
+          echo "----- .logs/imds-relay-router.log -----"
+          cat .logs/imds-relay-router.log 2>/dev/null || true
+          echo "----- .logs/imds-relay-router.stdout.log -----"
+          cat .logs/imds-relay-router.stdout.log 2>/dev/null || true
+        }
+        for i in $(seq 1 10); do
+          if ! kill -0 "$router_pid" 2>/dev/null; then
+            echo "IMDS relay router exited during startup (failed validation)." >&2
+            dump_logs
+            exit 1
+          fi
+          curl -sf http://localhost:${IMDS_ROUTER_PORT}/healthz > /dev/null 2>&1 && break
+          [ "$i" -eq 10 ] && { dump_logs; exit 1; }
+          sleep 1
+        done
+
+    - name: "🔐 Verify IMDS Relay Router"
+      shell: bash
+      run: |
+        set -euo pipefail
+        SUB=$(curl -sf -H "Metadata: true" "$IMDS_METADATA_ENDPOINT" | jq -r '.compute.subscriptionId')
+        [[ "$SUB" == "$UAMI_SUBSCRIPTION" ]] || { echo "subscriptionId mismatch: expected '$UAMI_SUBSCRIPTION', got '$SUB'"; exit 1; }
+
+    - name: "🔐 Az Login with Fake UAMI"
+      shell: bash
+      run: |
+        set -euo pipefail
+        for attempt in $(seq 1 25); do
+          if az login --identity --client-id "$UAMI_CLIENT_ID" > /dev/null 2>&1; then
+            exit 0
+          fi
+          echo "az login attempt ${attempt}/25 failed; retrying in 1s" >&2
+          sleep 1
+        done
+        echo "az login still failing; final attempt (errors shown):" >&2
+        az login --identity --client-id "$UAMI_CLIENT_ID"
