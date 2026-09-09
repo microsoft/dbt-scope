@@ -66,6 +66,13 @@ DEFAULT_JOB_RETRY_RULES: tuple[RetryRule, ...] = (
             "eviction). Our own run's jobs are excluded from eviction separately "
         ),
     ),
+    RetryRule(
+        name="internal_server_error",
+        pattern=r"Internal Server Error. Please try again.*",
+        description=(
+            "Transient internal server error from the SCOPE service."
+        ),
+    ),
 )
 
 
