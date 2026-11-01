@@ -33,6 +33,13 @@ hash -r
 command -v az >/dev/null || { echo "Native Linux Azure CLI installation failed." >&2; exit 1; }
 command -v uv >/dev/null || { echo "uv installation failed." >&2; exit 1; }
 
+# Service-launched jobs do not read the user's shell profile.
+for tool in uv uvx; do
+    if [[ -x "$HOME/.local/bin/$tool" && ! -e "/usr/local/bin/$tool" ]]; then
+        sudo ln -s "$HOME/.local/bin/$tool" "/usr/local/bin/$tool"
+    fi
+done
+
 cd "$REPO_ROOT"
 uv sync --extra dev
 
