@@ -1,54 +1,49 @@
 #!/bin/bash
-#
-#
-#       Bootstraps a Linux dev environment idempotently.
-#       Layers developer tools on top of the CI environment.
-#       If your Devbox restarts, rerun this script.
-#
-# ---------------------------------------------------------------------------------------
-#
-set -e
+# Prepare the existing Linux checkout; also used by GCI on a normal Linux runner.
+set -euo pipefail
 
 is_wsl() {
-    [[ "${WSL_DISTRO_NAME:-}" == Ubuntu* ]]
+    [[ "${IS_GH_ACTION:-0}" != "1" ]] && {
+        [[ "${WSL_DISTRO_NAME:-}" == Ubuntu* ]] || grep -qi microsoft /proc/sys/kernel/osrelease
+    }
 }
 
-REPO_ROOT=$(git rev-parse --show-toplevel)
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-PACKAGES=""
-if ! command -v jq &> /dev/null; then PACKAGES="jq"; fi
-if ! command -v python3 &> /dev/null; then PACKAGES="${PACKAGES:+$PACKAGES }python3"; fi
-if ! command -v pip &> /dev/null; then PACKAGES="${PACKAGES:+$PACKAGES }python3-pip"; fi
-if is_wsl && ! command -v gh &> /dev/null; then PACKAGES="${PACKAGES:+$PACKAGES }gh"; fi
-if [ -n "$PACKAGES" ]; then
-    echo "Installing packages from apt, this will take a couple minutes: $PACKAGES"
-    sudo apt-get update > /dev/null 2>&1
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y $PACKAGES > /dev/null 2>&1
-fi
-command -v az &> /dev/null || curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash > /dev/null 2>&1
-command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+# WSL inherits Windows executables that do not install tools into the Linux environment.
+export PATH="$HOME/.local/bin:$(printf '%s' "$PATH" | tr ':' '\n' | grep -vE '^/mnt/[a-zA-Z]/' | paste -sd: -)"
 
-[[ ":$PATH:" != *":$HOME/.local/bin:"* ]] && export PATH="$PATH:$HOME/.local/bin" || true
-if [ -f "$HOME/.local/bin/uv" ] && [ ! -f /usr/local/bin/uv ]; then
-    sudo ln -sf "$HOME/.local/bin/uv" /usr/local/bin/uv
-    sudo ln -sf "$HOME/.local/bin/uvx" /usr/local/bin/uvx 2>/dev/null || true
+packages=()
+command -v curl >/dev/null || packages+=(curl ca-certificates)
+command -v jq >/dev/null || packages+=(jq)
+command -v python3 >/dev/null || packages+=(python3)
+if is_wsl && ! command -v gh >/dev/null; then packages+=(gh); fi
+if ((${#packages[@]})); then
+    sudo apt-get update -qq
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
 fi
+
+if ! command -v az >/dev/null; then
+    curl -fsSL https://aka.ms/InstallAzureCLIDeb | sudo bash
+fi
+if ! command -v uv >/dev/null; then
+    curl -fsSL https://astral.sh/uv/install.sh | sh
+fi
+hash -r
+command -v az >/dev/null || { echo "Native Linux Azure CLI installation failed." >&2; exit 1; }
+command -v uv >/dev/null || { echo "uv installation failed." >&2; exit 1; }
 
 cd "$REPO_ROOT"
-uv sync --all-groups
-[ -f .venv/bin/activate ] && source .venv/bin/activate
+uv sync --extra dev
 
-if is_wsl && command -v code &> /dev/null; then
-    echo "Installing VS Code extensions..."
-    code --install-extension ms-python.python                # Python
-    code --install-extension ms-python.vscode-pylance        # IntelliSense
-    code --install-extension ms-vscode-remote.remote-wsl     # WSL
+if is_wsl; then
+    if command -v code >/dev/null; then
+        code --install-extension ms-python.python
+        code --install-extension ms-vscode-remote.remote-wsl
+    fi
+    if ! command -v copilot >/dev/null; then
+        curl -fsSL https://gh.io/copilot-install | bash
+    fi
 fi
 
-if is_wsl && ! command -v copilot &> /dev/null; then
-    echo "Installing GitHub Copilot CLI..."
-    curl -fsSL https://gh.io/copilot-install | bash
-fi
-
-echo ""
-echo "Dev environment ready"
+echo "Dev environment ready: $REPO_ROOT"

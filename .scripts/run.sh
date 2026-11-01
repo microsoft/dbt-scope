@@ -62,9 +62,12 @@ load_env_file() {
         echo -e "\033[33m         cp .env.example .env\033[0m"
         return
     fi
+    local env_contents
+    # Windows-authored files are synced unchanged; strip only CRLF endings in memory.
+    env_contents="$(sed 's/\r$//' "$env_file")"
     set -a
     # shellcheck disable=SC1090
-    source "$env_file"
+    source /dev/stdin <<< "$env_contents"
     set +a
 }
 

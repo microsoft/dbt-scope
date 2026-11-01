@@ -1,0 +1,22 @@
+version: '3'
+
+vars:
+  DISTRO: Ubuntu-24.04
+  REPO: /workspaces/dbt-scope
+
+tasks:
+  default:
+    desc: Recreate WSL, clone the current branch, then prepare the workspace
+    platforms: [windows]
+    dir: '{{.TASKFILE_DIR}}'
+    cmds:
+      - pwsh -NoProfile -NonInteractive -File bootstrap-dev-env.ps1
+      - task: up
+
+  up:
+    desc: Prepare the existing WSL checkout and open VS Code without resetting work
+    platforms: [windows]
+    dir: '{{.TASKFILE_DIR}}'
+    cmds:
+      - wsl -d {{.DISTRO}} --cd {{.REPO}} --exec bash ./.scripts/bootstrap-dev-env.sh
+      - code --folder-uri 'vscode-remote://wsl+{{.DISTRO}}{{.REPO}}'

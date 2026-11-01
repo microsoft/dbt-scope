@@ -1,65 +1,64 @@
 # Contributing to dbt-scope
 
-## Prerequisites
+## One-shot Windows setup
 
-1. Windows pre-reqs
+Use an elevated PowerShell 7 terminal with Git for Windows (including Git Credential Manager),
+VS Code, WSL, and [Task](https://taskfile.dev/installation/) installed. Clone this repo on Windows
+and check out a branch that has been pushed to origin. Git must be able to read it without a prompt.
 
-   > ⚠️ Warning: this removes your WSL machine and recreates it fresh.
+> **Warning:** the default task deletes and recreates **Ubuntu-24.04**. Use `up` to preserve an
+> existing workspace. Other installed WSL distros are not unregistered.
 
-   ```powershell
-   $GIT_ROOT = git rev-parse --show-toplevel
-   & "$GIT_ROOT\.scripts\bootstrap-dev-env.ps1"
-   ```
+```powershell
+$GIT_ROOT = git rev-parse --show-toplevel
+task --taskfile "$GIT_ROOT\.scripts\bootstrap-dev-env.yaml"
+```
 
-2. Clone the repo, and open VSCode in it:
+This creates the Linux user without first-run prompts, clones the selected Windows branch into
+`/workspaces/dbt-scope`, installs the Linux tools and development dependencies, and opens VS Code
+in WSL. There is no devcontainer. The PowerShell script also accepts `-Branch` and `-LinuxUser`
+when invoked directly; the Taskfile runs the Linux setup afterward.
 
-   ```bash
-   cd ~/
-   
-   read -p "Enter your name (e.g. 'FirstName LastName'): " user_name
-   read -p "Enter your github email (e.g. 'your-github-alias@blah.com'): " user_email
-   read -p "Enter the branch to switch to: (e.g. 'main') " branch_name
-    
-   git clone https://github.com/microsoft/dbt-scope.git
-   
-   git config --global user.name "$user_name"
-   git config --global user.email "$user_email"
-   
-   cd dbt-scope/
+After a restart, or to refresh dependencies without deleting the checkout:
 
-   git pull origin
-   git checkout "$branch_name"
-   code .
-   ```
+```powershell
+task --taskfile "$GIT_ROOT\.scripts\bootstrap-dev-env.yaml" up
+```
 
-3. Run the bootstrapper script, which installs all tools idempotently:
+`up` does not reset files, switch branches, or reclone the repository.
 
-   ```bash
-   GIT_ROOT=$(git rev-parse --show-toplevel)
-   chmod +x ${GIT_ROOT}/.scripts/bootstrap-dev-env.sh && ${GIT_ROOT}/.scripts/bootstrap-dev-env.sh
-   source ~/.bashrc
-   ```
+## Linux and CI setup
 
-4. Login to github and make sure to authorize `Microsoft`:
+The same Linux script works in an existing checkout, including a non-WSL CI runner:
 
-   ```bash
-   gh auth login
-   ```
+```bash
+bash .scripts/bootstrap-dev-env.sh
+export PATH="$HOME/.local/bin:$PATH"
+```
 
-5. Install recommended developer tooling (optional):
+It installs native Linux Azure CLI and uv as needed and runs `uv sync --extra dev`.
+Setup does not log in to Azure, read `.env`, run cloud tests, or publish a wheel.
+GitHub Copilot CLI and VS Code extensions are installed when applicable in WSL.
 
-   ```bash
-   curl -fsSL https://gh.io/copilot-install | bash
-   $HOME/.local/bin/copilot --yolo
-   ```
+For manual development, sign in with `gh auth login` and authorize the Microsoft organization
+before pushing. Copy `.env.example` to `.env` and fill in the values before cloud tests, then
+authenticate with Azure CLI. Never commit `.env`.
 
-6. Take `.env.example` and fill out `.env`
+When driven by repo-bootstrapper, place `.env` in its gitignored `sync/dbt-scope/` directory.
+The service syncs it into `/workspaces/dbt-scope/.env` and sets up the configured GitHub identity
+after the Taskfile completes. Relay-based Azure authentication, when used, is separate from
+bootstrapping, as it is in `.github/actions/auth`.
+The dev/test entry point accepts either LF or Windows CRLF line endings in `.env` without
+rewriting the file.
 
 ## Quick start
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh  # one-time install for uv
-.scripts/run.sh all                              # uv venv, sync, build, lint, unit-test, debug, integration-test
+bash .scripts/bootstrap-dev-env.sh
+export PATH="$HOME/.local/bin:$PATH"
+.scripts/run.sh build
+.scripts/run.sh lint
+.scripts/run.sh unit-test
 ```
 
 ## Dev script
@@ -75,14 +74,20 @@ All development tasks go through a single entry-point — [`.scripts/run.sh`](.s
 | `venv`             | Create a fresh uv-managed `.venv`               | No     |
 | `install`          | `uv sync --extra dev`                           | No     |
 | `build`            | Build wheel to `dist/`                          | No     |
+| `upload`           | Build and publish wheel to the existing static site | Yes |
 | `lint`             | `ruff check + format --check`                   | No     |
 | `fix`              | `ruff auto-fix + format`                        | No     |
 | `unit-test`        | `pytest tests/unit/` (fast, no credentials)     | No     |
 | `debug`            | `dbt debug` against test project                | Yes    |
 | `integration-test` | `pytest tests/integration/` (datagen + dbt run) | Yes    |
-| `all`              | All of the above in sequence                    | Yes    |
+| `all`              | Includes upload as well as local and cloud checks | Yes |
 
 Each target is idempotent — auto-creates the uv-managed `.venv` and syncs deps if missing.
+
+Publishing is explicit: `.scripts/run.sh upload` uses Azure CLI authentication to upload the
+current version to `arcdataciadomisc/$web/whls/`, overwriting the same wheel filename.
+Do not use `all` for a non-publishing validation run: it also invokes `upload`.
+Neither bootstrap task publishes.
 
 ## Running tests
 
