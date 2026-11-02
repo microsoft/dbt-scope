@@ -31,6 +31,7 @@ As a result of this conscious design decision, the adapter **does not** encourag
 - **Clean SQL models** — write `SELECT ... FROM @data`; macros generate `EXTRACT`, `INSERT INTO`
 - **File-based incremental** — the adapter lists source files on ADLS Gen1, filters by watermark, and processes batches bounded by `max_files_per_trigger` and `max_bytes_per_trigger` per SCOPE job. Uses `append` strategy — dbt calls the macro once per `dbt run`, no date-range orchestration needed - this is very similar to Apache Spark [Microbatch based structured streaming](https://spark.apache.org/docs/latest/streaming/getting-started.html)
 - **Watermark checkpoint** — progress is tracked in `_checkpoint/watermark.json` alongside `_delta_log/`. Re-runs automatically skip already-processed files; full refresh resets the checkpoint
+- **Crash recovery** — every batch commit carries a batch token, so after a crash or kill the next run checkpoints batches that landed in Delta instead of ingesting them twice (see [Crash recovery](#crash-recovery))
 - **Sources audit trail** — per-batch JSONL diffs record which files were processed. Configurable compaction (parquet snapshots) and retention keep the checkpoint directory bounded - similar once again to Spark structured streaming.
 - **Virtual file metadata** — `source_file_uri`, `source_file_length`, `source_file_created`, `source_file_modified` columns map to `FILE.*()` functions, giving each row lineage back to its source file
 - **Declarative table properties** — compression, checkpoint intervals via `scope_settings`
@@ -53,14 +54,26 @@ The **safety buffer** (`safety_buffer_seconds`, default 30) skips files modified
 
 ### Checkpoint lifecycle
 
-After each successful SCOPE job:
+Before each SCOPE job, `_checkpoint/pending.json` records the batch: its files, the watermark and Delta version before it, and a new batch token. After each successful SCOPE job:
 
-1. **Watermark updated** — `_checkpoint/watermark.json` records `{version, modifiedTime, batchId}`
+1. **Watermark updated** — `_checkpoint/watermark.json` records `{version, modifiedTime, batchId, deltaVersion}`, where `deltaVersion` is the Delta commit of the batch, and `pending.json` is deleted
 2. **Sources recorded** — a JSONL diff in `_checkpoint/sources/{batchId}` lists every file processed in that batch
 3. **Compaction** — every `source_compaction_interval` batches, a parquet snapshot is written containing all history (latest snapshot + JSONL diffs since + current batch). All files persist on disk — **compaction never deletes anything**
 4. **Retention** — `source_retention_files` caps the total number of files in `_checkpoint/sources/`, deleting the oldest first. This is the **only** mechanism that removes files
 
-On **full refresh**, the checkpoint is deleted before processing begins. The adapter re-discovers all files and starts fresh at `batch_id=0`.
+On **full refresh**, the checkpoint (including `pending.json`) is deleted before processing begins. The adapter re-discovers all files and starts fresh at `batch_id=0`.
+
+### Crash recovery
+
+Every SCOPE script sets the batch token as the `dbt_scope.batch_token` table property, merged with `scope_settings`. ScopeEngine writes the property change and the `INSERT` in the same Delta commit, so a commit carrying the token proves the batch landed.
+
+At the start of every model, before discovery, the adapter reconciles the checkpoint with the Delta log:
+
+1. **Orphaned jobs** — ADLA jobs of this model (`job_tag`) left by earlier runs are cancelled, and the adapter waits until they end. If one has not ended after 10 minutes, the model fails instead of risking a duplicate commit; the next run tries again.
+2. **Pending batch** — if a ScopeEngine commit after the recorded Delta version carries the token, or the latest table properties do once those commits are checkpointed away, the batch's files are checkpointed without resubmitting. Otherwise `pending.json` is discarded and the files are processed again. A pending batch whose starting watermark no longer matches is discarded.
+3. **Unrecorded commits** — other ScopeEngine commits after `deltaVersion`, such as those of a job that finished after dbt was killed, are matched to unprocessed source files through their `source_file_uri` values, and those files are checkpointed. The watermark only advances over the oldest contiguous run of matched files, so a gap can cause re-ingestion but never data loss. Without a `source_file_uri` column, the adapter logs a warning and those files may be ingested again. Commits from other engines (e.g. Spark `OPTIMIZE`) are ignored.
+
+Checkpoints written by earlier versions of the adapter migrate automatically. When `watermark.json` has no `deltaVersion`, ScopeEngine commits newer than the file's last-modified time are treated as unrecorded commits (step 3), and `deltaVersion` is written from then on.
 
 ### What each SCOPE job does
 
@@ -87,7 +100,7 @@ flowchart TB
 
     subgraph Checkpoint["_checkpoint/ (ADLS Gen2)"]
         direction TB
-        WM["📄 watermark.json<br/><i>{version, modifiedTime, batchId}</i>"]
+        WM["📄 watermark.json<br/><i>{version, modifiedTime, batchId, deltaVersion}</i>"]
         SRC["📂 sources/<br/>0 (JSONL) · 1 (JSONL) · 10.parquet"]
     end
 
@@ -359,7 +372,7 @@ WHERE edition == "Standard"
 | `delta_table_columns`        | `[]`                                   | Delta table schema (CREATE TABLE). List of `{name, type}` dicts. Adding a column triggers automatic [schema evolution](#schema-evolution)                                              |
 | `extract_columns`            | `[]`                                   | Source file columns (EXTRACT). List of `{name, type}` dicts                                                                                                                            |
 | `partition_by`               | —                                      | Single column name or list of columns for Delta table partitioning                                                                                                                     |
-| `scope_settings`             | `{}`                                   | Delta table properties passed to `ALTER TABLE SET TBLPROPERTIES` (e.g. compression, checkpoint intervals)                                                                              |
+| `scope_settings`             | `{}`                                   | Delta table properties passed to `ALTER TABLE SET TBLPROPERTIES` (e.g. compression, checkpoint intervals), together with `dbt_scope.batch_token`                                       |
 | `au`                         | from profile                           | Per-model ADLA Analytics Units (parallelism) override                                                                                                                                  |
 | `priority`                   | from profile                           | Per-model ADLA job priority override                                                                                                                                                   |
 | `job_timeout_seconds`        | from profile                           | Per-model job timeout override (seconds)                                                                                                                                               |
@@ -488,9 +501,11 @@ outputs:
 
 **Caveats:**
 
-- `SIGKILL` is uncatchable at the OS level — no Python handler can run. The existing `cancel_orphaned_jobs` cleanup (runs at the start of every new `dbt run` per model) is the safety net for that case: orphaned jobs from previous runs are cancelled before submitting a new one.
+- `SIGKILL` is uncatchable at the OS level — no Python handler can run. [Crash recovery](#crash-recovery) at the start of the next run of each model is the safety net: orphaned jobs are cancelled and awaited, and batches they committed are checkpointed.
 - On Windows, `SIGTERM` is not delivered the same way as on POSIX; `SIGINT` (Ctrl+C) works.
-- Only jobs submitted by the **current** Python process are tracked — orphans from earlier `dbt run` invocations are handled by `cancel_orphaned_jobs`, not by this shutdown hook.
+- Only jobs submitted by the **current** Python process are tracked — orphans from earlier `dbt run` invocations are handled by crash recovery, not by this shutdown hook.
+
+A job the adapter gives up on (a fatal poll error or a timeout) is cancelled first, so it cannot commit after the run stops tracking it. With `dbt run --fail-fast`, the first failure also cancels every other in-flight job, and no new jobs or retries start for the rest of the run.
 
 ## Contributing
 

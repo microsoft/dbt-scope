@@ -14,14 +14,16 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from azure.core.exceptions import ResourceNotFoundError
 
-from dbt.adapters.scope.checkpoint import CheckpointManager, Watermark
+from dbt.adapters.scope.checkpoint import CheckpointManager, PendingBatch, Watermark
 
 # ---------------------------------------------------------------------------
 # In-memory ADLS Gen2 filesystem mock
 # ---------------------------------------------------------------------------
 
 DELTA_LOC = "abfss://testcontainer@teststorage.dfs.core.windows.net/delta/lifecycle_test"
+PENDING_KEY = "delta/lifecycle_test/_checkpoint/pending.json"
 
 
 class _DownloadStream:
@@ -46,7 +48,7 @@ class InMemoryFileClient:
 
     def download_file(self) -> _DownloadStream:
         if self._path not in self._store:
-            raise FileNotFoundError(self._path)
+            raise ResourceNotFoundError(self._path)
         return _DownloadStream(self._store[self._path])
 
     def delete_file(self) -> None:
@@ -393,6 +395,48 @@ class TestCheckpointLifecycle:
         assert wm_new is not None
         assert wm_new.batch_id == 0
         assert "0" in checkpoint_mgr.list_source_files(DELTA_LOC)
+
+    def test_pending_batch_roundtrip(self, checkpoint_mgr, adls_store):
+        assert checkpoint_mgr.read_pending(DELTA_LOC) is None
+        pending = PendingBatch(
+            token="tok",
+            batch_id=0,
+            run_id="run",
+            job_name="lifecycle_incremental_batch_1_of_1_files_2",
+            files=[("/shares/a.ss", 1000), ("/shares/b.ss", 2000)],
+            watermark_before=None,
+            delta_version_before=-1,
+        )
+        checkpoint_mgr.write_pending(DELTA_LOC, pending)
+
+        assert PENDING_KEY in adls_store
+        assert checkpoint_mgr.read_pending(DELTA_LOC) == pending
+
+        checkpoint_mgr.delete_pending(DELTA_LOC)
+        assert checkpoint_mgr.read_pending(DELTA_LOC) is None
+        checkpoint_mgr.delete_pending(DELTA_LOC, strict=True)
+
+    def test_full_refresh_deletes_pending_batch(self, checkpoint_mgr, adls_store):
+        checkpoint_mgr.write_watermark(
+            DELTA_LOC, Watermark(version=1, modified_time="2026-04-01T00:00:00+00:00", batch_id=1)
+        )
+        checkpoint_mgr.write_pending(
+            DELTA_LOC,
+            PendingBatch(
+                token="tok",
+                batch_id=2,
+                run_id="run",
+                job_name="job",
+                files=[("/shares/a.ss", 1000)],
+                watermark_before=None,
+                delta_version_before=3,
+            ),
+        )
+
+        checkpoint_mgr.delete_watermark(DELTA_LOC)
+
+        assert PENDING_KEY not in adls_store
+        assert checkpoint_mgr.read_watermark(DELTA_LOC, strict=True) is None
 
     def test_aggressive_retention_lifecycle(self, checkpoint_mgr, adls_store):
         """Simulate the aggressive_retention model: 7 batches, compaction_interval=1,

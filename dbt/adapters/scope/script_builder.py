@@ -16,7 +16,7 @@ from typing import Any
 from dbt.adapters.events.logging import AdapterLogger
 from dbt_common.exceptions import DbtRuntimeError
 
-from dbt.adapters.scope.checkpoint import VIRTUAL_COLUMNS
+from dbt.adapters.scope.checkpoint import BATCH_TOKEN_PROPERTY, VIRTUAL_COLUMNS
 from dbt.adapters.scope.constants import (
     DEFAULT_DELTA_LAKE_COMMIT_CONDITION,
     DEFAULT_MAX_BYTES_PER_TRIGGER,
@@ -73,6 +73,9 @@ class ScriptConfig:
     # Table properties (declarative)
     scope_settings: dict[str, Any] = field(default_factory=dict)
 
+    # Per-batch token stamped into the Delta commit (see ``checkpoint.BATCH_TOKEN_PROPERTY``)
+    batch_token: str | None = None
+
     # Feature previews
     feature_previews: str = "EnableDeltaTableDynamicInsert:on"
 
@@ -118,7 +121,7 @@ class ScriptBuilder:
         Steps:
           1. SET feature previews
           2. CREATE TABLE IF NOT EXISTS ... OPTIONS (LAYOUT = DELTA)
-          3. ALTER TABLE SET TBLPROPERTIES (if scope_settings present)
+          3. ALTER TABLE SET TBLPROPERTIES (scope_settings + batch token, if any)
           4. DELETE all existing data
           5. EXTRACT from explicit file list
           6. INSERT INTO target from user's SELECT
@@ -138,8 +141,8 @@ class ScriptBuilder:
         )
         parts.append(_declare_paths(delta_loc))
         parts.append(_create_table(config.delta_columns, config.partition_by, "@deltaPath"))
-        if config.scope_settings:
-            parts.append(_alter_table_properties(config.scope_settings))
+        if table_properties := _table_properties(config):
+            parts.append(_alter_table_properties(table_properties))
 
         parts.append(_delete_all_rows())
         parts.append(_extract_from_files(config.extract_columns, config.source_files))
@@ -159,7 +162,7 @@ class ScriptBuilder:
         Steps:
           1. SET feature previews + DeltaLakeCommitCondition
           2. CREATE TABLE IF NOT EXISTS
-          3. ALTER TABLE SET TBLPROPERTIES
+          3. ALTER TABLE SET TBLPROPERTIES (scope_settings + batch token, if any)
           4. EXTRACT from explicit file list
           5. INSERT INTO target from user's SELECT
         """
@@ -183,8 +186,8 @@ class ScriptBuilder:
         )
         parts.append(_declare_paths(delta_loc))
         parts.append(_create_table(config.delta_columns, config.partition_by, "@deltaPath"))
-        if config.scope_settings:
-            parts.append(_alter_table_properties(config.scope_settings))
+        if table_properties := _table_properties(config):
+            parts.append(_alter_table_properties(table_properties))
         parts.append(_extract_from_files(config.extract_columns, config.source_files))
         parts.append(_model_transform_and_insert(model_sql, config.delta_columns))
 
@@ -287,6 +290,13 @@ def _create_table(
     parts.append(f"LOCATION {location_var}")
     parts.append("OPTIONS (LAYOUT = DELTA);\n")
     return "\n".join(parts)
+
+
+def _table_properties(config: ScriptConfig) -> dict[str, Any]:
+    properties = dict(config.scope_settings)
+    if config.batch_token:
+        properties[BATCH_TOKEN_PROPERTY] = config.batch_token
+    return properties
 
 
 def _alter_table_properties(settings: dict[str, Any]) -> str:

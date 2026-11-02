@@ -44,6 +44,11 @@
     {# -- Register model name for orphan cancellation + related metadata -- #}
     {% do adapter.set_next_job_model_name(job_identifier) %}
 
+    {# -- Settle jobs left running by earlier runs before anything is written -- #}
+    {% do adapter.reconcile_checkpoint(
+        delta_location, source_roots, source_patterns, job_identifier, safety_buffer_seconds, source_compaction_interval, source_retention_files
+    ) %}
+
     {# -- Batching loop: discover → submit → checkpoint → repeat -- #}
     {# NOTE: file_batch MUST live in the namespace — see incremental.sql for details. #}
     {%- set ns = namespace(
@@ -70,6 +75,10 @@
                 {%- set ns.batch_num = ns.batch_num + 1 -%}
                 {%- set ns.total_files = ns.total_files + ns.file_batch | length -%}
 
+                {%- set job_suffix = "full-refresh_batch_" ~ ns.batch_num ~ "_of_" ~ total_batches ~ "_files_" ~ ns.file_batch | length -%}
+                {%- set job_name = job_identifier ~ "_" ~ job_suffix -%}
+                {%- set batch_properties = adapter.begin_batch(delta_location, ns.file_batch, job_name) -%}
+
                 {%- set scope_script = scope__build_file_based_script(
                     identifier,
                     delta_location,
@@ -83,13 +92,13 @@
                     is_full_refresh=(ns.batch_num == 1),
                     delta_lake_commit_condition=delta_lake_commit_condition,
                     max_file_count_per_output_file_set=max_file_count_per_output_file_set,
-                    evolve_columns=evolve_columns
+                    evolve_columns=evolve_columns,
+                    batch_properties=batch_properties
                 ) -%}
 
                 {{ log("SCOPE: full-refresh " ~ identifier ~ " batch " ~ ns.batch_num ~ " of " ~ total_batches ~ " (" ~ ns.file_batch | length ~ " files)", info=True) }}
 
-                {%- set job_suffix = "full-refresh_batch_" ~ ns.batch_num ~ "_of_" ~ total_batches ~ "_files_" ~ ns.file_batch | length -%}
-                {% do adapter.set_next_job_name(job_identifier ~ "_" ~ job_suffix) %}
+                {% do adapter.set_next_job_name(job_name) %}
                 {% if config.get('au') %}{% do adapter.set_next_job_au(config.get('au') | int) %}{% endif %}
                 {% if config.get('priority') %}{% do adapter.set_next_job_priority(config.get('priority') | int) %}{% endif %}
                 {% if config.get('job_timeout_seconds') %}{% do adapter.set_next_job_timeout_seconds(config.get('job_timeout_seconds') | int) %}{% endif %}
@@ -130,7 +139,8 @@
     is_incremental=false,
     delta_lake_commit_condition="FailIfFileConflict",
     max_file_count_per_output_file_set=5000,
-    evolve_columns=[]
+    evolve_columns=[],
+    batch_properties={}
 ) %}
 {# -- Normalize partition_by to a list -- #}
 {%- set partition_cols = partition_by if partition_by is iterable and partition_by is not string else ([partition_by] if partition_by else []) -%}
@@ -160,10 +170,13 @@ PARTITIONED BY ({{ partition_cols | join(', ') }})
 LOCATION @deltaPath
 OPTIONS (LAYOUT = DELTA);
 
-{# -- ALTER TABLE SET TBLPROPERTIES (declarative) -- #}
-{%- if scope_settings %}
+{# -- ALTER TABLE SET TBLPROPERTIES: scope_settings + the batch token that identifies this commit -- #}
+{%- set table_properties = {} -%}
+{%- do table_properties.update(scope_settings or {}) -%}
+{%- do table_properties.update(batch_properties or {}) -%}
+{%- if table_properties %}
 ALTER TABLE @target SET TBLPROPERTIES (
-{%- for key, value in scope_settings.items() %}
+{%- for key, value in table_properties.items() %}
     "{{ key }}" = {{ scope__quote_property(value) }}{{ "," if not loop.last }}
 {%- endfor %}
 );
