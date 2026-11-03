@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from contextlib import contextmanager
+from datetime import timedelta
 from unittest.mock import MagicMock, call, patch
 from urllib.parse import quote as url_quote
 
@@ -11,8 +12,10 @@ import pytest
 import requests.exceptions
 from dbt_common.exceptions import DbtDatabaseError, DbtRuntimeError
 
+from dbt.adapters.scope.checkpoint import TableOwner
 from dbt.adapters.scope.connections import (
     _UUID_NAMESPACE,
+    ModelSupersededError,
     ScopeConnectionHandle,
     ScopeConnectionManager,
     _cancelled_job_ids,
@@ -23,20 +26,25 @@ from dbt.adapters.scope.message_retry import MessageRetryPolicy
 
 # A minimal non-comment SCOPE script that won't be skipped by execute()
 _DUMMY_SCRIPT = '// SCOPE script\nSET @@FeaturePreviews = "EnableDeltaTableDynamicInsert:on";'
+_LOC = "abfss://c@a.dfs.core.windows.net/d/events"
 
 
 @pytest.fixture(autouse=True)
 def _reset_class_state():
     """Reset class-level state between tests."""
     old_run_id = ScopeConnectionHandle._run_id
+    old_run_started_at = ScopeConnectionHandle._run_started_at
     old_cancelled = ScopeConnectionHandle._cancelled_models.copy()
+    old_claimed = dict(ScopeConnectionHandle._claimed_tables)
     old_cancelled_jobs = set(_cancelled_job_ids)
     old_confirmed_jobs = set(_confirmed_cancelled_job_ids)
     _shutdown_event.clear()
     yield
     _shutdown_event.clear()
     ScopeConnectionHandle._run_id = old_run_id
+    ScopeConnectionHandle._run_started_at = old_run_started_at
     ScopeConnectionHandle._cancelled_models = old_cancelled
+    ScopeConnectionHandle._claimed_tables = old_claimed
     _cancelled_job_ids.clear()
     _cancelled_job_ids.update(old_cancelled_jobs)
     _confirmed_cancelled_job_ids.clear()
@@ -72,13 +80,17 @@ class TestRunId:
 
     def test_start_new_run_rotates_run_id_and_resets_cancelled_models(self):
         previous = ScopeConnectionHandle._run_id
+        previous_start = ScopeConnectionHandle._run_started_at
         ScopeConnectionHandle._cancelled_models.add("events_daily")
+        ScopeConnectionHandle._claimed_tables["events_daily"] = _LOC
 
         ScopeConnectionHandle.start_new_run()
 
         assert ScopeConnectionHandle._run_id != previous
         uuid.UUID(ScopeConnectionHandle._run_id)
+        assert ScopeConnectionHandle._run_started_at >= previous_start
         assert ScopeConnectionHandle._cancelled_models == set()
+        assert ScopeConnectionHandle._claimed_tables == {}
 
 
 class TestPipelineId:
@@ -513,6 +525,128 @@ class TestSettleOrphanedJobs:
         handle.cancel_job_async.assert_not_called()
 
 
+def _newer_run() -> TableOwner:
+    started = ScopeConnectionHandle._run_started_at + timedelta(minutes=5)
+    return TableOwner(run_id="newer-run", run_started_at=started)
+
+
+class TestTableOwnership:
+    """A run submits jobs only for tables it owns; a run that started later takes them over."""
+
+    def _claimed_handle(self, *owners: TableOwner | None) -> ScopeConnectionHandle:
+        handle = _make_handle()
+        handle._get_token = MagicMock(return_value="fake-token")
+        handle._checkpoint_manager = MagicMock()
+        handle._checkpoint_manager.read_owner.side_effect = list(owners)
+        ScopeConnectionHandle._claimed_tables["events"] = _LOC
+        return handle
+
+    def test_claims_the_table_before_settling_orphans(self):
+        handle = _make_handle()
+        steps = MagicMock()
+        steps.claim_owner.side_effect = lambda location, claimant: claimant
+        steps.settle_orphaned_jobs.return_value = ["job-1"]
+        handle._checkpoint_manager = steps
+        handle.settle_orphaned_jobs = steps.settle_orphaned_jobs
+
+        assert handle.claim_table("events", _LOC) == ["job-1"]
+
+        assert steps.mock_calls == [
+            call.claim_owner(_LOC, ScopeConnectionHandle.run_owner()),
+            call.settle_orphaned_jobs("events"),
+        ]
+        assert ScopeConnectionHandle._claimed_tables == {"events": _LOC}
+
+    def test_older_run_neither_claims_nor_settles(self):
+        handle = _make_handle()
+        handle._checkpoint_manager = MagicMock()
+        handle._checkpoint_manager.claim_owner.return_value = _newer_run()
+        handle.settle_orphaned_jobs = MagicMock()
+
+        with pytest.raises(ModelSupersededError, match="newer-run"):
+            handle.claim_table("events", _LOC)
+
+        handle.settle_orphaned_jobs.assert_not_called()
+        assert "events" not in ScopeConnectionHandle._claimed_tables
+
+    def test_does_not_submit_once_the_table_was_taken_over(self):
+        handle = self._claimed_handle(_newer_run())
+        handle._request = MagicMock()
+
+        with pytest.raises(ModelSupersededError, match="taken over by dbt run newer-run"):
+            handle.submit_and_wait(
+                name="events_incremental_batch_1_of_1_files_2",
+                script="// script",
+                au=10,
+                priority=1,
+                model_name="events",
+            )
+        handle._request.assert_not_called()
+
+    def test_unreadable_owner_blocks_submission(self):
+        handle = self._claimed_handle()
+        handle._checkpoint_manager.read_owner.side_effect = ValueError("invalid owner.json")
+        handle._request = MagicMock()
+
+        with pytest.raises(ModelSupersededError, match="unreadable"):
+            handle.submit_and_wait(
+                name="events_incremental_batch_1_of_1_files_2",
+                script="// script",
+                au=10,
+                priority=1,
+                model_name="events",
+            )
+        handle._request.assert_not_called()
+
+    def test_cancels_its_job_when_taken_over_during_submission(self):
+        handle = self._claimed_handle(ScopeConnectionHandle.run_owner(), _newer_run())
+        submitted: list[str] = []
+
+        def fake_request(method, url, **kwargs):
+            if method == "PUT":
+                submitted.append(kwargs["json"]["jobId"])
+                return {"state": "Running"}
+            if method == "POST":
+                return {}
+            return {"state": "Ended", "result": "Cancelled"}
+
+        handle._request = MagicMock(side_effect=fake_request)
+
+        with (
+            patch("dbt.adapters.scope.connections.time.sleep"),
+            pytest.raises(ModelSupersededError),
+        ):
+            handle.submit_and_wait(
+                name="events_incremental_batch_1_of_1_files_2",
+                script="// script",
+                au=10,
+                priority=1,
+                poll_interval=0,
+                model_name="events",
+            )
+        methods = [c.args[0] for c in handle._request.call_args_list]
+        assert methods.count("PUT") == 1
+        assert methods.count("POST") == 1
+        assert submitted[0] in _confirmed_cancelled_job_ids
+
+    def test_unclaimed_models_are_not_checked(self):
+        handle = self._claimed_handle()
+        handle._request = MagicMock(
+            side_effect=lambda method, url, **kwargs: {"state": "Ended", "result": "Succeeded"}
+        )
+
+        job = handle.submit_and_wait(
+            name="other_incremental_batch_1_of_1_files_2",
+            script="// script",
+            au=10,
+            priority=1,
+            model_name="other",
+        )
+
+        assert job.succeeded
+        handle._checkpoint_manager.read_owner.assert_not_called()
+
+
 # =====================================================================
 # Integration: execute() triggers orphan cancellation
 # =====================================================================
@@ -629,6 +763,10 @@ _VERTEX_TIMEOUT_FAILURE = (
     "GrapheneJniException: Failed to open stream dms://x/y_0_0 with error Operation timed out"
 )
 _FATAL_FAILURE = "SCOPE job 'm' (abc) failed: E_USER_ERROR: syntax error near 'SELECT'"
+_CANCELLED_BY_NEWER_RUN_FAILURE = (
+    "SCOPE job 'm_incremental_batch_1_of_1_files_6' (96a99e9e) failed: "
+    "Job cancelled by user someSpn-app@SPI through ADL FE"
+)
 
 
 class TestExecuteJobRetry:
@@ -720,6 +858,20 @@ class TestExecuteJobRetry:
         ):
             mgr.execute(_DUMMY_SCRIPT)
         assert handle.submit_and_wait.call_count == 1
+
+    def test_superseded_run_does_not_resubmit_its_cancelled_job(self):
+        mgr, handle = self._manager(
+            submit_side_effect=[
+                DbtDatabaseError(_CANCELLED_BY_NEWER_RUN_FAILURE),
+                ModelSupersededError("Model 'm' was taken over by dbt run newer-run"),
+            ]
+        )
+        with (
+            patch("dbt.adapters.scope.message_retry.time.sleep"),
+            pytest.raises(DbtDatabaseError, match="taken over by dbt run newer-run"),
+        ):
+            mgr.execute(_DUMMY_SCRIPT)
+        assert handle.submit_and_wait.call_count == 2
 
 
 # =====================================================================

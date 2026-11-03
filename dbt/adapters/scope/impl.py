@@ -820,6 +820,7 @@ class ScopeAdapter(BaseAdapter):
                 f"begin_batch: {len(missing)} file(s) were not returned by discover_files: "
                 f"{missing[:5]}"
             )
+        self._ensure_table_owner()
         checkpoint = self._get_checkpoint_manager()
         watermark = checkpoint.read_watermark(delta_location, strict=True)
         pending = PendingBatch(
@@ -857,6 +858,7 @@ class ScopeAdapter(BaseAdapter):
         Also writes per-batch JSONL to ``_checkpoint/sources/{batch_id}``,
         triggers compaction at interval boundaries, and enforces retention.
         """
+        self._ensure_table_owner()
         gen1 = self._get_gen1_client()
         checkpoint = self._get_checkpoint_manager()
 
@@ -1001,8 +1003,9 @@ class ScopeAdapter(BaseAdapter):
     ) -> None:
         """Bring the checkpoint in line with the Delta table before the model's first batch.
 
-        1. Cancels this model's jobs left by other runs and waits until they end, so
-           nothing commits while the table is inspected.
+        1. Claims the table for this run (``ModelSupersededError`` if a newer run owns
+           it), then cancels this model's jobs left by other runs and waits until they
+           end, so nothing commits while the table is inspected.
         2. Resolves ``pending.json``: checkpoints its files if the batch token is in a
            Delta commit, otherwise discards it.
         3. Adopts ScopeEngine commits after the checkpoint's Delta version (or, for
@@ -1012,7 +1015,7 @@ class ScopeAdapter(BaseAdapter):
         """
         connection = self.connections.get_thread_connection()
         handle: ScopeConnectionHandle = connection.handle  # type: ignore[assignment]
-        handle.settle_orphaned_jobs(model_name)
+        handle.claim_table(model_name, delta_location)
 
         checkpoint = self._get_checkpoint_manager()
         client = self._get_delta_client()
@@ -1453,6 +1456,11 @@ class ScopeAdapter(BaseAdapter):
                 message_retry_policy=MessageRetryPolicy.from_credentials(creds),
             )
         return self._checkpoint_manager
+
+    def _ensure_table_owner(self) -> None:
+        connection = self.connections.get_thread_connection()
+        handle: ScopeConnectionHandle = connection.handle  # type: ignore[assignment]
+        handle.ensure_table_owner(handle._next_job_model_name)
 
     def _get_file_tracker(self) -> FileTracker:
         """Return the file tracker singleton."""

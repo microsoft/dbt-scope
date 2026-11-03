@@ -11,7 +11,7 @@ from dbt_common.exceptions import DbtRuntimeError
 
 from dbt.adapters.scope.adls_gen1_client import FileInfo
 from dbt.adapters.scope.checkpoint import BATCH_TOKEN_PROPERTY, PendingBatch, Watermark
-from dbt.adapters.scope.connections import ScopeConnectionHandle
+from dbt.adapters.scope.connections import ModelSupersededError, ScopeConnectionHandle
 from dbt.adapters.scope.delta_lake import DeltaCommit
 from dbt.adapters.scope.file_tracker import FileTracker
 from dbt.adapters.scope.impl import (
@@ -280,6 +280,20 @@ class TestBeginBatch:
             adapter.begin_batch(LOC, [FILES[0].path], "job")
         assert checkpoint.pending is None
 
+    def test_refuses_once_the_table_was_taken_over(self):
+        checkpoint = FakeCheckpoint()
+        adapter = _adapter(checkpoint, FakeDeltaClient(), FILES)
+        adapter._discovered_file_infos = {FILES[0].path: FILES[0]}
+        handle = _handle(adapter)
+        handle._next_job_model_name = MODEL
+        handle.ensure_table_owner.side_effect = ModelSupersededError("taken over")
+
+        with pytest.raises(ModelSupersededError):
+            adapter.begin_batch(LOC, [FILES[0].path], "job")
+
+        handle.ensure_table_owner.assert_called_once_with(MODEL)
+        assert checkpoint.pending is None
+
 
 class TestUpdateCheckpoint:
     def _begin(self, delta: FakeDeltaClient) -> tuple[ScopeAdapter, FakeCheckpoint, str]:
@@ -327,19 +341,30 @@ class TestUpdateCheckpoint:
         assert checkpoint.watermark.delta_version is None
         assert checkpoint.pending is None
 
+    def test_refuses_once_the_table_was_taken_over(self):
+        delta = FakeDeltaClient(_commit(5))
+        adapter, checkpoint, token = self._begin(delta)
+        delta.add(_commit(6, token=token, parquet=("part-6.parquet",)))
+        _handle(adapter).ensure_table_owner.side_effect = ModelSupersededError("taken over")
+
+        with pytest.raises(ModelSupersededError):
+            self._update(adapter)
+
+        assert checkpoint.watermark.delta_version == 5
+        assert checkpoint.batches == []
+        assert checkpoint.pending is not None
+
 
 class TestReconcilePending:
-    def test_settles_orphaned_jobs_before_reading_the_checkpoint(self):
+    def test_claims_the_table_before_reading_the_checkpoint(self):
         checkpoint = FakeCheckpoint(_watermark_after(FILES[:1], delta_version=5))
         adapter = _adapter(checkpoint, FakeDeltaClient(_commit(5)), FILES)
-        _handle(adapter).settle_orphaned_jobs.side_effect = DbtRuntimeError(
-            "did not end within 600s"
-        )
+        _handle(adapter).claim_table.side_effect = DbtRuntimeError("did not end within 600s")
 
         with pytest.raises(DbtRuntimeError, match="did not end"):
             _reconcile(adapter)
 
-        _handle(adapter).settle_orphaned_jobs.assert_called_once_with(MODEL)
+        _handle(adapter).claim_table.assert_called_once_with(MODEL, LOC)
         assert checkpoint.reads == 0
 
     def test_committed_pending_batch_is_checkpointed(self):
@@ -585,7 +610,7 @@ class TestLegacyCheckpointMigration:
 
         _reconcile(adapter)
 
-        _handle(adapter).settle_orphaned_jobs.assert_called_once_with(MODEL)
+        _handle(adapter).claim_table.assert_called_once_with(MODEL, LOC)
         assert checkpoint.watermark is None
         assert delta.columns_read == []
 

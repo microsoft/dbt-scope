@@ -9,6 +9,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, ClassVar
 from urllib.parse import quote as url_quote
 
@@ -25,8 +26,9 @@ from dbt_common.exceptions import DbtDatabaseError, DbtRuntimeError
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from dbt.adapters.scope.checkpoint import CheckpointManager, TableOwner
 from dbt.adapters.scope.credentials import ScopeCredentials
-from dbt.adapters.scope.delta_lake import build_credential
+from dbt.adapters.scope.delta_lake import RetryPolicy, build_credential
 from dbt.adapters.scope.message_retry import MessageRetryPolicy, retry_on_message
 from dbt.adapters.scope.quota_eviction import QuotaEvictionPolicy, retry_with_quota_eviction
 
@@ -51,6 +53,10 @@ def _model_job_name_pattern(model_name: str) -> re.Pattern[str]:
     Prevents model ``foo`` from matching jobs of model ``foo_bar``.
     """
     return re.compile(rf"^{re.escape(model_name)}_(?:full-refresh_|incremental_)?batch_\d+(?:_|$)")
+
+
+class ModelSupersededError(DbtRuntimeError):
+    """This run no longer owns the model's Delta table, so it must not write to it."""
 
 
 # ---------------------------------------------------------------------------
@@ -209,15 +215,25 @@ class ScopeConnectionHandle:
     # Identifies the current dbt invocation; shared across all connections/threads so
     # that every job submitted in one run carries the same runId.
     _run_id: ClassVar[str] = str(uuid.uuid4())
+    _run_started_at: ClassVar[datetime] = datetime.now(timezone.utc)
 
     # Models whose orphaned jobs have already been cancelled in this run.
     _cancelled_models: ClassVar[set[str]] = set()
+
+    # Delta locations of the models whose table this run has claimed, by model name.
+    _claimed_tables: ClassVar[dict[str, str]] = {}
 
     @classmethod
     def start_new_run(cls) -> None:
         """Begin a new dbt invocation; jobs from earlier invocations become orphans."""
         cls._run_id = str(uuid.uuid4())
+        cls._run_started_at = datetime.now(timezone.utc)
         cls._cancelled_models = set()
+        cls._claimed_tables = {}
+
+    @classmethod
+    def run_owner(cls) -> TableOwner:
+        return TableOwner(run_id=cls._run_id, run_started_at=cls._run_started_at)
 
     def __init__(self, credentials: ScopeCredentials) -> None:
         self._credentials = credentials
@@ -229,6 +245,11 @@ class ScopeConnectionHandle:
         self._message_retry_policy = MessageRetryPolicy.from_credentials(credentials)
         self._job_retry_policy = MessageRetryPolicy.for_job_retry(credentials)
         self._quota_eviction_policy = QuotaEvictionPolicy.from_credentials(credentials)
+        self._checkpoint_manager = CheckpointManager(
+            credential=self._credential,
+            retry_policy=RetryPolicy.from_http_retries(credentials.http_retries),
+            message_retry_policy=self._message_retry_policy,
+        )
         self._cached_token: str | None = None
         self._token_expires_at: float = 0
         self._next_job_name: str | None = None
@@ -502,6 +523,44 @@ class ScopeConnectionHandle:
         ScopeConnectionHandle._cancelled_models.add(model_name)
         return settled
 
+    def claim_table(self, model_name: str, delta_location: str) -> list[str]:
+        """Take ``model_name``'s Delta table over for this run, then settle orphaned jobs.
+
+        Raises ``ModelSupersededError`` when a run that started later owns the table.
+        The claim is written before orphaned jobs are listed, and every job submission
+        re-reads it (``ensure_table_owner``), so a job of an earlier run is either
+        settled here or cancelled by that run itself. Returns the settled job IDs.
+        """
+        owner = self._checkpoint_manager.claim_owner(delta_location, self.run_owner())
+        if owner.run_id != ScopeConnectionHandle._run_id:
+            raise ModelSupersededError(
+                f"Model '{model_name}' is owned by a newer dbt run {owner.run_id} (started "
+                f"{owner.run_started_at.isoformat()}); this run "
+                f"{ScopeConnectionHandle._run_id} leaves {delta_location} alone"
+            )
+        ScopeConnectionHandle._claimed_tables[model_name] = delta_location
+        return self.settle_orphaned_jobs(model_name)
+
+    def ensure_table_owner(self, model_name: str | None) -> None:
+        """Raise ``ModelSupersededError`` if another run took over a table this run claimed."""
+        delta_location = ScopeConnectionHandle._claimed_tables.get(model_name or "")
+        if delta_location is None:
+            return
+        try:
+            owner = self._checkpoint_manager.read_owner(delta_location)
+        except ValueError as exc:
+            raise ModelSupersededError(
+                f"Model '{model_name}': the owner of {delta_location} is unreadable, so another "
+                f"dbt run may be taking it over; this run {ScopeConnectionHandle._run_id} "
+                f"stops writing to it ({exc})"
+            ) from exc
+        if owner is not None and owner.run_id != ScopeConnectionHandle._run_id:
+            raise ModelSupersededError(
+                f"Model '{model_name}' was taken over by dbt run {owner.run_id} (started "
+                f"{owner.run_started_at.isoformat()}); this run "
+                f"{ScopeConnectionHandle._run_id} stops writing to {delta_location}"
+            )
+
     # Maximum consecutive poll failures before giving up
     _MAX_CONSECUTIVE_POLL_FAILURES = 5
 
@@ -524,7 +583,12 @@ class ScopeConnectionHandle:
         method calls ``cancel_job`` for its own job (blocking up to
         ``wait_on_cancel_seconds`` for terminal state) and raises
         ``DbtRuntimeError``.
+
+        For a model whose table this run claimed, ownership is checked before the
+        job is submitted and again once it exists; if the table was taken over, the
+        job is not submitted, or is cancelled, and ``ModelSupersededError`` is raised.
         """
+        self.ensure_table_owner(model_name)
         job = self.submit_job(name, script, au, priority, model_name=model_name)
         _register_active_job(
             _ActiveJobEntry(
@@ -541,6 +605,7 @@ class ScopeConnectionHandle:
             consecutive_failures = 0
 
             try:
+                self.ensure_table_owner(model_name)
                 while not job.is_terminal:
                     if _shutdown_event.is_set():
                         if job.job_id not in _cancelled_job_ids:

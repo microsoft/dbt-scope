@@ -24,6 +24,11 @@ Sources JSONL (one line per processed file)::
 checkpointed (see :class:`PendingBatch`). Each batch stamps its token into the
 Delta commit as the ``dbt_scope.batch_token`` table property, which lets the
 next run tell whether that batch committed.
+
+``_checkpoint/owner.json`` names the dbt run that owns the table (see
+:class:`TableOwner`)::
+
+    {"runId": "6f1c...", "runStartedAt": "2026-11-02T00:26:58.123456+00:00"}
 """
 
 from __future__ import annotations
@@ -33,8 +38,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from azure.core import MatchConditions
 from azure.core.credentials import TokenCredential
-from azure.core.exceptions import ResourceNotFoundError
+from azure.core.exceptions import (
+    ResourceExistsError,
+    ResourceModifiedError,
+    ResourceNotFoundError,
+)
 from azure.identity import CredentialUnavailableError
 from azure.storage.filedatalake import DataLakeServiceClient
 from dbt.adapters.events.logging import AdapterLogger
@@ -47,7 +57,9 @@ log = AdapterLogger("scope")
 _CHECKPOINT_DIR = "_checkpoint"
 _WATERMARK_FILE = "watermark.json"
 _PENDING_FILE = "pending.json"
+_OWNER_FILE = "owner.json"
 _SOURCES_DIR = "sources"
+_OWNER_CLAIM_ATTEMPTS = 5
 
 BATCH_TOKEN_PROPERTY = "dbt_scope.batch_token"
 PENDING_SCHEMA_VERSION = 1
@@ -199,6 +211,50 @@ class PendingBatch:
             created_at=data.get("createdAt", ""),
             schema_version=data.get("schemaVersion", PENDING_SCHEMA_VERSION),
         )
+
+
+@dataclass(frozen=True)
+class TableOwner:
+    """The dbt run allowed to submit batch jobs for a table and write its checkpoint.
+
+    Runs are ranked by start time, then run ID: a run that started later takes a
+    table over from an earlier one, never the reverse.
+    """
+
+    run_id: str
+    run_started_at: datetime
+
+    def outranks(self, other: TableOwner) -> bool:
+        return (self.run_started_at, self.run_id) > (other.run_started_at, other.run_id)
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {"runId": self.run_id, "runStartedAt": self.run_started_at.isoformat()}, indent=2
+        )
+
+    @classmethod
+    def from_json(cls, raw: str) -> TableOwner:
+        """Parse ``owner.json``; raises ``ValueError`` when it is not a valid record."""
+        try:
+            data = json.loads(raw)
+            owner = cls(
+                run_id=str(data["runId"]),
+                run_started_at=datetime.fromisoformat(data["runStartedAt"]),
+            )
+        except (KeyError, TypeError) as exc:
+            raise ValueError(f"invalid {_OWNER_FILE}: {exc!r}") from exc
+        if owner.run_started_at.tzinfo is None:
+            raise ValueError(f"invalid {_OWNER_FILE}: runStartedAt has no timezone")
+        return owner
+
+
+def _download_text(file_client: Any) -> tuple[str | None, str | None]:
+    """Return ``(content, etag)`` of a file, or ``(None, None)`` if it does not exist."""
+    try:
+        download = file_client.download_file()
+    except ResourceNotFoundError:
+        return None, None
+    return download.readall().decode("utf-8"), download.properties.etag
 
 
 def _get_service(parsed: AbfssLocation, credential: TokenCredential) -> DataLakeServiceClient:
@@ -427,6 +483,75 @@ class CheckpointManager:
             if strict:
                 raise
             log.warning(f"delete_pending failed for {delta_location}: {exc}")
+
+    # -- Table owner -------------------------------------------------------
+
+    def read_owner(self, delta_location: str) -> TableOwner | None:
+        """Read ``_checkpoint/owner.json``; ``None`` if no run has claimed the table.
+
+        Raises ``ValueError`` when the file is not a valid record, which is also what a
+        reader sees while another run is rewriting it.
+        """
+        parsed = AbfssLocation.parse(delta_location)
+        if parsed is None:
+            raise ValueError(f"read_owner: invalid delta_location: {delta_location}")
+
+        def _read() -> str | None:
+            service = _get_service(parsed, self._credential)
+            fs = service.get_file_system_client(parsed.container)
+            return _download_text(fs.get_file_client(_checkpoint_file(parsed, _OWNER_FILE)))[0]
+
+        raw = self._retry(_read, label=f"checkpoint.read_owner {delta_location}")
+        return None if raw is None else TableOwner.from_json(raw)
+
+    def claim_owner(self, delta_location: str, claimant: TableOwner) -> TableOwner:
+        """Make *claimant* the table's owner unless a run that outranks it already is.
+
+        Returns the owner after the call: *claimant*, or the run that keeps the table.
+        The write is conditional on the ETag that was read (or on the file being absent),
+        so two runs claiming at once cannot both win.
+        """
+        parsed = AbfssLocation.parse(delta_location)
+        if parsed is None:
+            raise ValueError(f"claim_owner: invalid delta_location: {delta_location}")
+        data = claimant.to_json().encode("utf-8")
+
+        def _claim() -> TableOwner:
+            service = _get_service(parsed, self._credential)
+            fs = service.get_file_system_client(parsed.container)
+            file_client = fs.get_file_client(_checkpoint_file(parsed, _OWNER_FILE))
+            for _ in range(_OWNER_CLAIM_ATTEMPTS):
+                raw, etag = _download_text(file_client)
+                current: TableOwner | None = None
+                if raw is not None:
+                    try:
+                        current = TableOwner.from_json(raw)
+                    except ValueError as exc:
+                        log.debug(f"Replacing unreadable {_OWNER_FILE} of {delta_location}: {exc}")
+                if current is not None and (current == claimant or current.outranks(claimant)):
+                    return current
+                try:
+                    if etag is None:
+                        fs.get_directory_client(_checkpoint_dir(parsed)).create_directory()
+                        file_client.upload_data(
+                            data, overwrite=True, match_condition=MatchConditions.IfMissing
+                        )
+                    else:
+                        file_client.upload_data(
+                            data,
+                            overwrite=True,
+                            etag=etag,
+                            match_condition=MatchConditions.IfNotModified,
+                        )
+                except (ResourceExistsError, ResourceModifiedError):
+                    continue
+                return claimant
+            raise RuntimeError(
+                f"Could not claim {delta_location}: {_OWNER_FILE} changed during each of "
+                f"{_OWNER_CLAIM_ATTEMPTS} attempts"
+            )
+
+        return self._retry(_claim, label=f"checkpoint.claim_owner {delta_location}")
 
     # -- Sources -----------------------------------------------------------
 

@@ -69,11 +69,19 @@ Every SCOPE script sets the batch token as the `dbt_scope.batch_token` table pro
 
 At the start of every model, before discovery, the adapter reconciles the checkpoint with the Delta log:
 
-1. **Orphaned jobs** — ADLA jobs of this model (`job_tag`) left by earlier runs are cancelled, and the adapter waits until they end. If one has not ended after 10 minutes, the model fails instead of risking a duplicate commit; the next run tries again.
+1. **Table owner and orphaned jobs** — the run claims the table in `_checkpoint/owner.json` (`{runId, runStartedAt}`), then cancels ADLA jobs of this model (`job_tag`) left by earlier runs and waits until they end. If one has not ended after 10 minutes, the model fails instead of risking a duplicate commit; the next run tries again.
 2. **Pending batch** — if a ScopeEngine commit after the recorded Delta version carries the token, or the latest table properties do once those commits are checkpointed away, the batch's files are checkpointed without resubmitting. Otherwise `pending.json` is discarded and the files are processed again. A pending batch whose starting watermark no longer matches is discarded.
 3. **Unrecorded commits** — other ScopeEngine commits after `deltaVersion`, such as those of a job that finished after dbt was killed, are matched to unprocessed source files through their `source_file_uri` values, and those files are checkpointed. The watermark only advances over the oldest contiguous run of matched files, so a gap can cause re-ingestion but never data loss. Without a `source_file_uri` column, the adapter logs a warning and those files may be ingested again. Commits from other engines (e.g. Spark `OPTIMIZE`) are ignored.
 
 Checkpoints written by earlier versions of the adapter migrate automatically. When `watermark.json` has no `deltaVersion`, ScopeEngine commits newer than the file's last-modified time are treated as unrecorded commits (step 3), and `deltaVersion` is written from then on.
+
+### Superseded runs
+
+A run that started later always takes a table over; an earlier run never takes it back. Runs are ranked by start time, then run ID, and the claim is a conditional write on the ETag of `owner.json`, so two runs claiming at once cannot both win.
+
+An earlier run can still be alive, for example a dbt process that outlived its cancelled notebook session. It re-reads the owner before writing `pending.json`, before and right after submitting each job, and before advancing the watermark. Once its table has been taken over, it cancels its own job and fails the model with `ModelSupersededError`, which is never retried, so it cannot commit a batch the newer run is also processing.
+
+Runs are ranked by the clock of the host that started them. If a host's clock was ahead, its runs outrank later runs from other hosts until the clock catches up; delete `_checkpoint/owner.json` to let the next run claim the table.
 
 ### What each SCOPE job does
 
@@ -215,7 +223,8 @@ that times out opening a DMS stream) or are cancelled by an external actor. The
 adapter re-submits the job when the terminal error message matches a known-transient
 rule, using a capped exponential backoff (`job_retry_initial_wait_seconds` →
 `job_retry_max_wait_seconds`) up to `job_retry_max_attempts`. A non-matching failure
-(e.g. a SCOPE compilation error) is **not** retried.
+(e.g. a SCOPE compilation error) is **not** retried, and neither is a job of a run whose
+table was taken over by a newer run (see [Superseded runs](#superseded-runs)).
 
 Rules are a curated, growable RegEx data structure (`DEFAULT_JOB_RETRY_RULES` in
 `dbt/adapters/scope/message_retry.py`). The built-in seed set covers:
