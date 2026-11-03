@@ -4,32 +4,51 @@ from __future__ import annotations
 
 import uuid
 from contextlib import contextmanager
+from datetime import timedelta
 from unittest.mock import MagicMock, call, patch
 from urllib.parse import quote as url_quote
 
 import pytest
 import requests.exceptions
-from dbt_common.exceptions import DbtDatabaseError
+from dbt_common.exceptions import DbtDatabaseError, DbtRuntimeError
 
+from dbt.adapters.scope.checkpoint import TableOwner
 from dbt.adapters.scope.connections import (
     _UUID_NAMESPACE,
+    ModelSupersededError,
     ScopeConnectionHandle,
     ScopeConnectionManager,
+    _cancelled_job_ids,
+    _confirmed_cancelled_job_ids,
+    _shutdown_event,
 )
 from dbt.adapters.scope.message_retry import MessageRetryPolicy
 
 # A minimal non-comment SCOPE script that won't be skipped by execute()
 _DUMMY_SCRIPT = '// SCOPE script\nSET @@FeaturePreviews = "EnableDeltaTableDynamicInsert:on";'
+_LOC = "abfss://c@a.dfs.core.windows.net/d/events"
 
 
 @pytest.fixture(autouse=True)
 def _reset_class_state():
     """Reset class-level state between tests."""
     old_run_id = ScopeConnectionHandle._run_id
+    old_run_started_at = ScopeConnectionHandle._run_started_at
     old_cancelled = ScopeConnectionHandle._cancelled_models.copy()
+    old_claimed = dict(ScopeConnectionHandle._claimed_tables)
+    old_cancelled_jobs = set(_cancelled_job_ids)
+    old_confirmed_jobs = set(_confirmed_cancelled_job_ids)
+    _shutdown_event.clear()
     yield
+    _shutdown_event.clear()
     ScopeConnectionHandle._run_id = old_run_id
+    ScopeConnectionHandle._run_started_at = old_run_started_at
     ScopeConnectionHandle._cancelled_models = old_cancelled
+    ScopeConnectionHandle._claimed_tables = old_claimed
+    _cancelled_job_ids.clear()
+    _cancelled_job_ids.update(old_cancelled_jobs)
+    _confirmed_cancelled_job_ids.clear()
+    _confirmed_cancelled_job_ids.update(old_confirmed_jobs)
 
 
 def _make_handle(account: str = "test-adla") -> ScopeConnectionHandle:
@@ -58,6 +77,20 @@ class TestRunId:
         h2 = _make_handle("acct-b")
         assert h1._run_id == h2._run_id
         assert h1._run_id is ScopeConnectionHandle._run_id
+
+    def test_start_new_run_rotates_run_id_and_resets_cancelled_models(self):
+        previous = ScopeConnectionHandle._run_id
+        previous_start = ScopeConnectionHandle._run_started_at
+        ScopeConnectionHandle._cancelled_models.add("events_daily")
+        ScopeConnectionHandle._claimed_tables["events_daily"] = _LOC
+
+        ScopeConnectionHandle.start_new_run()
+
+        assert ScopeConnectionHandle._run_id != previous
+        uuid.UUID(ScopeConnectionHandle._run_id)
+        assert ScopeConnectionHandle._run_started_at >= previous_start
+        assert ScopeConnectionHandle._cancelled_models == set()
+        assert ScopeConnectionHandle._claimed_tables == {}
 
 
 class TestPipelineId:
@@ -212,7 +245,7 @@ class TestCancelJob:
             ]
         )
 
-        handle.cancel_job("job-123", poll_interval=0)
+        assert handle.cancel_job("job-123", poll_interval=0) is True
 
         assert handle._request.call_count == 3
         # First call is the POST cancel
@@ -220,6 +253,7 @@ class TestCancelJob:
         # Remaining calls are GET polls
         assert handle._request.call_args_list[1].args[0] == "GET"
         assert handle._request.call_args_list[2].args[0] == "GET"
+        assert "job-123" in _confirmed_cancelled_job_ids
 
     def test_returns_immediately_if_already_ended(self):
         handle = _make_handle()
@@ -230,20 +264,37 @@ class TestCancelJob:
             ]
         )
 
-        handle.cancel_job("job-123", poll_interval=0)
+        assert handle.cancel_job("job-123", poll_interval=0) is True
 
         assert handle._request.call_count == 2
 
-    def test_times_out_gracefully(self):
+    def test_timeout_returns_false(self):
         handle = _make_handle()
-        # Never returns Ended
         handle._request = MagicMock(return_value={"state": "Finalizing", "result": None})
 
-        # Should not raise — just logs a warning and returns
-        handle.cancel_job("job-123", poll_interval=0, max_wait=0)
+        assert handle.cancel_job("job-123", poll_interval=0, max_wait=0) is False
 
-        # POST + at least one timeout check
         assert handle._request.call_count >= 1
+        assert "job-123" in _cancelled_job_ids
+        assert "job-123" not in _confirmed_cancelled_job_ids
+
+    def test_failed_cancel_request_on_ended_job_is_confirmed(self):
+        handle = _make_handle()
+        handle._request = MagicMock(
+            side_effect=[requests.exceptions.HTTPError("409"), {"state": "Ended"}]
+        )
+
+        assert handle.cancel_job("job-123", poll_interval=0) is True
+
+    def test_failed_cancel_request_on_running_job_raises(self):
+        handle = _make_handle()
+        handle._request = MagicMock(
+            side_effect=[requests.exceptions.HTTPError("500"), {"state": "Running"}]
+        )
+
+        with pytest.raises(requests.exceptions.HTTPError):
+            handle.cancel_job("job-123", poll_interval=0)
+        assert "job-123" not in _confirmed_cancelled_job_ids
 
 
 class TestCancelOrphanedJobs:
@@ -386,6 +437,215 @@ class TestCancelOrphanedJobs:
 
         assert cancelled == ["job-legacy"]
 
+    def test_ignores_jobs_of_models_sharing_the_name_prefix(self):
+        handle = _make_handle()
+        handle.list_jobs = MagicMock(
+            return_value=[
+                {"jobId": "own", "name": "events_incremental_batch_1_of_2_files_10"},
+                {"jobId": "other", "name": "events_daily_incremental_batch_1_of_1_files_3"},
+                {"jobId": "refresh", "name": "events_full-refresh_batch_2_of_2_files_1"},
+            ]
+        )
+        handle.cancel_job = MagicMock()
+
+        assert handle.cancel_orphaned_jobs("events") == ["own", "refresh"]
+
+
+class TestSettleOrphanedJobs:
+    """settle_orphaned_jobs cancels other runs' jobs and waits until they end."""
+
+    def _handle(self, jobs, states):
+        handle = _make_handle()
+        handle.list_jobs = MagicMock(return_value=jobs)
+        handle.cancel_job_async = MagicMock()
+        handle._request = MagicMock(side_effect=states)
+        return handle
+
+    def test_cancels_and_waits_until_terminal(self):
+        handle = self._handle(
+            [{"jobId": "job-1", "name": "events_incremental_batch_1_of_1_files_2"}],
+            [{"state": "Finalizing"}, {"state": "Ended", "result": "Cancelled"}],
+        )
+
+        with patch("dbt.adapters.scope.connections.time.sleep") as sleep_mock:
+            settled = handle.settle_orphaned_jobs("events", poll_interval=1)
+
+        assert settled == ["job-1"]
+        handle.cancel_job_async.assert_called_once_with("job-1")
+        sleep_mock.assert_called_once_with(1)
+        assert "job-1" in _confirmed_cancelled_job_ids
+        assert "events" in ScopeConnectionHandle._cancelled_models
+
+    def test_noop_without_orphans(self):
+        handle = self._handle([], [])
+
+        assert handle.settle_orphaned_jobs("events") == []
+        handle.cancel_job_async.assert_not_called()
+        handle._request.assert_not_called()
+
+    def test_raises_when_jobs_do_not_end_in_time(self):
+        handle = self._handle(
+            [{"jobId": "job-1", "name": "events_incremental_batch_1_of_1_files_2"}],
+            lambda *args, **kwargs: {"state": "Running"},
+        )
+
+        with pytest.raises(DbtRuntimeError, match="did not end within 0s"):
+            handle.settle_orphaned_jobs("events", max_wait=0, poll_interval=0)
+        assert "events" not in ScopeConnectionHandle._cancelled_models
+
+    def test_raises_when_jobs_cannot_be_listed(self):
+        handle = _make_handle()
+        handle.list_jobs = MagicMock(side_effect=requests.exceptions.ConnectionError("down"))
+
+        with pytest.raises(DbtRuntimeError, match="Cannot list ADLA jobs"):
+            handle.settle_orphaned_jobs("events")
+
+    def test_failed_cancel_request_still_waits_for_terminal_state(self):
+        handle = self._handle(
+            [{"jobId": "job-1", "name": "events_incremental_batch_1_of_1_files_2"}],
+            [{"state": "Ended", "result": "Succeeded"}],
+        )
+        handle.cancel_job_async.side_effect = requests.exceptions.HTTPError("409")
+
+        assert handle.settle_orphaned_jobs("events") == ["job-1"]
+
+    def test_skips_jobs_of_the_current_run(self):
+        handle = self._handle(
+            [
+                {
+                    "jobId": "sibling",
+                    "name": "events_incremental_batch_1_of_1_files_2",
+                    "related": {"runId": ScopeConnectionHandle._run_id},
+                }
+            ],
+            [],
+        )
+
+        assert handle.settle_orphaned_jobs("events") == []
+        handle.cancel_job_async.assert_not_called()
+
+
+def _newer_run() -> TableOwner:
+    started = ScopeConnectionHandle._run_started_at + timedelta(minutes=5)
+    return TableOwner(run_id="newer-run", run_started_at=started)
+
+
+class TestTableOwnership:
+    """A run submits jobs only for tables it owns; a run that started later takes them over."""
+
+    def _claimed_handle(self, *owners: TableOwner | None) -> ScopeConnectionHandle:
+        handle = _make_handle()
+        handle._get_token = MagicMock(return_value="fake-token")
+        handle._checkpoint_manager = MagicMock()
+        handle._checkpoint_manager.read_owner.side_effect = list(owners)
+        ScopeConnectionHandle._claimed_tables["events"] = _LOC
+        return handle
+
+    def test_claims_the_table_before_settling_orphans(self):
+        handle = _make_handle()
+        steps = MagicMock()
+        steps.claim_owner.side_effect = lambda location, claimant: claimant
+        steps.settle_orphaned_jobs.return_value = ["job-1"]
+        handle._checkpoint_manager = steps
+        handle.settle_orphaned_jobs = steps.settle_orphaned_jobs
+
+        assert handle.claim_table("events", _LOC) == ["job-1"]
+
+        assert steps.mock_calls == [
+            call.claim_owner(_LOC, ScopeConnectionHandle.run_owner()),
+            call.settle_orphaned_jobs("events"),
+        ]
+        assert ScopeConnectionHandle._claimed_tables == {"events": _LOC}
+
+    def test_older_run_neither_claims_nor_settles(self):
+        handle = _make_handle()
+        handle._checkpoint_manager = MagicMock()
+        handle._checkpoint_manager.claim_owner.return_value = _newer_run()
+        handle.settle_orphaned_jobs = MagicMock()
+
+        with pytest.raises(ModelSupersededError, match="newer-run"):
+            handle.claim_table("events", _LOC)
+
+        handle.settle_orphaned_jobs.assert_not_called()
+        assert "events" not in ScopeConnectionHandle._claimed_tables
+
+    def test_does_not_submit_once_the_table_was_taken_over(self):
+        handle = self._claimed_handle(_newer_run())
+        handle._request = MagicMock()
+
+        with pytest.raises(ModelSupersededError, match="taken over by dbt run newer-run"):
+            handle.submit_and_wait(
+                name="events_incremental_batch_1_of_1_files_2",
+                script="// script",
+                au=10,
+                priority=1,
+                model_name="events",
+            )
+        handle._request.assert_not_called()
+
+    def test_unreadable_owner_blocks_submission(self):
+        handle = self._claimed_handle()
+        handle._checkpoint_manager.read_owner.side_effect = ValueError("invalid owner.json")
+        handle._request = MagicMock()
+
+        with pytest.raises(ModelSupersededError, match="unreadable"):
+            handle.submit_and_wait(
+                name="events_incremental_batch_1_of_1_files_2",
+                script="// script",
+                au=10,
+                priority=1,
+                model_name="events",
+            )
+        handle._request.assert_not_called()
+
+    def test_cancels_its_job_when_taken_over_during_submission(self):
+        handle = self._claimed_handle(ScopeConnectionHandle.run_owner(), _newer_run())
+        submitted: list[str] = []
+
+        def fake_request(method, url, **kwargs):
+            if method == "PUT":
+                submitted.append(kwargs["json"]["jobId"])
+                return {"state": "Running"}
+            if method == "POST":
+                return {}
+            return {"state": "Ended", "result": "Cancelled"}
+
+        handle._request = MagicMock(side_effect=fake_request)
+
+        with (
+            patch("dbt.adapters.scope.connections.time.sleep"),
+            pytest.raises(ModelSupersededError),
+        ):
+            handle.submit_and_wait(
+                name="events_incremental_batch_1_of_1_files_2",
+                script="// script",
+                au=10,
+                priority=1,
+                poll_interval=0,
+                model_name="events",
+            )
+        methods = [c.args[0] for c in handle._request.call_args_list]
+        assert methods.count("PUT") == 1
+        assert methods.count("POST") == 1
+        assert submitted[0] in _confirmed_cancelled_job_ids
+
+    def test_unclaimed_models_are_not_checked(self):
+        handle = self._claimed_handle()
+        handle._request = MagicMock(
+            side_effect=lambda method, url, **kwargs: {"state": "Ended", "result": "Succeeded"}
+        )
+
+        job = handle.submit_and_wait(
+            name="other_incremental_batch_1_of_1_files_2",
+            script="// script",
+            au=10,
+            priority=1,
+            model_name="other",
+        )
+
+        assert job.succeeded
+        handle._checkpoint_manager.read_owner.assert_not_called()
+
 
 # =====================================================================
 # Integration: execute() triggers orphan cancellation
@@ -503,6 +763,10 @@ _VERTEX_TIMEOUT_FAILURE = (
     "GrapheneJniException: Failed to open stream dms://x/y_0_0 with error Operation timed out"
 )
 _FATAL_FAILURE = "SCOPE job 'm' (abc) failed: E_USER_ERROR: syntax error near 'SELECT'"
+_CANCELLED_BY_NEWER_RUN_FAILURE = (
+    "SCOPE job 'm_incremental_batch_1_of_1_files_6' (96a99e9e) failed: "
+    "Job cancelled by user someSpn-app@SPI through ADL FE"
+)
 
 
 class TestExecuteJobRetry:
@@ -582,6 +846,33 @@ class TestExecuteJobRetry:
         handle.cancel_orphaned_jobs.assert_called_once_with("events_daily")
         assert handle.submit_and_wait.call_count == 2
 
+    def test_does_not_retry_once_the_run_is_aborting(self):
+        def fail_and_abort(**kwargs):
+            _shutdown_event.set()
+            raise DbtDatabaseError(_VERTEX_TIMEOUT_FAILURE)
+
+        mgr, handle = self._manager(submit_side_effect=fail_and_abort)
+        with (
+            patch("dbt.adapters.scope.message_retry.time.sleep"),
+            pytest.raises(DbtDatabaseError, match="VertexManager"),
+        ):
+            mgr.execute(_DUMMY_SCRIPT)
+        assert handle.submit_and_wait.call_count == 1
+
+    def test_superseded_run_does_not_resubmit_its_cancelled_job(self):
+        mgr, handle = self._manager(
+            submit_side_effect=[
+                DbtDatabaseError(_CANCELLED_BY_NEWER_RUN_FAILURE),
+                ModelSupersededError("Model 'm' was taken over by dbt run newer-run"),
+            ]
+        )
+        with (
+            patch("dbt.adapters.scope.message_retry.time.sleep"),
+            pytest.raises(DbtDatabaseError, match="taken over by dbt run newer-run"),
+        ):
+            mgr.execute(_DUMMY_SCRIPT)
+        assert handle.submit_and_wait.call_count == 2
+
 
 # =====================================================================
 # Part D: Transient poll error resilience in submit_and_wait
@@ -640,26 +931,74 @@ class TestSubmitAndWaitTransientErrors:
         )
         assert job.succeeded
 
-    def test_consecutive_failures_exceed_threshold_raises(self):
-        """Exceeding _MAX_CONSECUTIVE_POLL_FAILURES consecutive errors raises."""
+    def test_consecutive_failures_exceed_threshold_cancels_job_and_raises(self):
+        """Exceeding _MAX_CONSECUTIVE_POLL_FAILURES cancels the job on ADLA, then raises."""
         handle = self._make_handle_with_submit()
-        call_count = 0
+        gets = 0
+        submitted: list[str] = []
 
         def fake_request(method, url, **kwargs):
-            nonlocal call_count
-            call_count += 1
+            nonlocal gets
+            if method == "PUT":
+                submitted.append(kwargs["json"]["jobId"])
+                return {"state": "Running"}
+            if method == "POST":
+                return {}
+            gets += 1
+            if gets <= handle._MAX_CONSECUTIVE_POLL_FAILURES:
+                raise requests.exceptions.ReadTimeout("Read timed out")
+            return {"state": "Ended", "result": "Cancelled"}
+
+        handle._request = MagicMock(side_effect=fake_request)
+
+        with (
+            patch("dbt.adapters.scope.connections.time.sleep"),
+            pytest.raises(DbtDatabaseError, match="poll failed"),
+        ):
+            handle.submit_and_wait(
+                name="test-job", script="// script", au=10, priority=1, poll_interval=0
+            )
+        methods = [c.args[0] for c in handle._request.call_args_list]
+        assert methods.count("POST") == 1
+        assert submitted[0] in _confirmed_cancelled_job_ids
+
+    def test_unconfirmed_cancel_after_poll_failures_raises(self):
+        handle = self._make_handle_with_submit()
+
+        def fake_request(method, url, **kwargs):
             if method == "PUT":
                 return {"state": "Running"}
             raise requests.exceptions.ReadTimeout("Read timed out")
 
         handle._request = MagicMock(side_effect=fake_request)
 
-        from dbt_common.exceptions import DbtDatabaseError
-
-        with pytest.raises(DbtDatabaseError, match="poll failed"):
+        with pytest.raises(DbtRuntimeError, match="cancellation was not confirmed"):
             handle.submit_and_wait(
                 name="test-job", script="// script", au=10, priority=1, poll_interval=0
             )
+
+    def test_job_that_succeeded_before_the_cancel_is_returned(self):
+        handle = self._make_handle_with_submit()
+        gets = 0
+
+        def fake_request(method, url, **kwargs):
+            nonlocal gets
+            if method == "PUT":
+                return {"state": "Running"}
+            if method == "POST":
+                return {}
+            gets += 1
+            if gets <= handle._MAX_CONSECUTIVE_POLL_FAILURES:
+                raise requests.exceptions.ConnectionError("Connection reset")
+            return {"state": "Ended", "result": "Succeeded"}
+
+        handle._request = MagicMock(side_effect=fake_request)
+
+        with patch("dbt.adapters.scope.connections.time.sleep"):
+            job = handle.submit_and_wait(
+                name="test-job", script="// script", au=10, priority=1, poll_interval=0
+            )
+        assert job.succeeded
 
     def test_counter_resets_on_successful_poll(self):
         """Consecutive failure counter resets after a successful poll."""

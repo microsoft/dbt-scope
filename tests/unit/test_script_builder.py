@@ -3,6 +3,7 @@
 import pytest
 from dbt_common.exceptions import DbtRuntimeError
 
+from dbt.adapters.scope.checkpoint import BATCH_TOKEN_PROPERTY
 from dbt.adapters.scope.script_builder import ColumnDef, ScriptBuilder, ScriptConfig
 
 
@@ -42,6 +43,23 @@ class TestScriptBuilderFullRefresh:
         sample_config.scope_settings = {}
         script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
         assert "ALTER TABLE" not in script
+
+    def test_batch_token_merged_into_single_alter(self, sample_config):
+        sample_config.batch_token = "tok-1"
+        script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
+        assert script.count("ALTER TABLE") == 1
+        assert '"microsoft.scope.compression" = "zstd#11"' in script
+        assert f'"{BATCH_TOKEN_PROPERTY}" = "tok-1"' in script
+        assert script.index("ALTER TABLE") < script.index("DELETE FROM") < script.index("INSERT")
+
+    def test_batch_token_alone_emits_alter(self, sample_config):
+        sample_config.scope_settings = {}
+        sample_config.batch_token = "tok-2"
+        script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
+        assert (
+            f'ALTER TABLE @target SET TBLPROPERTIES (\n    "{BATCH_TOKEN_PROPERTY}" = "tok-2"\n);'
+            in script
+        )
 
     def test_generates_extract_from_explicit_files(self, sample_config):
         script = ScriptBuilder.build_full_refresh(sample_config, "SELECT * FROM @data")
@@ -176,6 +194,14 @@ class TestScriptBuilderIncremental:
         """Incremental should not have DELETE statements."""
         script = ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
         assert "DELETE" not in script
+
+    def test_batch_token_lands_with_the_insert(self, sample_config):
+        sample_config.batch_token = "tok-3"
+        script = ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")
+        assert script.count("ALTER TABLE") == 1
+        assert '"delta.checkpointInterval" = 5' in script
+        assert f'"{BATCH_TOKEN_PROPERTY}" = "tok-3"' in script
+        assert script.index("CREATE TABLE") < script.index("ALTER TABLE") < script.index("INSERT")
 
     def test_insert_present(self, sample_config):
         script = ScriptBuilder.build_incremental(sample_config, "SELECT * FROM @data")

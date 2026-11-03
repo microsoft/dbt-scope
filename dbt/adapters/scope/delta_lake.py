@@ -11,16 +11,19 @@ integration tests share one implementation for:
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import unquote
 
 import duckdb
 from azure.core.credentials import AccessToken, TokenCredential
+from azure.core.exceptions import ResourceNotFoundError
 from azure.identity import AzureCliCredential, CredentialUnavailableError
 from azure.storage.filedatalake import DataLakeServiceClient
 from dbt.adapters.events.logging import AdapterLogger
@@ -36,6 +39,9 @@ _ABFSS_RE = re.compile(
 )
 _STORAGE_SCOPE = "https://storage.azure.com/.default"
 _DUCKDB_EXTENSION_SQL = "INSTALL delta; LOAD delta; INSTALL azure; LOAD azure;"
+_COMMIT_FILE_RE = re.compile(r"(?:^|/)(\d{20})\.json$")
+_CHECKPOINT_FILE_RE = re.compile(r"(?:^|/)(\d{20})\.checkpoint(?:\.\d+\.\d+)?\.parquet$")
+_PHYSICAL_NAME_KEY = "delta.columnMapping.physicalName"
 
 
 def parse_abfss(location: str) -> tuple[str, str, str] | None:
@@ -232,6 +238,127 @@ class AbfssLocation:
     @property
     def account_url(self) -> str:
         return f"https://{self.account}.dfs.core.windows.net"
+
+    @property
+    def url(self) -> str:
+        host = f"{self.container}@{self.account}.dfs.core.windows.net"
+        return f"abfss://{host}/{self.path.strip('/')}"
+
+
+@dataclass(frozen=True)
+class DeltaCommit:
+    """One parsed ``_delta_log/<version>.json`` commit."""
+
+    version: int
+    actions: list[dict[str, Any]] = field(default_factory=list)
+    last_modified_ms: int | None = None
+
+    @classmethod
+    def parse(cls, version: int, text: str, last_modified_ms: int | None = None) -> DeltaCommit:
+        actions: list[dict[str, Any]] = []
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                action = json.loads(line)
+            except ValueError:
+                log.debug(f"Skipping unparseable action in Delta commit {version}")
+                continue
+            if isinstance(action, dict):
+                actions.append(action)
+        return cls(version=version, actions=actions, last_modified_ms=last_modified_ms)
+
+    def _first(self, key: str) -> dict[str, Any] | None:
+        for action in self.actions:
+            value = action.get(key)
+            if isinstance(value, dict):
+                return value
+        return None
+
+    @property
+    def commit_info(self) -> dict[str, Any] | None:
+        return self._first("commitInfo")
+
+    @property
+    def metadata(self) -> dict[str, Any] | None:
+        return self._first("metaData")
+
+    @property
+    def configuration(self) -> dict[str, Any]:
+        configuration = (self.metadata or {}).get("configuration")
+        return configuration if isinstance(configuration, dict) else {}
+
+    @property
+    def schema_string(self) -> str | None:
+        schema = (self.metadata or {}).get("schemaString")
+        return schema if isinstance(schema, str) else None
+
+    @property
+    def is_scope_engine(self) -> bool:
+        """ScopeEngine writes ``engineInfo: ScopeEngine/...``; its table-creating commit has none."""
+        info = self.commit_info
+        if info is None:
+            return True
+        return str(info.get("engineInfo") or "").startswith("ScopeEngine")
+
+    @property
+    def added_data_paths(self) -> list[str]:
+        return [
+            add["path"]
+            for action in self.actions
+            if isinstance(add := action.get("add"), dict)
+            and add.get("path")
+            and add.get("dataChange", True)
+        ]
+
+    @property
+    def timestamp_ms(self) -> int | None:
+        info = self.commit_info or {}
+        if isinstance(info.get("timestamp"), int):
+            return info["timestamp"]
+        add_times = [
+            add["modificationTime"]
+            for action in self.actions
+            if isinstance(add := action.get("add"), dict)
+            and isinstance(add.get("modificationTime"), int)
+        ]
+        if add_times:
+            return max(add_times)
+        return self.last_modified_ms
+
+    def carries_property(self, key: str, value: str) -> bool:
+        """Return ``True`` if this commit set table property ``key`` to ``value``."""
+        if self.configuration.get(key) == value:
+            return True
+        parameters = (self.commit_info or {}).get("operationParameters")
+        if not parameters:
+            return False
+        serialized = parameters if isinstance(parameters, str) else json.dumps(parameters)
+        return key in serialized and value in serialized
+
+
+def physical_column_name(schema_string: str | None, column: str) -> str | None:
+    """Return the parquet column name of logical ``column``, or ``None`` if it is absent.
+
+    Honours Delta column mapping (``delta.columnMapping.physicalName``).
+    """
+    if not schema_string:
+        return None
+    try:
+        fields = json.loads(schema_string).get("fields", [])
+    except (ValueError, AttributeError):
+        return None
+    matches = [f for f in fields if isinstance(f, dict) and f.get("name") == column]
+    if not matches:
+        matches = [
+            f
+            for f in fields
+            if isinstance(f, dict) and str(f.get("name", "")).lower() == column.lower()
+        ]
+    if not matches:
+        return None
+    metadata = matches[0].get("metadata") or {}
+    return metadata.get(_PHYSICAL_NAME_KEY) or matches[0]["name"]
 
 
 @dataclass(frozen=True)
@@ -624,3 +751,142 @@ class DuckDbDeltaLakeClient(DeltaLakeClient):
             # A missing path raises (path not found) — treat as "does not exist".
             log.debug(f"delta_log_exists({delta_location}) → False (not found or error)")
             return False
+
+    def _delta_log_prefix(self, delta_location: str) -> tuple[AbfssLocation, str]:
+        parsed = AbfssLocation.parse(delta_location)
+        if parsed is None:
+            raise DbtRuntimeError(f"Invalid Delta location: {delta_location}")
+        return parsed, f"{parsed.path.rstrip('/')}/_delta_log"
+
+    def _file_system(self, parsed: AbfssLocation) -> Any:
+        service = DataLakeServiceClient(account_url=parsed.account_url, credential=self._credential)
+        return service.get_file_system_client(parsed.container)
+
+    def _list_log(self, delta_location: str) -> tuple[list[int], dict[int, list[str]]]:
+        """Return the JSON commit versions in ``_delta_log/`` (ascending) and checkpoint files by version."""
+        parsed, prefix = self._delta_log_prefix(delta_location)
+
+        def _list() -> tuple[list[int], dict[int, list[str]]]:
+            try:
+                paths = list(self._file_system(parsed).get_paths(path=prefix, recursive=False))
+            except ResourceNotFoundError:
+                return [], {}
+            commits: list[int] = []
+            checkpoints: dict[int, list[str]] = {}
+            for path in paths:
+                if getattr(path, "is_directory", False):
+                    continue
+                if match := _COMMIT_FILE_RE.search(path.name):
+                    commits.append(int(match.group(1)))
+                elif match := _CHECKPOINT_FILE_RE.search(path.name):
+                    checkpoints.setdefault(int(match.group(1)), []).append(path.name)
+            commits.sort()
+            return commits, checkpoints
+
+        return retry_on_message(
+            _list,
+            policy=self._message_retry_policy,
+            label=f"delta_lake.list_log {delta_location}",
+        )
+
+    def log_versions(self, delta_location: str) -> tuple[list[int], int]:
+        """Return the JSON commit versions in ``_delta_log/`` (ascending) and the latest version.
+
+        The latest version is ``-1`` when the table has no log yet.
+        """
+        commits, checkpoints = self._list_log(delta_location)
+        return commits, max([-1, *commits, *checkpoints])
+
+    def latest_version(self, delta_location: str) -> int:
+        """Return the latest Delta table version, or ``-1`` if the table has no log yet."""
+        return self.log_versions(delta_location)[1]
+
+    def read_commit(self, delta_location: str, version: int) -> DeltaCommit | None:
+        """Read and parse one JSON commit; ``None`` if it does not exist."""
+        parsed, prefix = self._delta_log_prefix(delta_location)
+
+        def _read() -> DeltaCommit | None:
+            file_client = self._file_system(parsed).get_file_client(f"{prefix}/{version:020d}.json")
+            try:
+                downloader = file_client.download_file()
+                raw = downloader.readall()
+            except ResourceNotFoundError:
+                return None
+            last_modified = getattr(getattr(downloader, "properties", None), "last_modified", None)
+            last_modified_ms = int(last_modified.timestamp() * 1000) if last_modified else None
+            return DeltaCommit.parse(version, raw.decode("utf-8"), last_modified_ms)
+
+        return retry_on_message(
+            _read,
+            policy=self._message_retry_policy,
+            label=f"delta_lake.read_commit {delta_location}@{version}",
+        )
+
+    def read_commits(self, delta_location: str, versions: Iterable[int]) -> list[DeltaCommit]:
+        """Read the given JSON commits in ascending order, skipping ones that no longer exist."""
+        commits = []
+        for version in sorted(versions):
+            commit = self.read_commit(delta_location, version)
+            if commit is not None:
+                commits.append(commit)
+        return commits
+
+    def latest_metadata_commit(
+        self, delta_location: str, max_commits: int = 100
+    ) -> DeltaCommit | None:
+        """Return the table's newest ``metaData`` action as a commit.
+
+        Reads the JSON commits after the latest checkpoint, then the checkpoint itself.
+        """
+        parsed, _ = self._delta_log_prefix(delta_location)
+        commits, checkpoints = self._list_log(delta_location)
+        checkpoint_version = max(checkpoints, default=-1)
+        for version in reversed(commits[-max_commits:]):
+            if version <= checkpoint_version:
+                break
+            commit = self.read_commit(delta_location, version)
+            if commit is not None and commit.metadata is not None:
+                return commit
+        if checkpoint_version < 0:
+            return None
+        metadata = self._checkpoint_metadata(parsed, checkpoints[checkpoint_version])
+        if metadata is None:
+            return None
+        return DeltaCommit(version=checkpoint_version, actions=[{"metaData": metadata}])
+
+    def _checkpoint_metadata(
+        self, parsed: AbfssLocation, checkpoint_files: list[str]
+    ) -> dict[str, Any] | None:
+        urls = [f"{parsed.url}/_delta_log/{name.rsplit('/', 1)[-1]}" for name in checkpoint_files]
+        files_sql = ", ".join(f"'{_sql_literal(url)}'" for url in urls)
+        row = self.fetchone(
+            "SELECT metaData.schemaString, map_entries(metaData.configuration) "
+            f"FROM read_parquet([{files_sql}], union_by_name = true) "
+            "WHERE metaData IS NOT NULL LIMIT 1"
+        )
+        if row is None:
+            return None
+        schema_string, entries = row
+        return {
+            "schemaString": schema_string,
+            "configuration": {entry["key"]: entry["value"] for entry in entries or []},
+        }
+
+    def distinct_column_values(
+        self, delta_location: str, data_paths: list[str], column: str
+    ) -> set[str]:
+        """Return the distinct non-null values of parquet ``column`` across ``data_paths``.
+
+        ``data_paths`` are Delta ``add.path`` values: URL-encoded and relative to the
+        table root, or absolute URLs.
+        """
+        if not data_paths:
+            return set()
+        parsed, _ = self._delta_log_prefix(delta_location)
+        urls = [path if "://" in path else f"{parsed.url}/{unquote(path)}" for path in data_paths]
+        files_sql = ", ".join(f"'{_sql_literal(url)}'" for url in urls)
+        rows = self.fetchall(
+            f"SELECT DISTINCT {_sql_identifier(column)} "
+            f"FROM read_parquet([{files_sql}], union_by_name = true)"
+        )
+        return {str(row[0]) for row in rows if row[0] is not None}

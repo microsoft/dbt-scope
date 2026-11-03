@@ -9,21 +9,42 @@ Watermark schema::
     {
         "version": 0,
         "modifiedTime": "2026-04-01T12:34:56.789000+00:00",
-        "batchId": 3
+        "batchId": 3,
+        "deltaVersion": 42
     }
+
+``deltaVersion`` is the Delta table version the checkpoint covers; it is
+absent in checkpoints written by older adapter versions.
 
 Sources JSONL (one line per processed file)::
 
     {"path": "/local/.../file.ss", "modificationTime": 1775018672000, "batchId": 0, "batchProcessingTime": "2026-04-06T21:00:00+00:00"}
+
+``_checkpoint/pending.json`` records the batch that was submitted but not yet
+checkpointed (see :class:`PendingBatch`). Each batch stamps its token into the
+Delta commit as the ``dbt_scope.batch_token`` table property, which lets the
+next run tell whether that batch committed.
+
+``_checkpoint/owner.json`` names the dbt run that owns the table (see
+:class:`TableOwner`)::
+
+    {"runId": "6f1c...", "runStartedAt": "2026-11-02T00:26:58.123456+00:00"}
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Any
 
+from azure.core import MatchConditions
 from azure.core.credentials import TokenCredential
+from azure.core.exceptions import (
+    ResourceExistsError,
+    ResourceModifiedError,
+    ResourceNotFoundError,
+)
 from azure.identity import CredentialUnavailableError
 from azure.storage.filedatalake import DataLakeServiceClient
 from dbt.adapters.events.logging import AdapterLogger
@@ -35,7 +56,13 @@ log = AdapterLogger("scope")
 
 _CHECKPOINT_DIR = "_checkpoint"
 _WATERMARK_FILE = "watermark.json"
+_PENDING_FILE = "pending.json"
+_OWNER_FILE = "owner.json"
 _SOURCES_DIR = "sources"
+_OWNER_CLAIM_ATTEMPTS = 5
+
+BATCH_TOKEN_PROPERTY = "dbt_scope.batch_token"
+PENDING_SCHEMA_VERSION = 1
 
 
 def _json_default(o: object) -> str:
@@ -75,6 +102,7 @@ class Watermark:
     version: int = 0
     modified_time: str = ""  # ISO-8601, e.g. "2026-04-01T12:34:56.789000+00:00"
     batch_id: int = 0  # Resets on full refresh
+    delta_version: int | None = None
 
     @property
     def modified_time_dt(self) -> datetime | None:
@@ -83,28 +111,162 @@ class Watermark:
             return None
         return datetime.fromisoformat(self.modified_time)
 
+    def same_position(self, other: Watermark | None) -> bool:
+        """Return ``True`` if *other* tracks the same processed-file position."""
+        return other is not None and (self.version, self.modified_time, self.batch_id) == (
+            other.version,
+            other.modified_time,
+            other.batch_id,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "version": self.version,
+            "modifiedTime": self.modified_time,
+            "batchId": self.batch_id,
+        }
+        if self.delta_version is not None:
+            data["deltaVersion"] = self.delta_version
+        return data
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), indent=2)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Watermark:
+        return cls(
+            version=data.get("version", 0),
+            modified_time=data.get("modifiedTime", ""),
+            batch_id=data.get("batchId", 0),
+            delta_version=data.get("deltaVersion"),
+        )
+
+    @classmethod
+    def from_json(cls, raw: str) -> Watermark:
+        return cls.from_dict(json.loads(raw))
+
+
+@dataclass
+class PendingBatch:
+    """A submitted batch whose checkpoint has not been written yet.
+
+    ``watermark_before`` is the watermark the batch was discovered from; the
+    record is stale once the watermark moves past it. ``delta_version_before``
+    is the latest Delta version before submission (``-1`` if no table yet).
+    """
+
+    token: str
+    batch_id: int
+    run_id: str
+    job_name: str
+    files: list[tuple[str, int]]  # (path, modificationTime in epoch ms)
+    watermark_before: Watermark | None
+    delta_version_before: int
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    schema_version: int = PENDING_SCHEMA_VERSION
+
+    def applies_to(self, watermark: Watermark | None) -> bool:
+        if self.watermark_before is None:
+            return watermark is None
+        return self.watermark_before.same_position(watermark)
+
+    @property
+    def file_paths(self) -> list[str]:
+        return [path for path, _ in self.files]
+
+    @property
+    def modification_times(self) -> list[datetime]:
+        return [datetime.fromtimestamp(ms / 1000, tz=timezone.utc) for _, ms in self.files]
+
     def to_json(self) -> str:
         return json.dumps(
             {
-                "version": self.version,
-                "modifiedTime": self.modified_time,
+                "schemaVersion": self.schema_version,
                 "batchId": self.batch_id,
+                "token": self.token,
+                "runId": self.run_id,
+                "jobName": self.job_name,
+                "files": [{"path": p, "modificationTime": ms} for p, ms in self.files],
+                "watermarkBefore": (
+                    self.watermark_before.to_dict() if self.watermark_before else None
+                ),
+                "deltaVersionBefore": self.delta_version_before,
+                "createdAt": self.created_at,
             },
             indent=2,
         )
 
     @classmethod
-    def from_json(cls, raw: str) -> Watermark:
+    def from_json(cls, raw: str) -> PendingBatch:
         data = json.loads(raw)
+        watermark_before = data.get("watermarkBefore")
         return cls(
-            version=data.get("version", 0),
-            modified_time=data.get("modifiedTime", ""),
+            token=data["token"],
             batch_id=data.get("batchId", 0),
+            run_id=data.get("runId", ""),
+            job_name=data.get("jobName", ""),
+            files=[(f["path"], int(f["modificationTime"])) for f in data.get("files", [])],
+            watermark_before=Watermark.from_dict(watermark_before) if watermark_before else None,
+            delta_version_before=int(data.get("deltaVersionBefore", -1)),
+            created_at=data.get("createdAt", ""),
+            schema_version=data.get("schemaVersion", PENDING_SCHEMA_VERSION),
         )
+
+
+@dataclass(frozen=True)
+class TableOwner:
+    """The dbt run allowed to submit batch jobs for a table and write its checkpoint.
+
+    Runs are ranked by start time, then run ID: a run that started later takes a
+    table over from an earlier one, never the reverse.
+    """
+
+    run_id: str
+    run_started_at: datetime
+
+    def outranks(self, other: TableOwner) -> bool:
+        return (self.run_started_at, self.run_id) > (other.run_started_at, other.run_id)
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {"runId": self.run_id, "runStartedAt": self.run_started_at.isoformat()}, indent=2
+        )
+
+    @classmethod
+    def from_json(cls, raw: str) -> TableOwner:
+        """Parse ``owner.json``; raises ``ValueError`` when it is not a valid record."""
+        try:
+            data = json.loads(raw)
+            owner = cls(
+                run_id=str(data["runId"]),
+                run_started_at=datetime.fromisoformat(data["runStartedAt"]),
+            )
+        except (KeyError, TypeError) as exc:
+            raise ValueError(f"invalid {_OWNER_FILE}: {exc!r}") from exc
+        if owner.run_started_at.tzinfo is None:
+            raise ValueError(f"invalid {_OWNER_FILE}: runStartedAt has no timezone")
+        return owner
+
+
+def _download_text(file_client: Any) -> tuple[str | None, str | None]:
+    """Return ``(content, etag)`` of a file, or ``(None, None)`` if it does not exist."""
+    try:
+        download = file_client.download_file()
+    except ResourceNotFoundError:
+        return None, None
+    return download.readall().decode("utf-8"), download.properties.etag
 
 
 def _get_service(parsed: AbfssLocation, credential: TokenCredential) -> DataLakeServiceClient:
     return DataLakeServiceClient(account_url=parsed.account_url, credential=credential)
+
+
+def _checkpoint_dir(parsed: AbfssLocation) -> str:
+    return f"{parsed.path.rstrip('/')}/{_CHECKPOINT_DIR}"
+
+
+def _checkpoint_file(parsed: AbfssLocation, name: str) -> str:
+    return f"{_checkpoint_dir(parsed)}/{name}"
 
 
 class CheckpointManager:
@@ -131,38 +293,51 @@ class CheckpointManager:
 
     # -- Watermark ---------------------------------------------------------
 
-    def read_watermark(self, delta_location: str) -> Watermark | None:
-        """Read the watermark from ``_checkpoint/watermark.json``."""
+    def read_watermark(self, delta_location: str, *, strict: bool = False) -> Watermark | None:
+        """Read the watermark from ``_checkpoint/watermark.json``.
+
+        Returns ``None`` when no checkpoint exists. Other read errors also return
+        ``None`` unless *strict* is set, in which case they propagate.
+        """
         parsed = AbfssLocation.parse(delta_location)
         if parsed is None:
             log.warning(f"read_watermark: invalid delta_location: {delta_location}")
             return None
 
-        def _read() -> Watermark:
+        def _read() -> Watermark | None:
             service = _get_service(parsed, self._credential)
             fs = service.get_file_system_client(parsed.container)
             file_path = f"{parsed.path.rstrip('/')}/{_CHECKPOINT_DIR}/{_WATERMARK_FILE}"
             file_client = fs.get_file_client(file_path)
-            download = file_client.download_file()
+            try:
+                download = file_client.download_file()
+            except ResourceNotFoundError:
+                return None
             raw = download.readall().decode("utf-8")
             watermark = Watermark.from_json(raw)
             log.debug(
                 f"Read watermark: version={watermark.version}, "
                 f"modified_time={watermark.modified_time}, "
-                f"batch_id={watermark.batch_id}"
+                f"batch_id={watermark.batch_id}, "
+                f"delta_version={watermark.delta_version}"
             )
             return watermark
 
         try:
-            return self._retry(_read, label=f"checkpoint.read_watermark {delta_location}")
+            watermark = self._retry(_read, label=f"checkpoint.read_watermark {delta_location}")
         except CredentialUnavailableError:
             # Don't mask auth failures as "no checkpoint" — that would
             # silently flip an incremental run into a full refresh.
             log.error(f"read_watermark: credential acquisition exhausted for {delta_location}")
             raise
         except Exception:
+            if strict:
+                raise
             log.debug(f"No checkpoint found for {delta_location} (first run or full refresh)")
             return None
+        if watermark is None:
+            log.debug(f"No checkpoint found for {delta_location} (first run or full refresh)")
+        return watermark
 
     def write_watermark(self, delta_location: str, watermark: Watermark) -> None:
         """Write (create or overwrite) the watermark checkpoint."""
@@ -187,7 +362,8 @@ class CheckpointManager:
             log.debug(
                 f"Wrote watermark: version={watermark.version}, "
                 f"modified_time={watermark.modified_time}, "
-                f"batch_id={watermark.batch_id} → {delta_location}"
+                f"batch_id={watermark.batch_id}, "
+                f"delta_version={watermark.delta_version} → {delta_location}"
             )
 
         try:
@@ -216,8 +392,166 @@ class CheckpointManager:
         except Exception:
             log.debug(f"No watermark to delete for {delta_location} (already clean)")
 
+        self.delete_pending(delta_location, strict=True)
         # Also delete all sources
         self.delete_all_sources(delta_location)
+
+    def watermark_last_modified(self, delta_location: str) -> datetime | None:
+        """Return when ``watermark.json`` was last written, or ``None`` if it does not exist."""
+        parsed = AbfssLocation.parse(delta_location)
+        if parsed is None:
+            return None
+
+        def _properties() -> datetime | None:
+            service = _get_service(parsed, self._credential)
+            fs = service.get_file_system_client(parsed.container)
+            file_client = fs.get_file_client(_checkpoint_file(parsed, _WATERMARK_FILE))
+            try:
+                return file_client.get_file_properties().last_modified
+            except ResourceNotFoundError:
+                return None
+
+        return self._retry(
+            _properties, label=f"checkpoint.watermark_last_modified {delta_location}"
+        )
+
+    # -- Pending batch -----------------------------------------------------
+
+    def read_pending(self, delta_location: str) -> PendingBatch | None:
+        """Read ``_checkpoint/pending.json``; ``None`` if absent or unreadable."""
+        parsed = AbfssLocation.parse(delta_location)
+        if parsed is None:
+            return None
+
+        def _read() -> str | None:
+            service = _get_service(parsed, self._credential)
+            fs = service.get_file_system_client(parsed.container)
+            file_client = fs.get_file_client(_checkpoint_file(parsed, _PENDING_FILE))
+            try:
+                return file_client.download_file().readall().decode("utf-8")
+            except ResourceNotFoundError:
+                return None
+
+        raw = self._retry(_read, label=f"checkpoint.read_pending {delta_location}")
+        if raw is None:
+            return None
+        try:
+            return PendingBatch.from_json(raw)
+        except (ValueError, KeyError, TypeError) as exc:
+            log.warning(f"Ignoring unreadable {_PENDING_FILE} for {delta_location}: {exc}")
+            return None
+
+    def write_pending(self, delta_location: str, pending: PendingBatch) -> None:
+        """Write (create or overwrite) ``_checkpoint/pending.json``."""
+        parsed = AbfssLocation.parse(delta_location)
+        if parsed is None:
+            raise ValueError(f"write_pending: invalid delta_location: {delta_location}")
+
+        def _write() -> None:
+            service = _get_service(parsed, self._credential)
+            fs = service.get_file_system_client(parsed.container)
+            fs.get_directory_client(_checkpoint_dir(parsed)).create_directory()
+            file_client = fs.get_file_client(_checkpoint_file(parsed, _PENDING_FILE))
+            file_client.upload_data(pending.to_json().encode("utf-8"), overwrite=True)
+            log.debug(
+                f"Wrote pending batch {pending.batch_id} (token={pending.token}, "
+                f"{len(pending.files)} files) → {delta_location}"
+            )
+
+        self._retry(_write, label=f"checkpoint.write_pending {delta_location}")
+
+    def delete_pending(self, delta_location: str, *, strict: bool = False) -> None:
+        """Delete ``_checkpoint/pending.json`` if present; errors only warn unless *strict*."""
+        parsed = AbfssLocation.parse(delta_location)
+        if parsed is None:
+            return
+
+        def _delete() -> None:
+            service = _get_service(parsed, self._credential)
+            fs = service.get_file_system_client(parsed.container)
+            file_client = fs.get_file_client(_checkpoint_file(parsed, _PENDING_FILE))
+            try:
+                file_client.delete_file()
+            except ResourceNotFoundError:
+                return
+
+        try:
+            self._retry(_delete, label=f"checkpoint.delete_pending {delta_location}")
+        except CredentialUnavailableError:
+            raise
+        except Exception as exc:
+            if strict:
+                raise
+            log.warning(f"delete_pending failed for {delta_location}: {exc}")
+
+    # -- Table owner -------------------------------------------------------
+
+    def read_owner(self, delta_location: str) -> TableOwner | None:
+        """Read ``_checkpoint/owner.json``; ``None`` if no run has claimed the table.
+
+        Raises ``ValueError`` when the file is not a valid record, which is also what a
+        reader sees while another run is rewriting it.
+        """
+        parsed = AbfssLocation.parse(delta_location)
+        if parsed is None:
+            raise ValueError(f"read_owner: invalid delta_location: {delta_location}")
+
+        def _read() -> str | None:
+            service = _get_service(parsed, self._credential)
+            fs = service.get_file_system_client(parsed.container)
+            return _download_text(fs.get_file_client(_checkpoint_file(parsed, _OWNER_FILE)))[0]
+
+        raw = self._retry(_read, label=f"checkpoint.read_owner {delta_location}")
+        return None if raw is None else TableOwner.from_json(raw)
+
+    def claim_owner(self, delta_location: str, claimant: TableOwner) -> TableOwner:
+        """Make *claimant* the table's owner unless a run that outranks it already is.
+
+        Returns the owner after the call: *claimant*, or the run that keeps the table.
+        The write is conditional on the ETag that was read (or on the file being absent),
+        so two runs claiming at once cannot both win.
+        """
+        parsed = AbfssLocation.parse(delta_location)
+        if parsed is None:
+            raise ValueError(f"claim_owner: invalid delta_location: {delta_location}")
+        data = claimant.to_json().encode("utf-8")
+
+        def _claim() -> TableOwner:
+            service = _get_service(parsed, self._credential)
+            fs = service.get_file_system_client(parsed.container)
+            file_client = fs.get_file_client(_checkpoint_file(parsed, _OWNER_FILE))
+            for _ in range(_OWNER_CLAIM_ATTEMPTS):
+                raw, etag = _download_text(file_client)
+                current: TableOwner | None = None
+                if raw is not None:
+                    try:
+                        current = TableOwner.from_json(raw)
+                    except ValueError as exc:
+                        log.debug(f"Replacing unreadable {_OWNER_FILE} of {delta_location}: {exc}")
+                if current is not None and (current == claimant or current.outranks(claimant)):
+                    return current
+                try:
+                    if etag is None:
+                        fs.get_directory_client(_checkpoint_dir(parsed)).create_directory()
+                        file_client.upload_data(
+                            data, overwrite=True, match_condition=MatchConditions.IfMissing
+                        )
+                    else:
+                        file_client.upload_data(
+                            data,
+                            overwrite=True,
+                            etag=etag,
+                            match_condition=MatchConditions.IfNotModified,
+                        )
+                except (ResourceExistsError, ResourceModifiedError):
+                    continue
+                return claimant
+            raise RuntimeError(
+                f"Could not claim {delta_location}: {_OWNER_FILE} changed during each of "
+                f"{_OWNER_CLAIM_ATTEMPTS} attempts"
+            )
+
+        return self._retry(_claim, label=f"checkpoint.claim_owner {delta_location}")
 
     # -- Sources -----------------------------------------------------------
 

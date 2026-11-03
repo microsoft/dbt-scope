@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, ClassVar
 from urllib.parse import quote as url_quote
 
@@ -24,8 +26,9 @@ from dbt_common.exceptions import DbtDatabaseError, DbtRuntimeError
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from dbt.adapters.scope.checkpoint import CheckpointManager, TableOwner
 from dbt.adapters.scope.credentials import ScopeCredentials
-from dbt.adapters.scope.delta_lake import build_credential
+from dbt.adapters.scope.delta_lake import RetryPolicy, build_credential
 from dbt.adapters.scope.message_retry import MessageRetryPolicy, retry_on_message
 from dbt.adapters.scope.quota_eviction import QuotaEvictionPolicy, retry_with_quota_eviction
 
@@ -38,8 +41,22 @@ API_VERSION = "2017-09-01-preview"
 _TERMINAL_STATES = {"Ended"}
 _SUCCESS_RESULTS = {"Succeeded"}
 
+ORPHAN_SETTLE_TIMEOUT_SECONDS = 600
+
 # Namespace for deterministic UUID generation (pipeline and recurrence IDs)
 _UUID_NAMESPACE = uuid.NAMESPACE_DNS
+
+
+def _model_job_name_pattern(model_name: str) -> re.Pattern[str]:
+    """Match batch job names of ``model_name`` (``{model}_[{mode}_]batch_N...``) only.
+
+    Prevents model ``foo`` from matching jobs of model ``foo_bar``.
+    """
+    return re.compile(rf"^{re.escape(model_name)}_(?:full-refresh_|incremental_)?batch_\d+(?:_|$)")
+
+
+class ModelSupersededError(DbtRuntimeError):
+    """This run no longer owns the model's Delta table, so it must not write to it."""
 
 
 # ---------------------------------------------------------------------------
@@ -60,11 +77,14 @@ class _ActiveJobEntry:
 
 _active_jobs: dict[str, _ActiveJobEntry] = {}
 _active_jobs_lock = threading.Lock()
+# Jobs this process asked ADLA to cancel, and the subset confirmed terminal afterwards.
 _cancelled_job_ids: set[str] = set()
+_confirmed_cancelled_job_ids: set[str] = set()
 
-# Shared shutdown event. Set by the SIGINT/SIGTERM handler in ``impl.py``; observed
-# by ``submit_and_wait``'s poll loop and ``wait_for_next_cycle`` so that in-flight
-# work aborts promptly when the operator hits Ctrl+C.
+# Shared shutdown event. Set by the SIGINT/SIGTERM handler in ``impl.py`` and by dbt's
+# fail-fast ``cancel_open``; observed by ``submit_job``, ``submit_and_wait``'s poll loop,
+# job-level retries and ``wait_for_next_cycle`` so that no new work starts once the run
+# is aborting.
 _shutdown_event = threading.Event()
 
 
@@ -92,9 +112,15 @@ def cancel_all_active_jobs(reason: str, wait_seconds: int) -> tuple[int, int]:
 
     Returns ``(attempted, confirmed_terminal)``.
     """
+    results = _cancel_active_jobs(reason, wait_seconds)
+    return (len(results), sum(1 for confirmed in results.values() if confirmed))
+
+
+def _cancel_active_jobs(reason: str, wait_seconds: int) -> dict[str, bool]:
+    """Cancel every in-flight ADLA job; return ``{job_id: confirmed_terminal}``."""
     entries = _snapshot_active_jobs()
     if not entries:
-        return (0, 0)
+        return {}
 
     log.info(
         f"Shutdown ({reason}) — cancelling {len(entries)} active ADLA job(s), "
@@ -104,34 +130,45 @@ def cancel_all_active_jobs(reason: str, wait_seconds: int) -> tuple[int, int]:
     max_workers = min(len(entries), 32)
 
     def _cancel_one(entry: _ActiveJobEntry) -> bool:
-        if entry.job_id in _cancelled_job_ids:
+        if entry.job_id in _confirmed_cancelled_job_ids:
             return True
+        _cancelled_job_ids.add(entry.job_id)
         try:
-            entry.handle.cancel_job(
-                entry.job_id,
-                poll_interval=2,
-                max_wait=wait_seconds,
+            confirmed = bool(
+                entry.handle.cancel_job(
+                    entry.job_id,
+                    poll_interval=2,
+                    max_wait=wait_seconds,
+                )
             )
-            _cancelled_job_ids.add(entry.job_id)
-            return True
         except Exception as exc:
             log.warning(f"Failed to cancel ADLA job '{entry.name}' ({entry.job_id}): {exc}")
-            _cancelled_job_ids.add(entry.job_id)
             return False
+        if confirmed:
+            _confirmed_cancelled_job_ids.add(entry.job_id)
+        return confirmed
 
     executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="scope-cancel")
     try:
-        futures = [executor.submit(_cancel_one, e) for e in entries]
+        futures = {executor.submit(_cancel_one, e): e for e in entries}
         # Bound the overall wait — cancel_job has its own max_wait per job, but we
         # add a small grace for thread scheduling + the synchronous POST itself.
         grace_seconds = 5
         wait(futures, timeout=wait_seconds + grace_seconds)
-        confirmed = sum(1 for f in futures if f.done() and not f.cancelled() and f.result())
+        results = {
+            entry.job_id: f.done() and not f.cancelled() and f.result()
+            for f, entry in futures.items()
+        }
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
 
+    confirmed = sum(1 for ok in results.values() if ok)
     log.info(f"Shutdown cancel complete: {confirmed}/{len(entries)} ADLA job(s) confirmed terminal")
-    return (len(entries), confirmed)
+    unconfirmed = [entry for entry in entries if not results[entry.job_id]]
+    if unconfirmed:
+        names = ", ".join(f"'{e.name}' ({e.job_id})" for e in unconfirmed)
+        log.warning(f"ADLA job(s) not confirmed terminal and may still commit: {names}")
+    return results
 
 
 @dataclass
@@ -175,13 +212,28 @@ class ADLAJob:
 class ScopeConnectionHandle:
     """Wraps an ADLA REST client with credential caching."""
 
-    # Unique per Python process (= per dbt invocation).  Shared across all
-    # connections/threads so that every job submitted in one run carries the
-    # same runId.
+    # Identifies the current dbt invocation; shared across all connections/threads so
+    # that every job submitted in one run carries the same runId.
     _run_id: ClassVar[str] = str(uuid.uuid4())
+    _run_started_at: ClassVar[datetime] = datetime.now(timezone.utc)
 
     # Models whose orphaned jobs have already been cancelled in this run.
     _cancelled_models: ClassVar[set[str]] = set()
+
+    # Delta locations of the models whose table this run has claimed, by model name.
+    _claimed_tables: ClassVar[dict[str, str]] = {}
+
+    @classmethod
+    def start_new_run(cls) -> None:
+        """Begin a new dbt invocation; jobs from earlier invocations become orphans."""
+        cls._run_id = str(uuid.uuid4())
+        cls._run_started_at = datetime.now(timezone.utc)
+        cls._cancelled_models = set()
+        cls._claimed_tables = {}
+
+    @classmethod
+    def run_owner(cls) -> TableOwner:
+        return TableOwner(run_id=cls._run_id, run_started_at=cls._run_started_at)
 
     def __init__(self, credentials: ScopeCredentials) -> None:
         self._credentials = credentials
@@ -193,6 +245,11 @@ class ScopeConnectionHandle:
         self._message_retry_policy = MessageRetryPolicy.from_credentials(credentials)
         self._job_retry_policy = MessageRetryPolicy.for_job_retry(credentials)
         self._quota_eviction_policy = QuotaEvictionPolicy.from_credentials(credentials)
+        self._checkpoint_manager = CheckpointManager(
+            credential=self._credential,
+            retry_policy=RetryPolicy.from_http_retries(credentials.http_retries),
+            message_retry_policy=self._message_retry_policy,
+        )
         self._cached_token: str | None = None
         self._token_expires_at: float = 0
         self._next_job_name: str | None = None
@@ -214,6 +271,8 @@ class ScopeConnectionHandle:
         priority: int,
         model_name: str | None = None,
     ) -> ADLAJob:
+        if _shutdown_event.is_set():
+            raise DbtRuntimeError(f"Not submitting SCOPE job '{name}': the dbt run is aborting")
         job_id = str(uuid.uuid4())
         url = f"{self._base_url}/jobs/{job_id}?api-version={API_VERSION}"
         body: dict[str, Any] = {
@@ -260,37 +319,55 @@ class ScopeConnectionHandle:
         job_id: str,
         poll_interval: int = 2,
         max_wait: int = 120,
-    ) -> None:
+    ) -> bool:
         """Cancel an ADLA job and poll until it reaches a terminal state.
 
         The ADLA CancelJob API is asynchronous — it returns immediately while
         the job transitions through ``Finalizing`` before reaching ``Ended``.
         This method blocks until the job is terminal or *max_wait* is exceeded.
+
+        Returns ``True`` only when the job was observed terminal. Raises when the
+        CancelJob request fails and the job is not already terminal.
         """
         url = f"{self._base_url}/jobs/{job_id}/CancelJob?api-version={API_VERSION}"
+        poll_url = f"{self._base_url}/jobs/{job_id}?api-version={API_VERSION}"
         log.debug(f"Cancelling ADLA job {job_id}")
-        self._request("POST", url)
+        _cancelled_job_ids.add(job_id)
+        try:
+            self._request("POST", url)
+        except Exception:
+            try:
+                terminal = self._request("GET", poll_url).get("state", "") in _TERMINAL_STATES
+            except Exception:
+                terminal = False
+            if not terminal:
+                raise
+            _confirmed_cancelled_job_ids.add(job_id)
+            return True
 
-        # Poll until the job reaches a terminal state
         start = time.monotonic()
         while True:
             elapsed = time.monotonic() - start
             if elapsed >= max_wait:
                 log.warning(
                     f"Timed out waiting for job {job_id} to finish cancelling "
-                    f"after {elapsed:.0f}s — proceeding anyway"
+                    f"after {elapsed:.0f}s — not confirmed terminal"
                 )
-                return
+                return False
             time.sleep(poll_interval)
-            poll_url = f"{self._base_url}/jobs/{job_id}?api-version={API_VERSION}"
-            resp = self._request("GET", poll_url)
+            try:
+                resp = self._request("GET", poll_url)
+            except Exception as exc:
+                log.debug(f"Poll during cancel of job {job_id} failed: {exc}")
+                continue
             state = resp.get("state", "")
             if state in _TERMINAL_STATES:
                 log.debug(
                     f"Job {job_id} cancel confirmed: state={state}, "
                     f"result={resp.get('result')} ({elapsed:.1f}s)"
                 )
-                return
+                _confirmed_cancelled_job_ids.add(job_id)
+                return True
 
     def cancel_job_async(self, job_id: str) -> None:
         """Fire-and-forget cancel — POST CancelJob without polling for terminal state.
@@ -329,11 +406,20 @@ class ScopeConnectionHandle:
         related = job.get("related") or {}
         return related.get("runId") == ScopeConnectionHandle._run_id
 
+    def _list_orphaned_jobs(self, model_name: str) -> list[dict[str, Any]]:
+        filter_expr = f"startswith(name,'{model_name}_') and state ne 'Ended'"
+        pattern = _model_job_name_pattern(model_name)
+        return [
+            j
+            for j in self.list_jobs(filter_expr=filter_expr)
+            if pattern.match(str(j.get("name", ""))) and not self.is_self_job(j)
+        ]
+
     def cancel_orphaned_jobs(self, model_name: str) -> list[str]:
         """Cancel active ADLA jobs for *previous* runs of ``model_name``.
 
-        Jobs are considered orphaned if their name starts with
-        ``{model_name}_`` **and** they were not submitted by the current
+        Jobs are considered orphaned if their name is a batch job name of
+        ``model_name`` **and** they were not submitted by the current
         dbt invocation (identified by ``_run_id`` in the ``related``
         metadata).
 
@@ -343,9 +429,8 @@ class ScopeConnectionHandle:
         if model_name in ScopeConnectionHandle._cancelled_models:
             return []
 
-        filter_expr = f"startswith(name,'{model_name}_') and state ne 'Ended'"
         try:
-            active_jobs = self.list_jobs(filter_expr=filter_expr)
+            orphaned_jobs = self._list_orphaned_jobs(model_name)
         except Exception as exc:
             log.warning(
                 f"Failed to list active ADLA jobs for model '{model_name}' "
@@ -353,12 +438,6 @@ class ScopeConnectionHandle:
             )
             ScopeConnectionHandle._cancelled_models.add(model_name)
             return []
-
-        # Exclude jobs from the current run — they are siblings, not orphans
-        current_run_id = ScopeConnectionHandle._run_id
-        orphaned_jobs = [
-            j for j in active_jobs if j.get("related", {}).get("runId") != current_run_id
-        ]
 
         cancelled: list[str] = []
         for job in orphaned_jobs:
@@ -380,6 +459,107 @@ class ScopeConnectionHandle:
 
         ScopeConnectionHandle._cancelled_models.add(model_name)
         return cancelled
+
+    def settle_orphaned_jobs(
+        self,
+        model_name: str,
+        max_wait: int = ORPHAN_SETTLE_TIMEOUT_SECONDS,
+        poll_interval: int = 5,
+    ) -> list[str]:
+        """Cancel ``model_name`` jobs left by other runs and wait until all are terminal.
+
+        Unlike ``cancel_orphaned_jobs`` this is strict: it raises ``DbtRuntimeError``
+        when the jobs cannot be listed or are not terminal within ``max_wait``, because
+        a job that is still running may commit to the Delta table after the caller has
+        inspected it. Returns the IDs of the settled jobs.
+        """
+        try:
+            orphaned_jobs = self._list_orphaned_jobs(model_name)
+        except Exception as exc:
+            raise DbtRuntimeError(
+                f"Cannot list ADLA jobs to settle orphans of model '{model_name}': {exc}"
+            ) from exc
+
+        pending = {str(j.get("jobId", "")): str(j.get("name", "")) for j in orphaned_jobs}
+        pending.pop("", None)
+        settled = list(pending)
+        if pending:
+            log.info(
+                f"Cancelling {len(pending)} orphaned ADLA job(s) for model '{model_name}' and "
+                f"waiting up to {max_wait}s for them to end: "
+                + ", ".join(f"'{name}' ({job_id})" for job_id, name in pending.items())
+            )
+        for job_id in pending:
+            _cancelled_job_ids.add(job_id)
+            try:
+                self.cancel_job_async(job_id)
+            except Exception as exc:
+                log.warning(f"CancelJob for orphaned ADLA job {job_id} failed: {exc}")
+
+        deadline = time.monotonic() + max_wait
+        while pending:
+            for job_id in list(pending):
+                try:
+                    state = self._request(
+                        "GET", f"{self._base_url}/jobs/{job_id}?api-version={API_VERSION}"
+                    ).get("state", "")
+                except Exception as exc:
+                    log.debug(f"Poll of orphaned ADLA job {job_id} failed: {exc}")
+                    continue
+                if state in _TERMINAL_STATES:
+                    _confirmed_cancelled_job_ids.add(job_id)
+                    del pending[job_id]
+            if not pending:
+                break
+            if time.monotonic() >= deadline:
+                names = ", ".join(f"'{name}' ({job_id})" for job_id, name in pending.items())
+                raise DbtRuntimeError(
+                    f"Orphaned ADLA job(s) of model '{model_name}' did not end within "
+                    f"{max_wait}s: {names}. They may still commit to the Delta table, so the "
+                    f"checkpoint is left untouched; the next run retries."
+                )
+            time.sleep(poll_interval)
+
+        ScopeConnectionHandle._cancelled_models.add(model_name)
+        return settled
+
+    def claim_table(self, model_name: str, delta_location: str) -> list[str]:
+        """Take ``model_name``'s Delta table over for this run, then settle orphaned jobs.
+
+        Raises ``ModelSupersededError`` when a run that started later owns the table.
+        The claim is written before orphaned jobs are listed, and every job submission
+        re-reads it (``ensure_table_owner``), so a job of an earlier run is either
+        settled here or cancelled by that run itself. Returns the settled job IDs.
+        """
+        owner = self._checkpoint_manager.claim_owner(delta_location, self.run_owner())
+        if owner.run_id != ScopeConnectionHandle._run_id:
+            raise ModelSupersededError(
+                f"Model '{model_name}' is owned by a newer dbt run {owner.run_id} (started "
+                f"{owner.run_started_at.isoformat()}); this run "
+                f"{ScopeConnectionHandle._run_id} leaves {delta_location} alone"
+            )
+        ScopeConnectionHandle._claimed_tables[model_name] = delta_location
+        return self.settle_orphaned_jobs(model_name)
+
+    def ensure_table_owner(self, model_name: str | None) -> None:
+        """Raise ``ModelSupersededError`` if another run took over a table this run claimed."""
+        delta_location = ScopeConnectionHandle._claimed_tables.get(model_name or "")
+        if delta_location is None:
+            return
+        try:
+            owner = self._checkpoint_manager.read_owner(delta_location)
+        except ValueError as exc:
+            raise ModelSupersededError(
+                f"Model '{model_name}': the owner of {delta_location} is unreadable, so another "
+                f"dbt run may be taking it over; this run {ScopeConnectionHandle._run_id} "
+                f"stops writing to it ({exc})"
+            ) from exc
+        if owner is not None and owner.run_id != ScopeConnectionHandle._run_id:
+            raise ModelSupersededError(
+                f"Model '{model_name}' was taken over by dbt run {owner.run_id} (started "
+                f"{owner.run_started_at.isoformat()}); this run "
+                f"{ScopeConnectionHandle._run_id} stops writing to {delta_location}"
+            )
 
     # Maximum consecutive poll failures before giving up
     _MAX_CONSECUTIVE_POLL_FAILURES = 5
@@ -403,7 +583,12 @@ class ScopeConnectionHandle:
         method calls ``cancel_job`` for its own job (blocking up to
         ``wait_on_cancel_seconds`` for terminal state) and raises
         ``DbtRuntimeError``.
+
+        For a model whose table this run claimed, ownership is checked before the
+        job is submitted and again once it exists; if the table was taken over, the
+        job is not submitted, or is cancelled, and ``ModelSupersededError`` is raised.
         """
+        self.ensure_table_owner(model_name)
         job = self.submit_job(name, script, au, priority, model_name=model_name)
         _register_active_job(
             _ActiveJobEntry(
@@ -419,54 +604,77 @@ class ScopeConnectionHandle:
             last_state = job.state
             consecutive_failures = 0
 
-            while not job.is_terminal:
-                if _shutdown_event.is_set():
-                    if job.job_id not in _cancelled_job_ids:
-                        log.info(
-                            f"[{name}] Shutdown signalled — cancelling job {job.job_id} "
-                            f"(waiting up to {wait_on_cancel_seconds}s for terminal state)"
-                        )
-                        try:
-                            self.cancel_job(
-                                job.job_id,
-                                poll_interval=2,
-                                max_wait=wait_on_cancel_seconds,
+            try:
+                self.ensure_table_owner(model_name)
+                while not job.is_terminal:
+                    if _shutdown_event.is_set():
+                        if job.job_id not in _cancelled_job_ids:
+                            log.info(
+                                f"[{name}] Shutdown signalled — cancelling job {job.job_id} "
+                                f"(waiting up to {wait_on_cancel_seconds}s for terminal state)"
                             )
-                        except Exception as exc:
-                            log.warning(f"[{name}] Self-cancel failed for {job.job_id}: {exc}")
-                        finally:
-                            _cancelled_job_ids.add(job.job_id)
-                    raise DbtRuntimeError(
-                        f"SCOPE job '{name}' ({job.job_id}) cancelled by shutdown signal"
-                    )
+                            self._cancel_own_job(job.job_id, name, wait_on_cancel_seconds)
+                        raise DbtRuntimeError(
+                            f"SCOPE job '{name}' ({job.job_id}) cancelled by shutdown signal"
+                        )
 
-                elapsed = time.monotonic() - start
-                if elapsed >= max_wait:
+                    elapsed = time.monotonic() - start
+                    if elapsed >= max_wait:
+                        raise DbtRuntimeError(
+                            f"SCOPE job '{name}' ({job.job_id}) timed out after "
+                            f"{elapsed:.0f}s in state {job.state}"
+                        )
+                    time.sleep(poll_interval)
+                    try:
+                        self.poll_job(job)
+                        consecutive_failures = 0
+                    except (
+                        requests.exceptions.ConnectionError,
+                        requests.exceptions.Timeout,
+                    ) as exc:
+                        consecutive_failures += 1
+                        if consecutive_failures >= self._MAX_CONSECUTIVE_POLL_FAILURES:
+                            raise DbtDatabaseError(
+                                f"SCOPE job '{name}' ({job.job_id}) poll failed "
+                                f"{consecutive_failures} consecutive times: {exc}"
+                            ) from exc
+                        log.warning(
+                            f"Transient poll error for '{name}' ({job.job_id}), attempt "
+                            f"{consecutive_failures}/{self._MAX_CONSECUTIVE_POLL_FAILURES}: {exc}"
+                        )
+                        continue
+                    if job.state != last_state:
+                        log.debug(f"[{name}] {last_state} → {job.state}")
+                        last_state = job.state
+            except Exception as exc:
+                if job.job_id in _cancelled_job_ids:
+                    raise
+                log.warning(
+                    f"[{name}] Giving up on job {job.job_id} ({exc}) — cancelling it so it "
+                    f"cannot commit after this run stops tracking it"
+                )
+                if not self._cancel_own_job(job.job_id, name, wait_on_cancel_seconds):
                     raise DbtRuntimeError(
-                        f"SCOPE job '{name}' ({job.job_id}) timed out after "
-                        f"{elapsed:.0f}s in state {job.state}"
-                    )
-                time.sleep(poll_interval)
+                        f"SCOPE job '{name}' ({job.job_id}) was abandoned and its "
+                        f"cancellation was not confirmed; it may still commit"
+                    ) from exc
                 try:
                     self.poll_job(job)
-                    consecutive_failures = 0
-                except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
-                    consecutive_failures += 1
-                    if consecutive_failures >= self._MAX_CONSECUTIVE_POLL_FAILURES:
-                        raise DbtDatabaseError(
-                            f"SCOPE job '{name}' ({job.job_id}) poll failed "
-                            f"{consecutive_failures} consecutive times: {exc}"
-                        ) from exc
-                    log.warning(
-                        f"Transient poll error for '{name}' ({job.job_id}), "
-                        f"attempt {consecutive_failures}/{self._MAX_CONSECUTIVE_POLL_FAILURES}: {exc}"
-                    )
-                    continue
-                if job.state != last_state:
-                    log.debug(f"[{name}] {last_state} → {job.state}")
-                    last_state = job.state
+                except Exception as poll_exc:
+                    raise DbtRuntimeError(
+                        f"SCOPE job '{name}' ({job.job_id}) was abandoned and its final "
+                        f"result is unknown: {poll_exc}"
+                    ) from exc
+                if not job.succeeded:
+                    raise
+                log.warning(f"[{name}] Job {job.job_id} succeeded before it could be cancelled")
 
             if not job.succeeded:
+                if job.job_id in _cancelled_job_ids:
+                    log.debug(f"[{name}] ADLA error of cancelled job: {job.error_message}")
+                    raise DbtRuntimeError(
+                        f"SCOPE job '{name}' ({job.job_id}) was cancelled by this dbt run"
+                    )
                 raise DbtDatabaseError(
                     f"SCOPE job '{name}' ({job.job_id}) failed: {job.error_message}"
                 )
@@ -475,6 +683,19 @@ class ScopeConnectionHandle:
             return job
         finally:
             _deregister_active_job(job.job_id)
+
+    def _cancel_own_job(self, job_id: str, name: str, wait_seconds: int) -> bool:
+        _cancelled_job_ids.add(job_id)
+        try:
+            confirmed = bool(self.cancel_job(job_id, poll_interval=2, max_wait=wait_seconds))
+        except Exception as exc:
+            log.warning(f"[{name}] Cancel failed for {job_id}: {exc}")
+            return False
+        if confirmed:
+            _confirmed_cancelled_job_ids.add(job_id)
+        else:
+            log.warning(f"[{name}] Job {job_id} not confirmed terminal and may still commit")
+        return confirmed
 
     # -- Internal -----------------------------------------------------
 
@@ -559,14 +780,16 @@ class ScopeConnectionManager(BaseConnectionManager):
         return AdapterResponse(_message="OK")
 
     def cancel(self, connection: Connection) -> None:
+        _shutdown_event.set()
         creds = getattr(connection, "credentials", None)
         wait_seconds = getattr(creds, "wait_on_cancel_seconds", 30) if creds else 30
         if getattr(creds, "cancel_jobs_on_shutdown", True):
             cancel_all_active_jobs("dbt-native:cancel", wait_seconds=wait_seconds)
 
     @classmethod
-    def cancel_open(cls) -> None:
-        cancel_all_active_jobs("dbt-native:cancel_open", wait_seconds=30)
+    def cancel_open(cls) -> list[str]:
+        _shutdown_event.set()
+        return list(_cancel_active_jobs("dbt-native:cancel_open", wait_seconds=30))
 
     @contextmanager
     def exception_handler(self, sql: str):  # type: ignore[override]
@@ -647,6 +870,7 @@ class ScopeConnectionManager(BaseConnectionManager):
                 _run_job,
                 policy=handle._job_retry_policy,
                 label=f"SCOPE job '{effective_name}'",
+                abort=_shutdown_event.is_set,
             )
 
         response = AdapterResponse(

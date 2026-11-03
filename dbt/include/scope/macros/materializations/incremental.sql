@@ -11,11 +11,14 @@
      - processing_time: continuously loop — discover → batch → sleep → repeat
 
    Flow per dbt run:
+     0. Reconcile: settle orphan jobs of earlier runs, resolve
+        _checkpoint/pending.json, adopt commits that have no checkpoint
      loop:
        1. Read watermark from _checkpoint/watermark.json
        2. LIST files on ADLS Gen1, filter by regex + watermark
        3. Take up to max_files_per_trigger files
-       4. Build SCOPE script with explicit file list
+       4. Record the batch in _checkpoint/pending.json and build the SCOPE
+          script with explicit file list + batch token
        5. Submit SCOPE job
        6. On success, update checkpoint with new watermark
        7. If more files remain, repeat from step 1
@@ -77,6 +80,11 @@
     {# -- Register model name for orphan cancellation + related metadata -- #}
     {% do adapter.set_next_job_model_name(job_identifier) %}
 
+    {# -- Settle orphan jobs, then recover commits that landed without a checkpoint -- #}
+    {% do adapter.reconcile_checkpoint(
+        delta_location, source_roots, source_patterns, job_identifier, safety_buffer_seconds, source_compaction_interval, source_retention_files
+    ) %}
+
     {# -- Reset cycle counter for processing_time models -- #}
     {%- if is_processing_time -%}
         {% do adapter.reset_cycle_count() %}
@@ -136,6 +144,11 @@
                 {# Only DELETE on the first batch of a full refresh #}
                 {%- set is_first_full_refresh_batch = (full_refresh_mode and ns.batch_num == 1) -%}
 
+                {%- set mode_label = "full-refresh" if full_refresh_mode else "incremental" -%}
+                {%- set job_suffix = mode_label ~ "_batch_" ~ ns.batch_num ~ "_of_" ~ total_batches ~ "_files_" ~ ns.file_batch | length -%}
+                {%- set job_name = job_identifier ~ "_" ~ job_suffix -%}
+                {%- set batch_properties = adapter.begin_batch(delta_location, ns.file_batch, job_name) -%}
+
                 {%- set scope_script = scope__build_file_based_script(
                     identifier,
                     delta_location,
@@ -150,14 +163,13 @@
                     is_incremental=(not is_first_full_refresh_batch),
                     delta_lake_commit_condition=delta_lake_commit_condition,
                     max_file_count_per_output_file_set=max_file_count_per_output_file_set,
-                    evolve_columns=evolve_columns
+                    evolve_columns=evolve_columns,
+                    batch_properties=batch_properties
                 ) -%}
 
-                {%- set mode_label = "full-refresh" if full_refresh_mode else "incremental" -%}
                 {{ log("SCOPE: " ~ mode_label ~ " " ~ identifier ~ " batch " ~ ns.batch_num ~ " of " ~ total_batches ~ " (" ~ ns.file_batch | length ~ " files)", info=True) }}
 
-                {%- set job_suffix = mode_label ~ "_batch_" ~ ns.batch_num ~ "_of_" ~ total_batches ~ "_files_" ~ ns.file_batch | length -%}
-                {% do adapter.set_next_job_name(job_identifier ~ "_" ~ job_suffix) %}
+                {% do adapter.set_next_job_name(job_name) %}
                 {% if config.get('au') %}{% do adapter.set_next_job_au(config.get('au') | int) %}{% endif %}
                 {% if config.get('priority') %}{% do adapter.set_next_job_priority(config.get('priority') | int) %}{% endif %}
                 {% if config.get('job_timeout_seconds') %}{% do adapter.set_next_job_timeout_seconds(config.get('job_timeout_seconds') | int) %}{% endif %}

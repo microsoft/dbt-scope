@@ -261,6 +261,40 @@ class TestRetryOnMessage:
         assert calls["n"] == 1
         assert sleeps == []
 
+    def test_abort_stops_retrying_and_reraises(self):
+        calls = {"n": 0}
+
+        def op():
+            calls["n"] += 1
+            raise DbtDatabaseError("ADLA 400: Cannot exceed 1000 queued SCOPE jobs")
+
+        sleeps: list[float] = []
+        with pytest.raises(DbtDatabaseError, match="Cannot exceed"):
+            retry_on_message(
+                op, policy=self._policy(), label="test", sleep=sleeps.append, abort=lambda: True
+            )
+        assert calls["n"] == 1
+        assert sleeps == []
+
+    def test_abort_is_checked_before_each_retry(self):
+        calls = {"n": 0}
+
+        def op():
+            calls["n"] += 1
+            raise DbtDatabaseError("Cannot exceed 1000 queued SCOPE jobs")
+
+        sleeps: list[float] = []
+        with pytest.raises(DbtDatabaseError):
+            retry_on_message(
+                op,
+                policy=self._policy(max_retries=5),
+                label="test",
+                sleep=sleeps.append,
+                abort=lambda: calls["n"] >= 2,
+            )
+        assert calls["n"] == 2
+        assert sleeps == [1.0]
+
 
 _VERTEX_TIMEOUT_MSG = (
     "SCOPE job 'm_incremental_batch_1_of_1_files_6' (5838e41a) failed: "

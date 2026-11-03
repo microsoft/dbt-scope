@@ -3,21 +3,30 @@
 from __future__ import annotations
 
 import atexit
+import re
 import signal
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import unquote
 
 import agate
 import pandas as pd
 import tabulate as tabulate_lib
+from azure.identity import CredentialUnavailableError
 from dbt.adapters.base import BaseAdapter, available
 from dbt.adapters.events.logging import AdapterLogger
 from dbt_common.exceptions import DbtRuntimeError
 
 from dbt.adapters.scope.adls_gen1_client import AdlsGen1Client, FileInfo
-from dbt.adapters.scope.checkpoint import CheckpointManager, Watermark
+from dbt.adapters.scope.checkpoint import (
+    BATCH_TOKEN_PROPERTY,
+    CheckpointManager,
+    PendingBatch,
+    Watermark,
+)
 from dbt.adapters.scope.column import ScopeColumn
 from dbt.adapters.scope.connections import (
     ScopeConnectionHandle,
@@ -39,6 +48,7 @@ from dbt.adapters.scope.delta_lake import (
     RetryPolicy,
     build_credential,
     diff_schema_for_evolution,
+    physical_column_name,
 )
 from dbt.adapters.scope.file_tracker import FileTracker
 from dbt.adapters.scope.message_retry import MessageRetryPolicy, retry_on_message
@@ -302,12 +312,63 @@ def _count_batches(
     return count
 
 
+_SOURCE_FILE_COLUMN = "source_file_uri"
+_LEGACY_BASELINE_MAX_COMMITS = 100
+_URI_SCHEME_HOST_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://[^/]*")
+
+
+def _normalize_source_path(value: str) -> str:
+    """Reduce a listed path or ``FILE.URI()`` value to a ``/``-rooted, decoded path."""
+    path = _URI_SCHEME_HOST_RE.sub("", unquote(value.strip())).split("?", 1)[0]
+    return "/" + re.sub(r"/{2,}", "/", path).lstrip("/")
+
+
+def _match_source_files(uris: set[str], files: list[FileInfo]) -> set[str]:
+    """Return the paths of *files* referenced by *uris*.
+
+    Paths match when one is a ``/``-aligned suffix of the other, which tolerates a
+    scheme, host or mount prefix present on only one side.
+    """
+    by_name: dict[str, list[tuple[str, str]]] = {}
+    for f in files:
+        normalized = _normalize_source_path(f.path)
+        by_name.setdefault(normalized.rsplit("/", 1)[-1], []).append((normalized, f.path))
+    matched: set[str] = set()
+    for uri in uris:
+        normalized_uri = _normalize_source_path(uri)
+        for normalized, path in by_name.get(normalized_uri.rsplit("/", 1)[-1], []):
+            if normalized_uri.endswith(normalized) or normalized.endswith(normalized_uri):
+                matched.add(path)
+    return matched
+
+
+def _adoptable_prefix(files: list[FileInfo], adopted: set[str]) -> list[FileInfo]:
+    """Return the leading files (in discovery order) that are all in *adopted*.
+
+    The watermark can only skip a prefix, and must stay below the modification
+    time of the first file that was not adopted.
+    """
+    prefix: list[FileInfo] = []
+    for f in files:
+        if f.path not in adopted:
+            return [p for p in prefix if p.modification_time < f.modification_time]
+        prefix.append(f)
+    return prefix
+
+
 class ScopeAdapter(BaseAdapter):
     """Adapter for submitting SCOPE scripts to Azure Data Lake Analytics."""
 
     ConnectionManager = ScopeConnectionManager
     Relation = ScopeRelation
     Column = ScopeColumn
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # A programmatic dbtRunner reuses the process: a fail-fast from the previous
+        # invocation must not block this one, and its jobs become orphans.
+        _shutdown_event.clear()
+        ScopeConnectionHandle.start_new_run()
 
     # ------------------------------------------------------------------
     # Required abstract method implementations
@@ -585,7 +646,7 @@ class ScopeAdapter(BaseAdapter):
         )
 
         tracker = self._get_file_tracker()
-        watermark = self._get_checkpoint_manager().read_watermark(delta_location)
+        watermark = self._get_checkpoint_manager().read_watermark(delta_location, strict=True)
 
         # Determine effective watermark: checkpoint wins over starting_timestamp
         used_starting_timestamp = False
@@ -601,21 +662,9 @@ class ScopeAdapter(BaseAdapter):
         else:
             effective_watermark = None
 
-        seen_paths: set[str] = set()
-        all_unprocessed: list[FileInfo] = []
-
-        for root in source_roots:
-            for pattern in source_patterns:
-                unprocessed = tracker.discover_unprocessed_files(
-                    root=root,
-                    pattern=pattern,
-                    watermark=effective_watermark,
-                    safety_buffer_seconds=safety_buffer_seconds,
-                )
-                for f in unprocessed:
-                    if f.path not in seen_paths:
-                        seen_paths.add(f.path)
-                        all_unprocessed.append(f)
+        all_unprocessed = self._list_unprocessed(
+            source_roots, source_patterns, effective_watermark, safety_buffer_seconds
+        )
 
         # If starting_timestamp was used and yielded nothing, either fall back
         # to the single most-recent file (minimum lookback) or raise, depending
@@ -636,7 +685,6 @@ class ScopeAdapter(BaseAdapter):
                         latest.modification_time.isoformat(),
                     )
                     all_unprocessed = [latest]
-                    seen_paths.add(latest.path)
                 # else: no files exist at all — legitimate empty source, no error
             else:
                 self._validate_starting_timestamp_has_files(
@@ -731,6 +779,68 @@ class ScopeAdapter(BaseAdapter):
                         latest = f
         return latest
 
+    def _list_unprocessed(
+        self,
+        source_roots: list[str],
+        source_patterns: list[str],
+        watermark: Watermark | None,
+        safety_buffer_seconds: int,
+    ) -> list[FileInfo]:
+        """List the files newer than *watermark* across every (root, pattern), unique by path."""
+        tracker = self._get_file_tracker()
+        seen_paths: set[str] = set()
+        files: list[FileInfo] = []
+        for root in source_roots:
+            for pattern in source_patterns:
+                for f in tracker.discover_unprocessed_files(
+                    root=root,
+                    pattern=pattern,
+                    watermark=watermark,
+                    safety_buffer_seconds=safety_buffer_seconds,
+                ):
+                    if f.path not in seen_paths:
+                        seen_paths.add(f.path)
+                        files.append(f)
+        return files
+
+    @available
+    def begin_batch(
+        self, delta_location: str, file_paths: list[str], job_name: str
+    ) -> dict[str, str]:
+        """Record the batch in ``_checkpoint/pending.json`` before its job is submitted.
+
+        Returns the table properties the batch's script must set; the batch token among
+        them lets :meth:`reconcile_checkpoint` find the batch's Delta commit if this
+        process dies before :meth:`update_checkpoint`.
+        """
+        cache = getattr(self, "_discovered_file_infos", {})
+        missing = [path for path in file_paths if path not in cache]
+        if missing:
+            raise DbtRuntimeError(
+                f"begin_batch: {len(missing)} file(s) were not returned by discover_files: "
+                f"{missing[:5]}"
+            )
+        self._ensure_table_owner()
+        checkpoint = self._get_checkpoint_manager()
+        watermark = checkpoint.read_watermark(delta_location, strict=True)
+        pending = PendingBatch(
+            token=str(uuid.uuid4()),
+            batch_id=watermark.batch_id + 1 if watermark else 0,
+            run_id=ScopeConnectionHandle._run_id,
+            job_name=job_name,
+            files=[
+                (path, round(cache[path].modification_time.timestamp() * 1000))
+                for path in file_paths
+            ],
+            watermark_before=watermark,
+            delta_version_before=self._get_delta_client().latest_version(delta_location),
+        )
+        checkpoint.write_pending(delta_location, pending)
+        if not hasattr(self, "_pending_batches"):
+            self._pending_batches: dict[str, PendingBatch] = {}
+        self._pending_batches[delta_location] = pending
+        return {BATCH_TOKEN_PROPERTY: pending.token}
+
     @available
     def update_checkpoint(
         self,
@@ -748,11 +858,12 @@ class ScopeAdapter(BaseAdapter):
         Also writes per-batch JSONL to ``_checkpoint/sources/{batch_id}``,
         triggers compaction at interval boundaries, and enforces retention.
         """
+        self._ensure_table_owner()
         gen1 = self._get_gen1_client()
         checkpoint = self._get_checkpoint_manager()
 
         # Get current watermark
-        current = checkpoint.read_watermark(delta_location)
+        current = checkpoint.read_watermark(delta_location, strict=True)
 
         # Look up FileInfo from the discovery cache first
         cache = getattr(self, "_discovered_file_infos", {})
@@ -785,7 +896,31 @@ class ScopeAdapter(BaseAdapter):
             log.warning("update_checkpoint: no matching files found for paths")
             return
 
-        new_watermark = FileTracker.compute_new_watermark(processed, current)
+        pending = getattr(self, "_pending_batches", {}).pop(delta_location, None)
+        self._record_batch(
+            delta_location,
+            processed,
+            current,
+            self._committed_delta_version(delta_location, pending),
+            source_compaction_interval,
+            source_retention_files,
+        )
+        if pending is not None:
+            checkpoint.delete_pending(delta_location)
+
+    def _record_batch(
+        self,
+        delta_location: str,
+        files: list[FileInfo],
+        current: Watermark | None,
+        delta_version: int | None,
+        source_compaction_interval: int,
+        source_retention_files: int,
+    ) -> Watermark:
+        """Advance the watermark over *files* and record them as one batch."""
+        checkpoint = self._get_checkpoint_manager()
+        new_watermark = FileTracker.compute_new_watermark(files, current)
+        new_watermark.delta_version = delta_version
 
         # Write watermark
         checkpoint.write_watermark(delta_location, new_watermark)
@@ -794,8 +929,8 @@ class ScopeAdapter(BaseAdapter):
         checkpoint.write_batch_sources(
             delta_location,
             batch_id=new_watermark.batch_id,
-            file_paths=[f.path for f in processed],
-            modification_times=[f.modification_time for f in processed],
+            file_paths=[f.path for f in files],
+            modification_times=[f.modification_time for f in files],
             compaction_interval=source_compaction_interval,
         )
 
@@ -803,6 +938,269 @@ class ScopeAdapter(BaseAdapter):
         checkpoint.cleanup_sources(
             delta_location,
             max_files=source_retention_files,
+        )
+        return new_watermark
+
+    def _committed_delta_version(
+        self, delta_location: str, pending: PendingBatch | None
+    ) -> int | None:
+        """Return the Delta version that holds the batch just checkpointed, if readable.
+
+        Prefers the commit carrying the pending batch's token and falls back to the
+        latest version.
+        """
+        client = self._get_delta_client()
+        try:
+            versions, latest = client.log_versions(delta_location)
+            if pending is not None:
+                version = self._find_token_version(delta_location, pending, versions, latest)
+                if version is not None:
+                    return version
+        except CredentialUnavailableError:
+            raise
+        except Exception as exc:
+            log.warning(f"Could not read the Delta log of {delta_location}: {exc}")
+            return None
+        return latest if latest >= 0 else None
+
+    def _find_token_version(
+        self,
+        delta_location: str,
+        pending: PendingBatch,
+        versions: list[int],
+        latest: int,
+    ) -> int | None:
+        """Return the Delta version whose commit carries *pending*'s batch token, or ``None``.
+
+        When log cleanup has removed JSON commits after ``delta_version_before``, the
+        latest table configuration is checked instead.
+        """
+        client = self._get_delta_client()
+        after = pending.delta_version_before
+        candidates = [v for v in versions if v > after]
+        for commit in client.read_commits(delta_location, candidates):
+            if commit.carries_property(BATCH_TOKEN_PROPERTY, pending.token):
+                return commit.version
+        if latest > after and (not candidates or candidates[0] > after + 1):
+            metadata_commit = client.latest_metadata_commit(delta_location)
+            if (
+                metadata_commit is not None
+                and metadata_commit.configuration.get(BATCH_TOKEN_PROPERTY) == pending.token
+            ):
+                return latest
+        return None
+
+    @available
+    def reconcile_checkpoint(
+        self,
+        delta_location: str,
+        source_roots: list[str],
+        source_patterns: list[str],
+        model_name: str,
+        safety_buffer_seconds: int = DEFAULT_SAFETY_BUFFER_SECONDS,
+        source_compaction_interval: int = DEFAULT_SOURCE_COMPACTION_INTERVAL,
+        source_retention_files: int = DEFAULT_SOURCE_RETENTION_FILES,
+    ) -> None:
+        """Bring the checkpoint in line with the Delta table before the model's first batch.
+
+        1. Claims the table for this run (``ModelSupersededError`` if a newer run owns
+           it), then cancels this model's jobs left by other runs and waits until they
+           end, so nothing commits while the table is inspected.
+        2. Resolves ``pending.json``: checkpoints its files if the batch token is in a
+           Delta commit, otherwise discards it.
+        3. Adopts ScopeEngine commits after the checkpoint's Delta version (or, for
+           checkpoints written by older adapters, after ``watermark.json`` was written)
+           by matching their ``source_file_uri`` values to unprocessed source files.
+        4. Records the latest Delta version in the watermark.
+        """
+        connection = self.connections.get_thread_connection()
+        handle: ScopeConnectionHandle = connection.handle  # type: ignore[assignment]
+        handle.claim_table(model_name, delta_location)
+
+        checkpoint = self._get_checkpoint_manager()
+        client = self._get_delta_client()
+        watermark = checkpoint.read_watermark(delta_location, strict=True)
+        versions, latest = client.log_versions(delta_location)
+
+        watermark = self._resolve_pending(
+            delta_location,
+            watermark,
+            versions,
+            latest,
+            source_compaction_interval,
+            source_retention_files,
+        )
+        if watermark is None or latest < 0:
+            return
+
+        try:
+            baseline = watermark.delta_version
+            if baseline is None:
+                baseline = self._legacy_baseline(delta_location, versions, latest)
+            if baseline < latest:
+                watermark = self._adopt_unrecorded_commits(
+                    delta_location,
+                    source_roots,
+                    source_patterns,
+                    watermark,
+                    [v for v in versions if v > baseline],
+                    latest,
+                    safety_buffer_seconds,
+                    source_compaction_interval,
+                    source_retention_files,
+                )
+        except CredentialUnavailableError:
+            raise
+        except Exception as exc:
+            log.warning(
+                f"Could not check Delta commits of {delta_location} for batches missing from "
+                f"the checkpoint; their source files may be ingested again: {exc}"
+            )
+
+        if watermark.delta_version != latest:
+            watermark.delta_version = latest
+            checkpoint.write_watermark(delta_location, watermark)
+
+    def _resolve_pending(
+        self,
+        delta_location: str,
+        watermark: Watermark | None,
+        versions: list[int],
+        latest: int,
+        source_compaction_interval: int,
+        source_retention_files: int,
+    ) -> Watermark | None:
+        checkpoint = self._get_checkpoint_manager()
+        pending = checkpoint.read_pending(delta_location)
+        if pending is None:
+            return watermark
+        if not pending.applies_to(watermark):
+            log.info(
+                f"Discarding stale pending batch {pending.batch_id} of {delta_location}: "
+                f"the checkpoint has moved past it"
+            )
+            checkpoint.delete_pending(delta_location)
+            return watermark
+
+        version = self._find_token_version(delta_location, pending, versions, latest)
+        if version is None:
+            log.info(
+                f"Pending batch {pending.batch_id} of {delta_location} (job "
+                f"'{pending.job_name}') did not commit; its files will be processed again"
+            )
+            checkpoint.delete_pending(delta_location)
+            return watermark
+
+        log.info(
+            f"Pending batch {pending.batch_id} of {delta_location} (job '{pending.job_name}') "
+            f"committed as Delta version {version}; checkpointing its {len(pending.files)} file(s)"
+        )
+        files = [
+            FileInfo(path=path, name=path.rsplit("/", 1)[-1], length=0, modification_time=mtime)
+            for path, mtime in zip(pending.file_paths, pending.modification_times, strict=True)
+        ]
+        watermark = self._record_batch(
+            delta_location,
+            files,
+            watermark,
+            version,
+            source_compaction_interval,
+            source_retention_files,
+        )
+        checkpoint.delete_pending(delta_location)
+        return watermark
+
+    def _legacy_baseline(self, delta_location: str, versions: list[int], latest: int) -> int:
+        """Infer the Delta version covered by a watermark written without ``deltaVersion``.
+
+        A checkpointed batch is always followed by a watermark write, so commits newer
+        than ``watermark.json`` are the ones the checkpoint does not cover.
+        """
+        written_at = self._get_checkpoint_manager().watermark_last_modified(delta_location)
+        if written_at is None:
+            return latest
+        written_at_ms = written_at.timestamp() * 1000
+        baseline = latest
+        for version in reversed(versions[-_LEGACY_BASELINE_MAX_COMMITS:]):
+            commit = self._get_delta_client().read_commit(delta_location, version)
+            timestamp_ms = commit.timestamp_ms if commit is not None else None
+            if timestamp_ms is None or timestamp_ms <= written_at_ms:
+                break
+            baseline = version - 1
+        log.info(
+            f"Checkpoint of {delta_location} has no Delta version; inferred version "
+            f"{baseline} from when it was written"
+        )
+        return baseline
+
+    def _adopt_unrecorded_commits(
+        self,
+        delta_location: str,
+        source_roots: list[str],
+        source_patterns: list[str],
+        watermark: Watermark,
+        versions: list[int],
+        latest: int,
+        safety_buffer_seconds: int,
+        source_compaction_interval: int,
+        source_retention_files: int,
+    ) -> Watermark:
+        """Checkpoint source files that ScopeEngine commits in *versions* already ingested."""
+        client = self._get_delta_client()
+        commits = [
+            c
+            for c in client.read_commits(delta_location, versions)
+            if c.is_scope_engine and c.added_data_paths
+        ]
+        if not commits:
+            return watermark
+
+        schema_commit = next(
+            (c for c in reversed(commits) if c.schema_string),
+            None,
+        ) or client.latest_metadata_commit(delta_location)
+        column = physical_column_name(
+            schema_commit.schema_string if schema_commit else None, _SOURCE_FILE_COLUMN
+        )
+        commit_versions = [c.version for c in commits]
+        if column is None:
+            log.warning(
+                f"Delta versions {commit_versions} of {delta_location} are not in the "
+                f"checkpoint and the table has no '{_SOURCE_FILE_COLUMN}' column to tell "
+                f"which source files they ingested; those files may be ingested again"
+            )
+            return watermark
+
+        uris: set[str] = set()
+        for commit in commits:
+            uris |= client.distinct_column_values(delta_location, commit.added_data_paths, column)
+        unprocessed = sorted(
+            self._list_unprocessed(source_roots, source_patterns, watermark, safety_buffer_seconds),
+            key=lambda f: f.modification_time,
+        )
+        adopted = _match_source_files(uris, unprocessed)
+        prefix = _adoptable_prefix(unprocessed, adopted)
+        if len(prefix) < len(adopted):
+            log.warning(
+                f"Delta versions {commit_versions} of {delta_location} ingested "
+                f"{len(adopted)} unprocessed source file(s) but only the {len(prefix)} oldest "
+                f"form a contiguous run; the other {len(adopted) - len(prefix)} may be "
+                f"ingested again"
+            )
+        if not prefix:
+            return watermark
+
+        log.info(
+            f"Checkpointing {len(prefix)} source file(s) that Delta versions {commit_versions} "
+            f"of {delta_location} ingested without a checkpoint"
+        )
+        return self._record_batch(
+            delta_location,
+            prefix,
+            watermark,
+            latest,
+            source_compaction_interval,
+            source_retention_files,
         )
 
     @available
@@ -1058,6 +1456,11 @@ class ScopeAdapter(BaseAdapter):
                 message_retry_policy=MessageRetryPolicy.from_credentials(creds),
             )
         return self._checkpoint_manager
+
+    def _ensure_table_owner(self) -> None:
+        connection = self.connections.get_thread_connection()
+        handle: ScopeConnectionHandle = connection.handle  # type: ignore[assignment]
+        handle.ensure_table_owner(handle._next_job_model_name)
 
     def _get_file_tracker(self) -> FileTracker:
         """Return the file tracker singleton."""

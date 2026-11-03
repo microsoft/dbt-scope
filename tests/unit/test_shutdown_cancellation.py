@@ -19,6 +19,7 @@ from dbt.adapters.scope.connections import (
     _active_jobs,
     _ActiveJobEntry,
     _cancelled_job_ids,
+    _confirmed_cancelled_job_ids,
     _deregister_active_job,
     _register_active_job,
     _shutdown_event,
@@ -37,9 +38,11 @@ def _reset_shutdown_state():
     _shutdown_event.clear()
     saved_jobs = dict(_active_jobs)
     saved_cancelled = set(_cancelled_job_ids)
+    saved_confirmed = set(_confirmed_cancelled_job_ids)
     saved_observed = list(impl_module._observed_credentials)
     _active_jobs.clear()
     _cancelled_job_ids.clear()
+    _confirmed_cancelled_job_ids.clear()
     impl_module._observed_credentials.clear()
     yield
     _shutdown_event.clear()
@@ -47,6 +50,8 @@ def _reset_shutdown_state():
     _active_jobs.update(saved_jobs)
     _cancelled_job_ids.clear()
     _cancelled_job_ids.update(saved_cancelled)
+    _confirmed_cancelled_job_ids.clear()
+    _confirmed_cancelled_job_ids.update(saved_confirmed)
     impl_module._observed_credentials.clear()
     impl_module._observed_credentials.extend(saved_observed)
 
@@ -132,15 +137,16 @@ class TestSubmitAndWaitRegistry:
 
         def fake_cancel_job(job_id, poll_interval=2, max_wait=120):
             cancel_calls.append((job_id, max_wait))
+            return True
 
         def fake_request(method, url, **kwargs):
             if method == "PUT":
+                _shutdown_event.set()
                 return {"state": "Running"}
             return {"state": "Running"}
 
         handle = self._handle_with_request(fake_request)
         handle.cancel_job = MagicMock(side_effect=fake_cancel_job)
-        _shutdown_event.set()
 
         with pytest.raises(DbtRuntimeError, match="shutdown signal"):
             handle.submit_and_wait(
@@ -155,12 +161,14 @@ class TestSubmitAndWaitRegistry:
         assert cancel_calls[0][1] == 17
         assert _active_jobs == {}
         assert cancel_calls[0][0] in _cancelled_job_ids
+        assert cancel_calls[0][0] in _confirmed_cancelled_job_ids
 
     def test_does_not_double_cancel_if_already_in_cancelled_set(self):
         cancel_mock = MagicMock()
 
         def fake_request(method, url, **kwargs):
             if method == "PUT":
+                _shutdown_event.set()
                 return {"jobId": "preset-id", "state": "Running"}
             return {"state": "Running"}
 
@@ -169,10 +177,35 @@ class TestSubmitAndWaitRegistry:
 
         with patch("uuid.uuid4", return_value=MagicMock(__str__=lambda self: "preset-id")):
             _cancelled_job_ids.add("preset-id")
-            _shutdown_event.set()
-            with pytest.raises(DbtRuntimeError):
+            with pytest.raises(DbtRuntimeError, match="shutdown signal"):
                 handle.submit_and_wait(name="t", script="// s", au=10, priority=1, poll_interval=0)
         cancel_mock.assert_not_called()
+
+    def test_refuses_to_submit_once_shutdown_is_set(self):
+        handle = self._handle_with_request(lambda method, url, **kwargs: {"state": "Running"})
+        _shutdown_event.set()
+
+        with pytest.raises(DbtRuntimeError, match="aborting"):
+            handle.submit_and_wait(name="t", script="// s", au=10, priority=1, poll_interval=0)
+        handle._request.assert_not_called()
+        assert _active_jobs == {}
+
+    def test_job_cancelled_by_this_run_is_not_reported_as_adla_failure(self):
+        def fake_request(method, url, **kwargs):
+            if method == "PUT":
+                return {"state": "Running"}
+            _cancelled_job_ids.add(url.split("/jobs/")[1].split("?")[0])
+            return {
+                "state": "Ended",
+                "result": "Cancelled",
+                "errorMessage": "Job cancelled by user abc",
+            }
+
+        handle = self._handle_with_request(fake_request)
+
+        with pytest.raises(DbtRuntimeError, match="cancelled by this dbt run") as exc_info:
+            handle.submit_and_wait(name="t", script="// s", au=10, priority=1, poll_interval=0)
+        assert "Job cancelled by user" not in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +235,7 @@ class TestCancelAllActiveJobs:
     def test_returns_attempted_and_confirmed_with_mixed_results(self):
         good = _make_handle("good")
         bad = _make_handle("bad")
-        good.cancel_job = MagicMock()
+        good.cancel_job = MagicMock(return_value=True)
         bad.cancel_job = MagicMock(side_effect=RuntimeError("network down"))
         _register_active_job(_make_entry("ok", good))
         _register_active_job(_make_entry("err", bad))
@@ -211,6 +244,19 @@ class TestCancelAllActiveJobs:
 
         assert attempted == 2
         assert confirmed == 1
+        assert _confirmed_cancelled_job_ids == {"ok"}
+        assert _cancelled_job_ids == {"ok", "err"}
+
+    def test_unconfirmed_cancel_is_not_counted(self):
+        handle = _make_handle()
+        handle.cancel_job = MagicMock(return_value=False)
+        _register_active_job(_make_entry("slow", handle))
+
+        attempted, confirmed = cancel_all_active_jobs("test", wait_seconds=5)
+
+        assert (attempted, confirmed) == (1, 0)
+        assert "slow" in _cancelled_job_ids
+        assert "slow" not in _confirmed_cancelled_job_ids
 
     def test_continues_on_per_job_failure(self):
         h1 = _make_handle("h1")
@@ -245,17 +291,26 @@ class TestCancelAllActiveJobs:
         # wait_seconds=1 + 5s grace = 6s ceiling
         assert elapsed < 8, f"Cancel-all blocked {elapsed:.1f}s, expected < 8s"
 
-    def test_skips_jobs_already_in_cancelled_set(self):
+    def test_skips_jobs_already_confirmed_terminal(self):
         handle = _make_handle()
         handle.cancel_job = MagicMock()
         _register_active_job(_make_entry("already-cancelled", handle))
-        _cancelled_job_ids.add("already-cancelled")
+        _confirmed_cancelled_job_ids.add("already-cancelled")
 
         attempted, confirmed = cancel_all_active_jobs("test", wait_seconds=5)
 
         assert attempted == 1
         assert confirmed == 1
         handle.cancel_job.assert_not_called()
+
+    def test_retries_cancel_that_was_not_confirmed(self):
+        handle = _make_handle()
+        handle.cancel_job = MagicMock(return_value=True)
+        _register_active_job(_make_entry("requested", handle))
+        _cancelled_job_ids.add("requested")
+
+        assert cancel_all_active_jobs("test", wait_seconds=5) == (1, 1)
+        handle.cancel_job.assert_called_once_with("requested", poll_interval=2, max_wait=5)
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +485,7 @@ class TestManagerCancelDelegation:
         with patch.object(conn_module, "cancel_all_active_jobs") as mock_cancel:
             mgr.cancel(connection)
         mock_cancel.assert_called_once_with("dbt-native:cancel", wait_seconds=21)
+        assert _shutdown_event.is_set()
 
     def test_cancel_respects_opt_out_credential(self):
         connection = MagicMock()
@@ -444,10 +500,14 @@ class TestManagerCancelDelegation:
             mgr.cancel(connection)
         mock_cancel.assert_not_called()
 
-    def test_cancel_open_delegates_to_cancel_all(self):
-        with patch.object(conn_module, "cancel_all_active_jobs") as mock_cancel:
-            ScopeConnectionManager.cancel_open()
+    def test_cancel_open_cancels_active_jobs_and_returns_their_ids(self):
+        with patch.object(
+            conn_module, "_cancel_active_jobs", return_value={"a": True, "b": False}
+        ) as mock_cancel:
+            cancelled = ScopeConnectionManager.cancel_open()
         mock_cancel.assert_called_once_with("dbt-native:cancel_open", wait_seconds=30)
+        assert cancelled == ["a", "b"]
+        assert _shutdown_event.is_set()
 
 
 # ---------------------------------------------------------------------------
@@ -490,12 +550,12 @@ class TestSelfCancelFailureDuringShutdown:
 
         def fake_request(method, url, **kwargs):
             if method == "PUT":
+                _shutdown_event.set()
                 return {"state": "Running"}
             return {"state": "Running"}
 
         handle._request = MagicMock(side_effect=fake_request)
         handle.cancel_job = MagicMock(side_effect=requests.exceptions.ConnectionError("nope"))
-        _shutdown_event.set()
 
         with pytest.raises(DbtRuntimeError, match="shutdown signal"):
             handle.submit_and_wait(

@@ -213,13 +213,14 @@ def retry_on_message(
     policy: MessageRetryPolicy,
     label: str,
     sleep: Callable[[float], None] = time.sleep,
+    abort: Callable[[], bool] | None = None,
 ) -> T:
     """Run ``operation``; on a pattern-matching exception, retry with backoff.
 
     Non-matching exceptions are re-raised immediately without delay. When the
-    retry budget is exhausted the **original** exception is re-raised so
-    downstream callers see the unmodified type (e.g. ``DbtDatabaseError``
-    stays ``DbtDatabaseError``).
+    retry budget is exhausted, or ``abort()`` returns ``True``, the **original**
+    exception is re-raised so downstream callers see the unmodified type (e.g.
+    ``DbtDatabaseError`` stays ``DbtDatabaseError``).
     """
     if not policy.enabled:
         return operation()
@@ -234,6 +235,9 @@ def retry_on_message(
             if matched is None:
                 raise
             last_exc = exc
+            if abort is not None and abort():
+                log.warning(f"[{label}] not retrying {matched!r}: the run is aborting: {exc}")
+                raise
             if attempt >= total_attempts:
                 log.error(
                     f"[{label}] retry budget exhausted after {attempt} attempt(s) "
